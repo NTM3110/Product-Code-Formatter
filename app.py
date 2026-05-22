@@ -76,13 +76,14 @@ MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
 
 
-def empty_profile_config():
+def empty_profile_config(profile_key_name=None):
     return {
         "prefixes": {},
         "selected_products": {},
         "removed_companies": {},
         "word_rules": {"\u0111en": "DEN", "t\u00f4n": "TON"},
         "first_word_rules": {},
+        "repeated_phrase_removals": ["inox"] if profile_key_name == "cao_thanh" else [],
         "price_group_rules": {},
         "price_range_rules": {},
         "manual_code_overrides": {},
@@ -94,7 +95,7 @@ def empty_profile_config():
 def default_config():
     return {
         "selected_profile": "son_phuong",
-        "profiles": {key: empty_profile_config() for key in PROFILE_LABELS},
+        "profiles": {key: empty_profile_config(key) for key in PROFILE_LABELS},
         "columns": {
             "company_col": "F",
             "mst_col": "G",
@@ -163,12 +164,48 @@ def normalize_price_group_rules(value, products=None):
         if min_price > max_price:
             min_price, max_price = max_price, min_price
         base_code = rule.get("base_code") or products.get(normalized_key) or ""
+        groups = []
+        for group in rule.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            try:
+                group_min = float(group.get("min_price"))
+                group_max = float(group.get("max_price"))
+                adjust_percent = float(group.get("adjust_percent", 0))
+            except Exception:
+                continue
+            if group_min > group_max:
+                group_min, group_max = group_max, group_min
+            groups.append({
+                "index": int(group.get("index") or len(groups) + 1),
+                "label": str(group.get("label") or f"Nhóm {len(groups) + 1}"),
+                "min_price": group_min,
+                "max_price": group_max,
+                "average_price": float(group.get("average_price")) if group.get("average_price") is not None else None,
+                "adjust_percent": adjust_percent,
+            })
         result[normalized_key] = {
             "base_code": str(base_code),
             "min_price": min_price,
             "max_price": max_price,
             "percent": percent,
+            "groups": groups,
         }
+    return result
+
+
+def normalize_phrase_list(value):
+    result = []
+    seen = set()
+    if not isinstance(value, list):
+        return result
+    for item in value:
+        phrase = str(item or "").strip()
+        key = normalize_rule_key(phrase)
+        if not phrase or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(phrase)
     return result
 
 
@@ -187,7 +224,7 @@ def price_ranges_from_groups(price_group_rules):
 
 
 def normalize_profile_config(profile_key_name, profile):
-    defaults = empty_profile_config()
+    defaults = empty_profile_config(profile_key_name)
     profile = profile if isinstance(profile, dict) else {}
     prefixes = profile.get("prefixes") or profile.get("companies") or {}
     products = normalize_products_map(profile.get("manual_code_overrides") or profile.get("products") or {})
@@ -207,6 +244,7 @@ def normalize_profile_config(profile_key_name, profile):
         "removed_companies": normalize_removed_companies(profile.get("removed_companies")),
         "word_rules": normalize_word_rules(word_rules_source),
         "first_word_rules": normalize_word_rules(first_word_rules_source),
+        "repeated_phrase_removals": normalize_phrase_list(profile.get("repeated_phrase_removals", defaults["repeated_phrase_removals"])),
         "price_group_rules": price_groups,
         "price_range_rules": price_ranges,
         "manual_code_overrides": products,
@@ -523,13 +561,45 @@ def word_pieces(words, word_rules, fallback):
     return parts
 
 
-def make_product_part(profile, product, word_rules, first_word_rules=None):
+def remove_repeated_phrases(words, repeated_phrases):
+    phrase_words = [code_words(phrase) for phrase in normalize_phrase_list(repeated_phrases)]
+    phrase_words = [items for items in phrase_words if items]
+    if not phrase_words:
+        return words
+    phrase_words.sort(key=len, reverse=True)
+    seen = set()
+    result = []
+    i = 0
+    while i < len(words):
+        matched = None
+        for items in phrase_words:
+            length = len(items)
+            if length > len(words) - i:
+                continue
+            phrase = " ".join(words[i:i + length])
+            if normalize_rule_key(phrase) == normalize_rule_key(" ".join(items)):
+                matched = (phrase, length)
+                break
+        if matched:
+            phrase, length = matched
+            key = normalize_rule_key(phrase)
+            if key not in seen:
+                result.extend(words[i:i + length])
+                seen.add(key)
+            i += length
+        else:
+            result.append(words[i])
+            i += 1
+    return result
+
+
+def make_product_part(profile, product, word_rules, first_word_rules=None, repeated_phrase_removals=None):
     first_word_rules = first_word_rules or {}
     name = "" if pd.isna(product) else str(product).strip()
 
     if profile == "cao_thanh":
         name = re.sub(r"\([^)]*\)", " ", name)
-        words = code_words(name)
+        words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
         first = word_pieces(
             words[:2],
             first_word_rules,
@@ -542,7 +612,7 @@ def make_product_part(profile, product, word_rules, first_word_rules=None):
         )
         return "".join(first + rest)
 
-    words = code_words(name)
+    words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
 
     if profile == "quang_thinh":
         filtered = []
@@ -594,13 +664,13 @@ def make_product_part(profile, product, word_rules, first_word_rules=None):
     return "".join(parts)
 
 
-def make_code(mst, product, qty, prefix_map, profile, word_rules, first_word_rules=None, require_qty=True, include_company_prefix=True):
+def make_code(mst, product, qty, prefix_map, profile, word_rules, first_word_rules=None, require_qty=True, include_company_prefix=True, repeated_phrase_removals=None):
     if require_qty and not should_process_qty(qty):
         return ""
     mst = "" if pd.isna(mst) else str(mst).strip()
     if include_company_prefix and (not mst or mst not in prefix_map):
         return ""
-    body = make_product_part(profile, product, word_rules, first_word_rules)
+    body = make_product_part(profile, product, word_rules, first_word_rules, repeated_phrase_removals)
     if not include_company_prefix:
         return trim_code(body)
     prefix = normalize_token(prefix_map[mst])
@@ -740,7 +810,8 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
                 "priceCount": len(set(prices)),
                 "priceRows": price_rows,
             })
-        selected_list = saved_selected.get(mst)
+        skipped_list = saved_selected.get(mst)
+        skipped_set = set(skipped_list) if isinstance(skipped_list, list) else set()
         companies_data.append({
             "mst": str(mst),
             "company": str(mst_company[mst]),
@@ -748,7 +819,7 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
             "addresses": unique_values(addresses.get(mst, [])),
             "all_names": [str(n) for n in unique_values(by[mst])],
             "all_products": product_items,
-            "selected_product_names": selected_list if isinstance(selected_list, list) else [p["name"] for p in product_items],
+            "selected_product_names": [p["name"] for p in product_items if p["name"] not in skipped_set],
             "count": int(len(by[mst])),
             "default_prefix": str(suggestions[mst]),
             "suggested": str(suggested),
@@ -834,6 +905,7 @@ def process_workbook(path, out, data):
     profile = data.get("profile", "son_phuong")
     word_rules = data.get("word_rules") or {}
     first_word_rules = data.get("first_word_rules") or {}
+    repeated_phrase_removals = normalize_phrase_list(data.get("repeated_phrase_removals") or [])
     include_company_prefix = data.get("include_company_prefix") is not False
     price_rules = data.get("price_group_rules") or {}
     price_range_rules = data.get("price_range_rules") or {}
@@ -850,7 +922,7 @@ def process_workbook(path, out, data):
         key = product_key(mst, prod)
         base_code = str(manual_code_overrides.get(key) or "").strip()
         if not base_code:
-            base_code = make_code(mst, prod, 1, prefix_map, profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix)
+            base_code = make_code(mst, prod, 1, prefix_map, profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(base_code)
         if not rule:
             continue
@@ -867,7 +939,7 @@ def process_workbook(path, out, data):
         qty = cell(df, i, qi) if qi is not None else 1
         code = str(manual_code_overrides.get(key) or "").strip()
         if not code:
-            code = make_code(mst, prod, qty, prefix_map, profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix)
+            code = make_code(mst, prod, qty, prefix_map, profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(code)
         if code and rule and pri is not None:
             code += price_group_suffix(parse_price(cell(df, i, pri)), rule, occupied.get(key))
@@ -904,7 +976,7 @@ def import_profile_config(profile):
     current = load_config()
     current["selected_profile"] = target
     current["columns"].update(incoming.get("columns") or {})
-    current["profiles"][target] = incoming["profiles"].get(source, empty_profile_config())
+    current["profiles"][target] = incoming["profiles"].get(source, empty_profile_config(target))
     return jsonify(save_config(current))
 
 
@@ -981,15 +1053,16 @@ def process():
         profile = data.get("profile", cfg.get("selected_profile", "son_phuong"))
         cfg["selected_profile"] = profile
         cfg["columns"].update({k: data.get(k, v) for k, v in cfg["columns"].items()})
-        cfg["profiles"].setdefault(profile, empty_profile_config())
-        old_profile = cfg["profiles"].get(profile) or empty_profile_config()
+        cfg["profiles"].setdefault(profile, empty_profile_config(profile))
+        old_profile = cfg["profiles"].get(profile) or empty_profile_config(profile)
         merged_price_ranges = merge_price_ranges(old_profile.get("price_range_rules"), data.get("price_range_rules", {}))
         cfg["profiles"][profile].update({
             "prefixes": data.get("prefixes", {}),
-            "selected_products": data.get("selected_products_map", {}),
+            "selected_products": data.get("skipped_products_map", {}),
             "removed_companies": data.get("removed_companies", old_profile.get("removed_companies", {})),
             "word_rules": data.get("word_rules", {}),
             "first_word_rules": data.get("first_word_rules", {}),
+            "repeated_phrase_removals": normalize_phrase_list(data.get("repeated_phrase_removals", old_profile.get("repeated_phrase_removals", []))),
             "price_group_rules": data.get("price_group_rules", {}),
             "price_range_rules": merged_price_ranges,
             "manual_code_overrides": data.get("manual_code_overrides", {}),

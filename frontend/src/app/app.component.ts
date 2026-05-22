@@ -1,9 +1,10 @@
 import { Component } from '@angular/core';
 import { CommonModule, KeyValuePipe } from '@angular/common';
-import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse, HttpEventType } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
 type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh';
+type SuspectSectionKey = 'near_phrase' | 'misorder';
 
 type ConfigProfile = {
   prefixes: Record<string, string>;
@@ -11,6 +12,7 @@ type ConfigProfile = {
   removed_companies: Record<string, boolean>;
   word_rules: Record<string, string>;
   first_word_rules: Record<string, string>;
+  repeated_phrase_removals: string[];
   price_group_rules: Record<string, unknown>;
   price_range_rules: Record<string, unknown>;
   manual_code_overrides: Record<string, string>;
@@ -24,6 +26,29 @@ type AppConfig = {
   profiles: Record<ProfileKey, ConfigProfile>;
 };
 
+type PriceDetailRow = {
+  key: string;
+  excelRow: string;
+  companyName: string;
+  productName: string;
+  price: number;
+  deltaAmount: number;
+  deltaPercent: number;
+};
+
+type PriceBucket = {
+  key: string;
+  label: string;
+  count: number;
+  min: number;
+  max: number;
+  averagePrice: number;
+  marginPercent: number;
+  adjustedAverage: number;
+  rows: Array<{ key: string; excelRow: string; companyName: string; productName: string; price: number }>;
+  details: PriceDetailRow[] | null;
+};
+
 @Component({
   selector: 'app-root',
   standalone: true,
@@ -35,6 +60,10 @@ export class AppComponent {
   step = 1;
   error: string | null = null;
   isLoading = false;
+  processingProgress: number | null = null;
+  processingProgressLabel = '';
+  showConfigOperationLoading = false;
+  configOperationLabel = '';
   showErrorModal = false;
   errorMessage = '';
 
@@ -74,8 +103,10 @@ export class AppComponent {
 
   wordRules: Record<string, string> = {};
   firstWordRules: Record<string, string> = {};
+  repeatedPhraseRemovals: string[] = [];
   wordRuleRows: Array<{ word: string; output: string }> = [];
   firstWordRuleRows: Array<{ word: string; output: string }> = [];
+  repeatedPhraseRemovalRows: string[] = [];
   showWordRuleModal = false;
   includeCompanyPrefix = true;
 
@@ -84,15 +115,32 @@ export class AppComponent {
   priceConflictRows: any[] = [];
   priceConflictGroups: any[] = [];
   showPriceGroupModal = false;
+  expandedPriceBuckets: Record<string, boolean> = {};
+  priceFilterAllPercent = 8;
+  priceAdjustAllPercent = 0;
   manualCodeOverrides: Record<string, string> = {};
+  longCodeCounts: Record<string, number> = {};
   misorderGroups: any[] = [];
   misorderCanonicalCodes: Record<string, string> = {};
-  showMisorderModal = false;
+  nearPhraseGroups: any[] = [];
+  nearPhraseChoices: Record<string, string> = {};
+  showSuspectModal = false;
+  activeSuspectSection: SuspectSectionKey = 'near_phrase';
   showAddressModal = false;
   currentAddressCompany: any = null;
   showSkippedModal = false;
+  selectedProfileLabelText = '';
+  selectedProfileNoteText = '';
+  wordRuleCountValue = 0;
+  skippedCompanyList: any[] = [];
+  private configOperationTimer: ReturnType<typeof setTimeout> | null = null;
+  private configOperationId = 0;
+  private codePreviewCache = new Map<string, string>();
+  private processingProgressTimer: ReturnType<typeof setInterval> | null = null;
+  private processingProgressClearTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private http: HttpClient) {
+    this.refreshUiDerivedState();
     this.loadConfig();
   }
 
@@ -119,21 +167,30 @@ export class AppComponent {
     const profile: ConfigProfile = { ...this.emptyProfileState(), ...(this.config?.profiles?.[this.selectedProfile] || {}) };
     this.wordRules = { ...(profile.word_rules || {}) };
     this.firstWordRules = { ...(profile.first_word_rules || {}) };
+    this.repeatedPhraseRemovals = this.normalizePhraseList(profile.repeated_phrase_removals || []);
     this.includeCompanyPrefix = profile.include_company_prefix !== false;
     this.priceGroupRules = { ...(profile.price_group_rules || {}) };
     this.priceRangeRules = { ...(profile.price_range_rules || {}) };
     this.manualCodeOverrides = { ...(profile.manual_code_overrides || {}) };
     this.outputPath = profile.output_path || '';
+    this.invalidateCodePreviewCache();
+    this.refreshUiDerivedState();
   }
 
-  onProfileChange() {
-    this.applyProfileColumnDefaults();
-    this.applyProfileConfig();
-    if (this.companies.length) {
-      this.applySavedProfileToCompanies();
-      this.verifyPrefixes();
-      this.refreshPriceGroups();
-      this.refreshMisorderGroups();
+  async onProfileChange() {
+    const operationId = this.beginConfigOperation('Đang tải cấu hình...');
+    try {
+      this.applyProfileColumnDefaults();
+      this.applyProfileConfig();
+      await this.yieldToBrowser();
+      if (this.companies.length) {
+        this.applySavedProfileToCompanies();
+        this.invalidateCodePreviewCache();
+        this.verifyPrefixes(true, false);
+        await this.refreshDerivedCodeViewsChunked();
+      }
+    } finally {
+      this.endConfigOperation(operationId);
     }
   }
 
@@ -175,24 +232,25 @@ export class AppComponent {
   }
 
   selectedProfileLabel() {
-    return this.profiles.find(p => p.key === this.selectedProfile)?.label || '';
+    return this.selectedProfileLabelText;
   }
 
   selectedProfileNote() {
-    return this.profiles.find(p => p.key === this.selectedProfile)?.note || '';
+    return this.selectedProfileNoteText;
   }
 
   wordRuleCount() {
-    return Object.keys(this.wordRules || {}).length + Object.keys(this.firstWordRules || {}).length;
+    return this.wordRuleCountValue;
   }
 
-  emptyProfileState(): ConfigProfile {
+  emptyProfileState(profileKey: ProfileKey = this.selectedProfile): ConfigProfile {
     return {
       prefixes: {},
       selected_products: {},
       removed_companies: {},
       word_rules: { 'đen': 'DEN', 'tôn': 'TON' },
       first_word_rules: {},
+      repeated_phrase_removals: profileKey === 'cao_thanh' ? ['inox'] : [],
       price_group_rules: {},
       price_range_rules: {},
       manual_code_overrides: {},
@@ -204,7 +262,7 @@ export class AppComponent {
   currentProfileSnapshot(): ConfigProfile {
     const existing = { ...this.emptyProfileState(), ...(this.config?.profiles?.[this.selectedProfile] || {}) };
     const prefixes: Record<string, string> = { ...existing.prefixes };
-    const selectedProducts: Record<string, string[]> = { ...existing.selected_products };
+    const skippedProducts: Record<string, string[]> = { ...existing.selected_products };
     const removedCompanies: Record<string, boolean> = { ...existing.removed_companies };
     if (this.companies.length) {
       for (const company of this.companies) {
@@ -216,7 +274,7 @@ export class AppComponent {
           } else {
             delete prefixes[company.mst];
           }
-          selectedProducts[company.mst] = Array.from(company.selected_products || []).map(String);
+          skippedProducts[company.mst] = this.companySkippedProducts(company);
           delete removedCompanies[company.mst];
         } else {
           removedCompanies[company.mst] = true;
@@ -226,10 +284,11 @@ export class AppComponent {
     return {
       ...existing,
       prefixes,
-      selected_products: this.deltaSelectedProducts(selectedProducts),
+      selected_products: this.deltaSkippedProducts(skippedProducts),
       removed_companies: removedCompanies,
       word_rules: { ...this.wordRules },
       first_word_rules: { ...this.firstWordRules },
+      repeated_phrase_removals: this.normalizePhraseList(this.repeatedPhraseRemovals),
       price_group_rules: { ...this.priceGroupRules },
       price_range_rules: { ...this.priceRangeRules },
       manual_code_overrides: { ...this.manualCodeOverrides },
@@ -238,17 +297,23 @@ export class AppComponent {
     };
   }
 
-  deltaSelectedProducts(selectedProducts: Record<string, string[]>) {
+  companySkippedProducts(company: any) {
+    const allProducts = (company.all_products || []).map((product: any) => product.name);
+    const selectedSet = new Set(Array.from(company.selected_products || []).map(String));
+    return allProducts.filter((productName: string) => !selectedSet.has(productName));
+  }
+
+  deltaSkippedProducts(skippedProducts: Record<string, string[]>) {
     const delta: Record<string, string[]> = {};
-    for (const [mst, products] of Object.entries(selectedProducts || {})) {
+    for (const [mst, products] of Object.entries(skippedProducts || {})) {
       const company = this.companies.find(item => item.mst === mst);
       if (!company) {
         if (Array.isArray(products) && products.length) delta[mst] = products;
         continue;
       }
       const allProducts = (company.all_products || []).map((product: any) => product.name);
-      const selected = Array.isArray(products) ? products : [];
-      if (!this.sameStringSet(selected, allProducts)) delta[mst] = selected;
+      const skipped = Array.isArray(products) ? products : [];
+      if (skipped.length && skipped.length < allProducts.length) delta[mst] = skipped;
     }
     return delta;
   }
@@ -261,9 +326,9 @@ export class AppComponent {
 
   configSnapshot(): AppConfig {
     const profiles: Record<ProfileKey, ConfigProfile> = {
-      son_phuong: { ...this.emptyProfileState(), ...(this.config?.profiles?.son_phuong || {}) },
-      cao_thanh: { ...this.emptyProfileState(), ...(this.config?.profiles?.cao_thanh || {}) },
-      quang_thinh: { ...this.emptyProfileState(), ...(this.config?.profiles?.quang_thinh || {}) }
+      son_phuong: { ...this.emptyProfileState('son_phuong'), ...(this.config?.profiles?.son_phuong || {}) },
+      cao_thanh: { ...this.emptyProfileState('cao_thanh'), ...(this.config?.profiles?.cao_thanh || {}) },
+      quang_thinh: { ...this.emptyProfileState('quang_thinh'), ...(this.config?.profiles?.quang_thinh || {}) }
     };
     profiles[this.selectedProfile] = this.currentProfileSnapshot();
     return {
@@ -283,35 +348,50 @@ export class AppComponent {
   }
 
   saveProfileConfig(showSuccess = true) {
+    const operationId = this.beginConfigOperation('Đang lưu cấu hình...');
     this.isLoading = true;
     this.http.post<AppConfig>('/api/config', this.configSnapshot()).subscribe({
       next: (cfg) => {
         this.config = cfg;
         this.applyProfileConfig();
         this.isLoading = false;
+        this.endConfigOperation(operationId);
         if (showSuccess) this.showMessage('Đã lưu cấu hình cho ' + this.selectedProfileLabel() + '.');
       },
-      error: (err) => this.fail(err, 'Không lưu được cấu hình.')
+      error: (err) => {
+        this.endConfigOperation(operationId);
+        this.fail(err, 'Không lưu được cấu hình.');
+      }
     });
   }
 
   deleteProfileCache() {
     if (!window.confirm('Xóa cấu hình đã lưu cho ' + this.selectedProfileLabel() + '?')) return;
+    const operationId = this.beginConfigOperation('Đang xóa cache cấu hình...');
+    this.isLoading = true;
     const next = this.configSnapshot();
     next.profiles[this.selectedProfile] = this.emptyProfileState();
     this.http.post<AppConfig>('/api/config', next).subscribe({
-      next: (cfg) => {
+      next: async (cfg) => {
         this.config = cfg;
         this.applyProfileConfig();
         for (const company of this.companies) company.process = true;
-        this.verifyPrefixes();
+        this.verifyPrefixes(true, false);
+        await this.refreshDerivedCodeViewsChunked();
+        this.isLoading = false;
+        this.endConfigOperation(operationId);
         this.showMessage('Đã xóa cache cấu hình cho ' + this.selectedProfileLabel() + '.');
       },
-      error: (err) => this.fail(err, 'Không xóa được cache cấu hình.')
+      error: (err) => {
+        this.endConfigOperation(operationId);
+        this.fail(err, 'Không xóa được cache cấu hình.');
+      }
     });
   }
 
-  exportConfig() {
+  async exportConfig() {
+    const operationId = this.beginConfigOperation('Đang xuất cấu hình...');
+    await this.yieldToBrowser();
     const profile = this.currentProfileSnapshot();
     const exportData = {
       version: 6,
@@ -324,6 +404,7 @@ export class AppComponent {
           excluded_products: {},
           formula_options: this.legacyFormulaOptions(profile.word_rules),
           first_word_rules: profile.first_word_rules,
+          repeated_phrase_removals: profile.repeated_phrase_removals,
           include_company_prefix: profile.include_company_prefix,
           price_group_rules: this.legacyPriceRules(profile.price_group_rules),
           output_path: profile.output_path,
@@ -332,6 +413,7 @@ export class AppComponent {
       }
     };
     this.downloadJson(exportData, `product-code-${this.selectedProfile}-config.json`);
+    this.endConfigOperation(operationId);
   }
 
   legacyProducts(products: Record<string, string>) {
@@ -392,20 +474,26 @@ export class AppComponent {
   }
 
   importConfig(data: unknown) {
+    const operationId = this.beginConfigOperation('Đang nhập cấu hình...');
     this.isLoading = true;
     this.http.post<AppConfig>(`/api/config/profile/${this.selectedProfile}`, data).subscribe({
-      next: (cfg) => {
+      next: async (cfg) => {
         this.config = cfg;
         this.applyProfileColumnDefaults();
         this.applyProfileConfig();
         if (this.companies.length) {
           this.applySavedProfileToCompanies();
-          this.verifyPrefixes();
+          this.verifyPrefixes(true, false);
+          await this.refreshDerivedCodeViewsChunked();
         }
         this.isLoading = false;
+        this.endConfigOperation(operationId);
         this.showMessage('Đã nhập cấu hình cho ' + this.selectedProfileLabel() + '.');
       },
-      error: (err) => this.fail(err, 'Không nhập được cấu hình.')
+      error: (err) => {
+        this.endConfigOperation(operationId);
+        this.fail(err, 'Không nhập được cấu hình.');
+      }
     });
   }
 
@@ -446,8 +534,8 @@ export class AppComponent {
           return { ...c, process: true, selected_products: selected };
         });
         this.applySavedProfileToCompanies();
+        this.invalidateCodePreviewCache();
         this.verifyPrefixes();
-        this.refreshPriceGroups();
         this.step = 3;
         this.isLoading = false;
       },
@@ -458,13 +546,17 @@ export class AppComponent {
   applySavedProfileToCompanies() {
     const profile: ConfigProfile = { ...this.emptyProfileState(), ...(this.config?.profiles?.[this.selectedProfile] || {}) };
     const prefixes = profile.prefixes || {};
-    const selectedMap = profile.selected_products || {};
+    const skippedMap = profile.selected_products || {};
     const removedCompanies = profile.removed_companies || {};
     for (const c of this.companies) {
       if (prefixes[c.mst]) c.value = prefixes[c.mst];
-      if (Array.isArray(selectedMap[c.mst])) c.selected_products = new Set<string>(selectedMap[c.mst]);
+      if (Array.isArray(skippedMap[c.mst])) {
+        const skippedSet = new Set<string>(skippedMap[c.mst]);
+        c.selected_products = new Set<string>((c.all_products || []).map((product: any) => product.name).filter((name: string) => !skippedSet.has(name)));
+      }
       c.process = !removedCompanies[c.mst];
     }
+    this.refreshUiDerivedState();
   }
 
   basePayload() {
@@ -506,7 +598,8 @@ export class AppComponent {
     this.normalCompanies = visibleCompanies.filter(c => !this.duplicateCompanies.includes(c)).sort(normalSorter);
   }
 
-  verifyPrefixes(updateList = true) {
+  verifyPrefixes(updateList = true, refreshDerived = true) {
+    this.invalidateCodePreviewCache();
     const prefixCount = new Map<string, number>();
     if (this.includeCompanyPrefix) {
       for (const item of this.companies) {
@@ -542,9 +635,11 @@ export class AppComponent {
         item.needs_manual = false;
       }
     }
-    if (updateList) this.sortCompanies();
-    this.refreshPriceGroups();
-    this.refreshMisorderGroups();
+    if (updateList) {
+      this.sortCompanies();
+      if (refreshDerived) this.refreshDerivedCodeViews();
+    }
+    this.refreshUiDerivedState();
   }
 
   openProductModal(company: any) {
@@ -552,24 +647,73 @@ export class AppComponent {
     this.currentProductList = (company.all_products || []).map((p: any) => ({
       ...p,
       selected: company.selected_products.has(p.name),
-      code: this.productCodeFor(company, p.name)
+      code: this.productCodeFor(company, p.name),
+      rowSummary: this.productRowSummary(p),
+      priceSummary: this.productPriceSummary(p)
     }));
     this.showProductModal = true;
   }
 
-  productBaseCode(company: any, productName: string) {
-    return this.buildCodePreview(company, productName || '', true);
+  productBaseCode(company: any, productName: string, trim = true) {
+    return this.cachedBuildCodePreview(company, productName || '', trim);
   }
 
-  productCodeFor(company: any, productName: string) {
+  productCodeFor(company: any, productName: string, trim = true) {
     const key = this.productKey(company.mst, productName || '');
-    return this.manualCodeOverrides[key] || this.productBaseCode(company, productName);
+    return this.manualCodeOverrides[key] || this.productBaseCode(company, productName, trim);
+  }
+
+  refreshDerivedCodeViews() {
+    if (this.selectedProfile === 'cao_thanh') {
+      if (this.showPriceGroupModal) this.refreshPriceGroups();
+    } else {
+      this.priceConflictRows = [];
+      this.priceConflictGroups = [];
+      this.misorderGroups = [];
+      this.nearPhraseGroups = [];
+    }
+    this.updateLongCodeCounts();
+    if (this.showProductModal && this.currentCompany) {
+      for (const product of this.currentProductList) {
+        product.code = this.productCodeFor(this.currentCompany, product.name || '');
+      }
+    }
+    if (this.showSuspectModal) this.refreshActiveSuspectSection();
+  }
+
+  async refreshDerivedCodeViewsChunked() {
+    if (this.selectedProfile === 'cao_thanh') {
+      if (this.showPriceGroupModal) {
+        this.refreshPriceGroups();
+        await this.yieldToBrowser();
+      }
+    } else {
+      this.priceConflictRows = [];
+      this.priceConflictGroups = [];
+      this.misorderGroups = [];
+      this.nearPhraseGroups = [];
+    }
+    await this.updateLongCodeCountsChunked();
+    if (this.showProductModal && this.currentCompany) {
+      for (const product of this.currentProductList) {
+        product.code = this.productCodeFor(this.currentCompany, product.name || '');
+      }
+    }
+    if (this.showSuspectModal) this.refreshActiveSuspectSection();
   }
 
   productCodePreview(product: any) {
     if (!this.currentCompany) return '';
     const productName = product?.name || '';
     return product?.code || this.productCodeFor(this.currentCompany, productName);
+  }
+
+  productCodeLength(product: any) {
+    return (this.productCodePreview(product) || '').length;
+  }
+
+  productCodeTooLong(product: any) {
+    return this.productCodeLength(product) > 50;
   }
 
   productRowSummary(product: any) {
@@ -590,12 +734,35 @@ export class AppComponent {
     return priceCount > 1 ? `${range} (${priceCount} mức giá)` : range;
   }
 
-  longCodeCount(company: any) {
+  updateLongCodeCounts() {
+    const next: Record<string, number> = {};
+    for (const company of this.companies || []) {
+      next[company.mst] = this.computeLongCodeCount(company);
+    }
+    this.longCodeCounts = next;
+  }
+
+  async updateLongCodeCountsChunked() {
+    const next: Record<string, number> = {};
+    let processed = 0;
+    for (const company of this.companies || []) {
+      next[company.mst] = 0;
+      for (const product of company?.all_products || []) {
+        if (!company.selected_products?.has(product.name)) continue;
+        const code = this.productCodeFor(company, product.name || '', false);
+        if ((code || '').length > 50) next[company.mst]++;
+        processed++;
+        if (processed % 150 === 0) await this.yieldToBrowser();
+      }
+    }
+    this.longCodeCounts = next;
+  }
+
+  computeLongCodeCount(company: any) {
     let count = 0;
     for (const product of company?.all_products || []) {
       if (!company.selected_products?.has(product.name)) continue;
-      const key = this.productKey(company.mst, product.name || '');
-      const code = this.manualCodeOverrides[key] || this.buildCodePreview(company, product.name || '', false);
+      const code = this.productCodeFor(company, product.name || '', false);
       if ((code || '').length > 50) count++;
     }
     return count;
@@ -619,10 +786,10 @@ export class AppComponent {
         }
       }
       this.manualCodeOverrides = nextOverrides;
+      this.invalidateCodePreviewCache();
     }
     this.closeProductModal();
-    this.refreshPriceGroups();
-    this.refreshMisorderGroups();
+    this.refreshDerivedCodeViews();
   }
 
   closeProductModal() {
@@ -634,6 +801,7 @@ export class AppComponent {
   openWordRuleModal() {
     this.wordRuleRows = this.sortedRuleRows(this.wordRules);
     this.firstWordRuleRows = this.sortedRuleRows(this.firstWordRules);
+    this.repeatedPhraseRemovalRows = [...this.repeatedPhraseRemovals];
     if (!this.wordRuleRows.length) this.addWordRule();
     this.showWordRuleModal = true;
   }
@@ -652,6 +820,27 @@ export class AppComponent {
   removeWordRule(index: number, target: 'rest' | 'first' = 'rest') {
     const rows = target === 'first' ? this.firstWordRuleRows : this.wordRuleRows;
     rows.splice(index, 1);
+  }
+
+  addRepeatedPhraseRemoval() {
+    this.repeatedPhraseRemovalRows.push('');
+  }
+
+  removeRepeatedPhraseRemoval(index: number) {
+    this.repeatedPhraseRemovalRows.splice(index, 1);
+  }
+
+  normalizePhraseList(values: string[]) {
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (const value of values || []) {
+      const phrase = String(value || '').trim();
+      const key = this.normalizeRuleKey(phrase);
+      if (!phrase || !key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(phrase);
+    }
+    return result.sort((a, b) => a.localeCompare(b, 'vi-VN'));
   }
 
   rowsToRules(rows: Array<{ word: string; output: string }>, label: string) {
@@ -676,13 +865,15 @@ export class AppComponent {
     try {
       this.wordRules = this.rowsToRules(this.wordRuleRows, 'Từ thứ 3 trở đi');
       this.firstWordRules = this.rowsToRules(this.firstWordRuleRows, 'Hai từ đầu tiên');
+      this.repeatedPhraseRemovals = this.normalizePhraseList(this.repeatedPhraseRemovalRows);
     } catch (error) {
       this.showMessage(error instanceof Error ? error.message : 'Quy tắc từ thay riêng bị trùng.');
       return;
     }
     this.showWordRuleModal = false;
-    this.refreshPriceGroups();
-    this.refreshMisorderGroups();
+    this.invalidateCodePreviewCache();
+    this.refreshDerivedCodeViews();
+    this.refreshUiDerivedState();
   }
 
   normalizeRuleKey(value: string) {
@@ -708,77 +899,222 @@ export class AppComponent {
   }
 
   buildPriceConflictRows() {
-    const rows: any[] = [];
+    const grouped = new Map<string, any>();
     for (const company of this.companies) {
       if (!company.process) continue;
       for (const product of company.all_products || []) {
         if (!company.selected_products.has(product.name)) continue;
-        const prices = (product.priceRows || []).map((r: any) => Number(r.price)).filter((n: number) => Number.isFinite(n));
-        const unique = Array.from(new Set(prices));
-        if (unique.length < 2) continue;
-        const key = this.productKey(company.mst, product.name);
-        const saved = this.priceGroupRules[key];
-      const row: any = {
-          key,
-          company,
-          product,
-          code: this.buildCodePreview(company, product.name),
-          count: unique.length,
-          min: Math.min(...prices),
-          max: Math.max(...prices),
-          percent: Number(saved?.percent || 8),
-          savedRule: saved || null
-        };
-        row.priceGroups = this.buildPriceGroupPreview(row);
-        rows.push(row);
+        const code = this.productCodeFor(company, product.name);
+        if (!code) continue;
+        const priceItems = (product.priceRows || [])
+          .map((item: any, index: number) => ({ item, index, price: Number(item.price) }))
+          .filter((item: any) => Number.isFinite(item.price));
+        if (!priceItems.length) continue;
+        const productKey = this.productKey(company.mst, product.name);
+        const savedByProduct = this.priceGroupRules[productKey];
+        let row = grouped.get(code);
+        if (!row) {
+          const savedByCode = this.priceRangeRules[code];
+          row = {
+            key: `price-code|||${code}`,
+            code,
+            companies: [],
+            companyKeys: new Set<string>(),
+            products: [],
+            productKeySet: new Set<string>(),
+            sourceRows: [],
+            priceRowCount: 0,
+            min: 0,
+            max: 0,
+            average: 0,
+            filterPercent: Number(savedByProduct?.percent || savedByCode?.percent || 8),
+            bulkAdjustPercent: 0,
+            savedRule: savedByProduct || savedByCode || null,
+            buckets: [] as PriceBucket[]
+          };
+          grouped.set(code, row);
+        }
+        if (!row.companyKeys.has(company.mst)) {
+          row.companyKeys.add(company.mst);
+          row.companies.push(company);
+        }
+        if (!row.productKeySet.has(productKey)) {
+          row.productKeySet.add(productKey);
+          row.products.push({ key: productKey, name: product.name, company });
+        }
+        for (const priceItem of priceItems) {
+          row.sourceRows.push({
+            key: `${productKey}|||${priceItem.item.excelRow || priceItem.index}`,
+            company,
+            product,
+            productKey,
+            excelRow: priceItem.item.excelRow || '',
+            name: priceItem.item.name || product.name,
+            price: priceItem.price
+          });
+        }
       }
     }
-    return rows.sort((a, b) => a.company.company.localeCompare(b.company.company) || a.product.name.localeCompare(b.product.name));
+    const rows: any[] = [];
+    for (const row of grouped.values()) {
+      const prices = row.sourceRows.map((item: any) => item.price);
+      const unique = Array.from(new Set(prices));
+      if (unique.length < 2) continue;
+      row.count = unique.length;
+      row.priceRowCount = prices.length;
+      row.min = Math.min(...prices);
+      row.max = Math.max(...prices);
+      row.average = prices.reduce((sum: number, price: number) => sum + price, 0) / prices.length;
+      row.companyDisplay = row.companies.map((company: any) => `${company.mst} - ${company.company}`).join(' | ');
+      row.productDisplay = row.products.map((product: any) => product.name).join(' | ');
+      row.productCount = row.products.length;
+      row.buckets = this.buildPriceBuckets(row);
+      rows.push(row);
+    }
+    return rows.sort((a, b) => a.code.localeCompare(b.code));
   }
 
   groupPriceRows(rows: any[]) {
-    const map = new Map<string, any>();
-    for (const row of rows) {
-      const key = row.company.mst;
-      if (!map.has(key)) map.set(key, { company: row.company, rows: [] });
-      map.get(key).rows.push(row);
-    }
-    return Array.from(map.values());
+    return rows.length ? [{ key: 'all-price-conflicts', title: 'Các Mã VT có nhiều đơn giá', rows }] : [];
   }
 
-  buildPriceGroupPreview(row: any) {
-    const min = Number(row.savedRule?.min_price || row.min);
-    const percent = Number(row.percent || 8);
-    const step = min * percent / 100;
-    if (!min || !step) return [];
-    const rawMap = new Map<number, any[]>();
-    for (const item of row.product.priceRows || []) {
-      const price = Number(item.price);
-      if (!Number.isFinite(price)) continue;
-      const raw = Math.floor((price - min) / step) + 1;
-      const group = Math.max(1, raw);
-      if (!rawMap.has(group)) rawMap.set(group, []);
-      rawMap.get(group)!.push(item);
+  priceBaseline(average: number, percent: number) {
+    if (!Number.isFinite(average) || !Number.isFinite(percent)) return 0;
+    return average * (1 - percent / 100);
+  }
+
+  formatSignedPrice(value: number) {
+    if (!Number.isFinite(value)) return '';
+    if (Math.abs(value) < 0.000001) return this.formatPrice(0);
+    const sign = value > 0 ? '+' : '-';
+    return `${sign}${this.formatPrice(Math.abs(value))}`;
+  }
+
+  buildPriceBuckets(row: any) {
+    const filterPercent = Number(row.filterPercent || 8);
+    const sorted = [...(row.sourceRows || [])].sort((left: any, right: any) => left.price - right.price);
+    const groupedRows: any[][] = [];
+    for (const item of sorted) {
+      const current = groupedRows[groupedRows.length - 1];
+      if (!current?.length) {
+        groupedRows.push([item]);
+        continue;
+      }
+      const average = current.reduce((sum, currentItem) => sum + currentItem.price, 0) / current.length;
+      const deviation = average > 0 ? Math.abs((item.price - average) / average) * 100 : 0;
+      if (deviation <= filterPercent) {
+        current.push(item);
+      } else {
+        groupedRows.push([item]);
+      }
     }
-    const occupied = Array.from(rawMap.keys()).sort((a, b) => a - b);
-    return occupied.map((raw, index) => {
-      const items = rawMap.get(raw) || [];
-      const example = items[0] || {};
-      const from = min + (raw - 1) * step;
-      const to = min + raw * step;
+    return groupedRows.map((items, index) => {
+      const key = `${row.key}|||bucket|||${index + 1}`;
+      const averagePrice = items.reduce((sum, item) => sum + item.price, 0) / items.length;
+      const savedGroup = this.savedPriceBucketRule(row, index, items);
+      const marginPercent = Number(savedGroup?.adjust_percent || 0);
       return {
-        suffix: `.${String(index + 1).padStart(3, '0')}`,
-        rangeDisplay: `${this.formatPrice(from)} - < ${this.formatPrice(to)}`,
-        exampleRowDisplay: example.excelRow || '',
-        exampleNameDisplay: example.name || row.product.name,
-        examplePriceDisplay: this.formatPrice(Number(example.price)),
-        count: items.length
+        key,
+        label: `Nhóm ${index + 1}`,
+        count: items.length,
+        min: Math.min(...items.map(item => item.price)),
+        max: Math.max(...items.map(item => item.price)),
+        averagePrice,
+        marginPercent,
+        adjustedAverage: this.priceBaseline(averagePrice, marginPercent),
+        rows: items.map(item => ({
+          key: item.key,
+          excelRow: String(item.excelRow || ''),
+          companyName: String(item.company.company || ''),
+          productName: String(item.product.name || item.name || ''),
+          price: Number(item.price || 0)
+        })),
+        details: null
       };
     });
   }
 
+  savedPriceBucketRule(row: any, index: number, items: Array<{ price: number }>) {
+    const groups = Array.isArray(row?.savedRule?.groups) ? row.savedRule.groups : [];
+    const min = Math.min(...items.map(item => item.price));
+    const max = Math.max(...items.map(item => item.price));
+    return groups.find((group: any) => Number(group?.min_price) === min && Number(group?.max_price) === max)
+      || groups.find((group: any) => Number(group?.index) === index + 1)
+      || null;
+  }
+
+  priceBucketDetails(bucket: PriceBucket) {
+    if (bucket.details) return bucket.details;
+    bucket.details = bucket.rows
+      .slice()
+      .sort((left, right) => Number(left.excelRow || 0) - Number(right.excelRow || 0) || left.productName.localeCompare(right.productName, 'vi-VN'))
+      .map(item => {
+        const deltaAmount = item.price - bucket.adjustedAverage;
+        const deltaPercent = bucket.adjustedAverage > 0 ? (deltaAmount / bucket.adjustedAverage) * 100 : 0;
+        return {
+          key: item.key,
+          excelRow: String(item.excelRow || ''),
+          companyName: String(item.companyName || ''),
+          productName: String(item.productName || ''),
+          price: Number(item.price || 0),
+          deltaAmount,
+          deltaPercent
+        };
+      });
+    return bucket.details;
+  }
+
+  togglePriceBucket(bucket: PriceBucket) {
+    this.expandedPriceBuckets[bucket.key] = !this.expandedPriceBuckets[bucket.key];
+    if (this.expandedPriceBuckets[bucket.key]) this.priceBucketDetails(bucket);
+  }
+
+  bucketDeltaLabel(detail: PriceDetailRow) {
+    if (Math.abs(detail.deltaPercent) < 0.000001) return 'Hòa vốn';
+    return detail.deltaPercent > 0 ? 'Lãi' : 'Lỗ';
+  }
+
+  bucketLossCount(bucket: PriceBucket) {
+    return (bucket.rows || []).filter(item => item.price < bucket.adjustedAverage).length;
+  }
+
+  bucketHasLoss(bucket: PriceBucket) {
+    return this.bucketLossCount(bucket) > 0;
+  }
+
   onPriceGroupPercentChange(row: any) {
-    row.priceGroups = this.buildPriceGroupPreview(row);
+    row.buckets = this.buildPriceBuckets(row);
+  }
+
+  onPriceBucketMarginChange(bucket: PriceBucket) {
+    bucket.adjustedAverage = this.priceBaseline(bucket.averagePrice, Number(bucket.marginPercent || 0));
+    bucket.details = null;
+  }
+
+  applyPriceAdjustPercentToBuckets(buckets: PriceBucket[], percent: number) {
+    const nextPercent = Number(percent || 0);
+    for (const bucket of buckets || []) {
+      bucket.marginPercent = nextPercent;
+      this.onPriceBucketMarginChange(bucket);
+    }
+  }
+
+  applyPriceAdjustPercentToAll() {
+    for (const row of this.priceConflictRows) {
+      this.applyPriceAdjustPercentToBuckets(row.buckets || [], this.priceAdjustAllPercent);
+    }
+  }
+
+  applyPriceFilterPercentToAll() {
+    const nextPercent = Number(this.priceFilterAllPercent || 0);
+    for (const row of this.priceConflictRows) {
+      row.filterPercent = nextPercent;
+      this.onPriceGroupPercentChange(row);
+    }
+  }
+
+  applyPriceAdjustPercentToRow(row: any) {
+    this.applyPriceAdjustPercentToBuckets(row.buckets || [], Number(row.bulkAdjustPercent || 0));
   }
 
   openPriceGroupModal() {
@@ -790,24 +1126,34 @@ export class AppComponent {
     const next: Record<string, any> = {};
     const ranges = { ...this.priceRangeRules };
     for (const row of this.priceConflictRows) {
-      next[row.key] = {
-        base_code: row.code,
+      const percent = Number(row.filterPercent || 8);
+      const groups = (row.buckets || []).map((bucket: PriceBucket, index: number) => ({
+        index: index + 1,
+        label: bucket.label,
+        min_price: bucket.min,
+        max_price: bucket.max,
+        average_price: bucket.averagePrice,
+        adjust_percent: Number(bucket.marginPercent || 0)
+      }));
+      for (const product of row.products || []) {
+        next[product.key] = {
+          base_code: row.code,
+          min_price: row.min,
+          max_price: row.max,
+          percent,
+          groups
+        };
+      }
+      ranges[row.code] = {
         min_price: row.min,
         max_price: row.max,
-        percent: Number(row.percent || 8)
-      };
-      const old = ranges[row.code];
-      ranges[row.code] = {
-        min_price: old ? Math.min(Number(old.min_price), row.min) : row.min,
-        max_price: old ? Math.max(Number(old.max_price), row.max) : row.max,
-        percent: Number(row.percent || 8)
+        percent
       };
     }
     this.priceGroupRules = next;
     this.priceRangeRules = ranges;
     this.showPriceGroupModal = false;
   }
-
   openAddressModal(company: any) {
     this.currentAddressCompany = company;
     this.showAddressModal = true;
@@ -883,6 +1229,40 @@ export class AppComponent {
     return parts;
   }
 
+  removeRepeatedPhrases(words: string[], repeatedPhrases: string[]) {
+    const phrases = this.normalizePhraseList(repeatedPhrases)
+      .map(phrase => this.codeWords(phrase))
+      .filter(items => items.length)
+      .sort((a, b) => b.length - a.length);
+    if (!phrases.length) return words;
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (let i = 0; i < words.length;) {
+      let match: string[] | null = null;
+      for (const phrase of phrases) {
+        if (phrase.length > words.length - i) continue;
+        const current = words.slice(i, i + phrase.length).join(' ');
+        if (this.normalizeRuleKey(current) === this.normalizeRuleKey(phrase.join(' '))) {
+          match = phrase;
+          break;
+        }
+      }
+      if (match) {
+        const currentWords = words.slice(i, i + match.length);
+        const key = this.normalizeRuleKey(currentWords.join(' '));
+        if (!seen.has(key)) {
+          result.push(...currentWords);
+          seen.add(key);
+        }
+        i += match.length;
+      } else {
+        result.push(words[i]);
+        i++;
+      }
+    }
+    return result;
+  }
+
   normalizeCodeText(value: string, keepSlash = false) {
     const allowedPattern = keepSlash ? /[^A-Z0-9./]+/g : /[^A-Z0-9.]+/g;
     return (value || '')
@@ -917,6 +1297,22 @@ export class AppComponent {
     return this.normalizeSep(value).split(/\s+/).filter(Boolean);
   }
 
+  reducerDimensionToken(words: string[]) {
+    const last = words[words.length - 1] || '';
+    const normalized = this.normalizeCodeText(last, true);
+    return /\d+(?:[.,]\d+)?\/\d+/.test(normalized) ? normalized : '';
+  }
+
+  isConReducerProduct(words: string[]) {
+    return this.normalizeCodeText(words[0] || '') === 'CON' && Boolean(this.reducerDimensionToken(words));
+  }
+
+  normalizeCaoThanhConReducerWords(words: string[]) {
+    if (!this.isConReducerProduct(words)) return words;
+    const hasThu = words.some(word => this.normalizeCodeText(word) === 'THU');
+    return hasThu ? words : [words[0], 'thu', ...words.slice(1)];
+  }
+
   trimCode(value: string) {
     return (value || '').replace(/\.+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 50).replace(/\.+$/g, '');
   }
@@ -930,9 +1326,10 @@ export class AppComponent {
     const sourceName = this.selectedProfile === 'cao_thanh'
       ? (productName || '').replace(/\([^)]*\)/g, ' ')
       : (productName || '');
-    const words = this.codeWords(sourceName);
+    let words = this.removeRepeatedPhrases(this.codeWords(sourceName), this.repeatedPhraseRemovals);
     let tail = '';
     if (this.selectedProfile === 'cao_thanh') {
+      words = this.normalizeCaoThanhConReducerWords(words);
       const first = this.tokenParts(
         words.slice(0, 2),
         this.firstWordRules,
@@ -985,13 +1382,47 @@ export class AppComponent {
     return trim ? this.trimCode(code) : code.replace(/\.+/g, '.').replace(/^\.+|\.+$/g, '');
   }
 
+  ruleMatchScore(productName: string) {
+    const sourceName = this.selectedProfile === 'cao_thanh'
+      ? (productName || '').replace(/\([^)]*\)/g, ' ')
+      : (productName || '');
+    const words = this.removeRepeatedPhrases(this.codeWords(sourceName), this.repeatedPhraseRemovals);
+    let score = 0;
+    const firstMatch = this.phraseRulePart(words.slice(0, 2), 0, this.firstWordRules);
+    if (firstMatch) score += 100 + firstMatch.length;
+    for (let i = 2; i < words.length;) {
+      const matched = this.phraseRulePart(words, i, this.wordRules);
+      if (matched) {
+        score += matched.length;
+        i += matched.length;
+      } else {
+        i++;
+      }
+    }
+    return score;
+  }
+
+  preferredMisorderCode(items: Array<{ code: string; ruleScore: number }>) {
+    const sorted = [...items].sort((left, right) => {
+      if (right.ruleScore !== left.ruleScore) return right.ruleScore - left.ruleScore;
+      if (left.code.length !== right.code.length) return left.code.length - right.code.length;
+      return left.code.localeCompare(right.code, 'vi-VN');
+    });
+    return sorted[0]?.code || '';
+  }
+
   refreshMisorderGroups() {
+    if (this.selectedProfile !== 'cao_thanh') {
+      this.misorderGroups = [];
+      return;
+    }
     const groups: any[] = [];
     for (const company of this.companies) {
       if (!company.process) continue;
       const map = new Map<string, any[]>();
       for (const product of company.all_products || []) {
         if (!company.selected_products.has(product.name)) continue;
+        const code = this.productCodeFor(company, product.name);
         const words = this.normalizeProductWords(product.name);
         if (words.length < 2) continue;
         const key = this.misorderKey(product.name);
@@ -999,7 +1430,8 @@ export class AppComponent {
         map.get(key)!.push({
           key: this.productKey(company.mst, product.name),
           product,
-          code: this.manualCodeOverrides[this.productKey(company.mst, product.name)] || this.buildCodePreview(company, product.name),
+          code,
+          ruleScore: this.ruleMatchScore(product.name || ''),
           orderKey: this.productOrderKey(product.name)
         });
       }
@@ -1008,39 +1440,148 @@ export class AppComponent {
         if (items.length > 1 && orderCount > 1) {
           const groupKey = `${company.mst}|||${wordKey}`;
           groups.push({ key: groupKey, company, items });
-          if (!this.misorderCanonicalCodes[groupKey]) this.misorderCanonicalCodes[groupKey] = items[0].code;
+          const codes = new Set(items.map(item => item.code));
+          if (!codes.has(this.misorderCanonicalCodes[groupKey])) this.misorderCanonicalCodes[groupKey] = this.preferredMisorderCode(items);
         }
       }
     }
     this.misorderGroups = groups.sort((a, b) => a.company.mst.localeCompare(b.company.mst));
   }
 
-  openMisorderModal() {
-    this.refreshMisorderGroups();
-    this.showMisorderModal = true;
+  openSuspectModal(section: SuspectSectionKey = 'near_phrase') {
+    this.showSuspectModal = true;
+    this.selectSuspectSection(section);
   }
 
-  applyMisorderChoices() {
+  selectSuspectSection(section: SuspectSectionKey) {
+    this.activeSuspectSection = section;
+    this.refreshActiveSuspectSection();
+  }
+
+  refreshActiveSuspectSection() {
+    if (this.activeSuspectSection === 'near_phrase') {
+      this.refreshNearPhraseGroups();
+    } else {
+      this.refreshMisorderGroups();
+    }
+  }
+
+  closeSuspectModal() {
+    this.showSuspectModal = false;
+  }
+
+  openMisorderModal() {
+    this.openSuspectModal('misorder');
+  }
+
+  applyMisorderChoices(groups = this.misorderGroups) {
     const next = { ...this.manualCodeOverrides };
-    for (const group of this.misorderGroups) {
+    for (const group of groups) {
       const selected = this.misorderCanonicalCodes[group.key];
       if (!selected) continue;
       for (const item of group.items) {
         next[item.key] = selected;
       }
     }
+    this.applyManualCodeOverrides(next);
+  }
+
+  applyManualCodeOverrides(next: Record<string, string>) {
     this.manualCodeOverrides = next;
-    this.showMisorderModal = false;
+    this.closeSuspectModal();
+    this.invalidateCodePreviewCache();
+    this.refreshDerivedCodeViews();
+    this.refreshUiDerivedState();
+  }
+  phraseDistance(left: string, right: string) {
+    if (Math.abs(left.length - right.length) > 1) return 2;
+    const dp = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+    for (let i = 0; i <= left.length; i++) dp[i][0] = i;
+    for (let j = 0; j <= right.length; j++) dp[0][j] = j;
+    for (let i = 1; i <= left.length; i++) {
+      for (let j = 1; j <= right.length; j++) {
+        const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+        dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      }
+    }
+    return dp[left.length][right.length];
+  }
+
+  phraseCode(words: string[]) {
+    return this.tokenParts(
+      words,
+      this.firstWordRules,
+      word => this.tokenPart(word, true, word.length, true, true, {})
+    ).join('');
+  }
+
+  refreshNearPhraseGroups() {
+    const candidates = new Map<string, any>();
+    if (this.selectedProfile !== 'cao_thanh') {
+      this.nearPhraseGroups = [];
+      return;
+    }
+    for (const company of this.companies) {
+      if (!company.process) continue;
+      for (const product of company.all_products || []) {
+        if (!company.selected_products.has(product.name)) continue;
+        const words = this.removeRepeatedPhrases(this.codeWords((product.name || '').replace(/\([^)]*\)/g, ' ')), this.repeatedPhraseRemovals);
+        if (words.length < 2) continue;
+        const phraseWords = words.slice(0, 2);
+        const phrase = phraseWords.join(' ');
+        const norm = this.normalizeCodeText(phrase);
+        if (!norm || /^\d+$/.test(norm)) continue;
+        if (!candidates.has(norm)) {
+          candidates.set(norm, { phrase, norm, code: this.phraseCode(phraseWords), examples: [] });
+        }
+        const item = candidates.get(norm);
+        if (item.examples.length < 3) item.examples.push(product.name);
+      }
+    }
+    const items = Array.from(candidates.values()).sort((a, b) => a.norm.length - b.norm.length || a.phrase.localeCompare(b.phrase, 'vi-VN'));
+    const groups: any[] = [];
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        if (items[j].norm.length - items[i].norm.length > 1) break;
+        if (this.phraseDistance(items[i].norm, items[j].norm) !== 1) continue;
+        const key = `${items[i].norm}|||${items[j].norm}`;
+        groups.push({ key, left: items[i], right: items[j] });
+        const validChoices = new Set(['', items[i].code, items[j].code]);
+        if (!validChoices.has(this.nearPhraseChoices[key])) this.nearPhraseChoices[key] = '';
+      }
+    }
+    this.nearPhraseGroups = groups;
+  }
+
+  openNearPhraseModal() {
+    this.openSuspectModal('near_phrase');
+  }
+
+  applyNearPhraseChoices() {
+    const nextFirstRules = { ...this.firstWordRules };
+    for (const group of this.nearPhraseGroups) {
+      const code = this.nearPhraseChoices[group.key];
+      if (!code) continue;
+      nextFirstRules[group.left.phrase] = code;
+      nextFirstRules[group.right.phrase] = code;
+    }
+    this.firstWordRules = this.rowsToRules(this.sortedRuleRows(nextFirstRules), 'Hai từ đầu tiên');
+    this.closeSuspectModal();
+    this.invalidateCodePreviewCache();
+    this.refreshDerivedCodeViews();
+    this.refreshUiDerivedState();
   }
 
   processFile() {
     this.error = null;
     this.isLoading = true;
+    this.startProcessingProgress();
     const payload: any = {
       ...this.basePayload(),
       output_path: this.outputPath,
       word_rules: this.wordRules,
       first_word_rules: this.firstWordRules,
+      repeated_phrase_removals: this.repeatedPhraseRemovals,
       include_company_prefix: this.includeCompanyPrefix,
       price_group_rules: this.priceGroupRules,
       price_range_rules: this.priceRangeRules,
@@ -1050,18 +1591,38 @@ export class AppComponent {
       process_mst: [],
       removed_companies: {},
       prefixes: {},
-      selected_products_map: {}
+      selected_products_map: {},
+      skipped_products_map: {}
     };
     const validationError = this.fillCompanyPayload(payload);
     if (validationError) {
       this.errorMessage = validationError;
       this.showErrorModal = true;
       this.isLoading = false;
+      this.clearProcessingProgress();
       return;
     }
-    this.http.post('/api/process', payload, { responseType: 'blob', observe: 'response' }).subscribe({
-      next: (response) => {
-        const blob = new Blob([response.body as Blob], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    this.http.post('/api/process', payload, { responseType: 'blob', observe: 'events', reportProgress: true }).subscribe({
+      next: (event) => {
+        if (event.type === HttpEventType.Sent) {
+          this.setProcessingProgress(5, 'Đang gửi dữ liệu...');
+          return;
+        }
+        if (event.type === HttpEventType.UploadProgress) {
+          this.setProcessingProgress(this.eventProgress(event.loaded, event.total, 5, 20), 'Đang gửi dữ liệu...');
+          return;
+        }
+        if (event.type === HttpEventType.ResponseHeader) {
+          this.setProcessingProgress(90, 'Đang nhận file kết quả...');
+          return;
+        }
+        if (event.type === HttpEventType.DownloadProgress) {
+          this.setProcessingProgress(this.eventProgress(event.loaded, event.total, 90, 99), 'Đang tải file kết quả...');
+          return;
+        }
+        if (event.type !== HttpEventType.Response) return;
+
+        const blob = new Blob([event.body as Blob], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -1070,11 +1631,62 @@ export class AppComponent {
         a.click();
         window.URL.revokeObjectURL(url);
         a.remove();
+        this.finishProcessingProgress();
         this.isLoading = false;
         this.loadConfig();
       },
-      error: (err) => this.fail(err, 'Không xử lý được file.')
+      error: (err) => {
+        this.clearProcessingProgress();
+        this.fail(err, 'Không xử lý được file.');
+      }
     });
+  }
+
+  startProcessingProgress() {
+    this.clearProcessingProgress();
+    this.setProcessingProgress(1, 'Đang chuẩn bị xử lý...');
+    this.processingProgressTimer = setInterval(() => {
+      const current = this.processingProgress ?? 1;
+      if (current < 90) {
+        this.setProcessingProgress(current + 1, 'Đang xử lý file...');
+      } else if (current < 95) {
+        this.setProcessingProgress(current + 0.25, 'Đang hoàn tất file...');
+      }
+    }, 500);
+  }
+
+  setProcessingProgress(value: number, label: string) {
+    const next = Math.max(0, Math.min(100, Math.round(value)));
+    this.processingProgress = Math.max(this.processingProgress ?? 0, next);
+    this.processingProgressLabel = label;
+  }
+
+  eventProgress(loaded: number, total: number | undefined, start: number, end: number) {
+    if (!total) return start;
+    return start + (loaded / total) * (end - start);
+  }
+
+  finishProcessingProgress() {
+    if (this.processingProgressTimer) {
+      clearInterval(this.processingProgressTimer);
+      this.processingProgressTimer = null;
+    }
+    this.setProcessingProgress(100, 'Hoàn tất 100%');
+    if (this.processingProgressClearTimer) clearTimeout(this.processingProgressClearTimer);
+    this.processingProgressClearTimer = setTimeout(() => this.clearProcessingProgress(), 900);
+  }
+
+  clearProcessingProgress() {
+    if (this.processingProgressTimer) {
+      clearInterval(this.processingProgressTimer);
+      this.processingProgressTimer = null;
+    }
+    if (this.processingProgressClearTimer) {
+      clearTimeout(this.processingProgressClearTimer);
+      this.processingProgressClearTimer = null;
+    }
+    this.processingProgress = null;
+    this.processingProgressLabel = '';
   }
 
   fillCompanyPayload(payload: any) {
@@ -1098,9 +1710,13 @@ export class AppComponent {
         if (prefix && prefix !== defaultPrefix) payload.prefixes[item.mst] = prefix;
       }
       const selectedProducts = Array.from(item.selected_products).map(String);
+      const skippedProducts = this.companySkippedProducts(item);
       const allProducts = (item.all_products || []).map((product: any) => product.name);
       if (!this.sameStringSet(selectedProducts, allProducts)) {
         payload.selected_products_map[item.mst] = selectedProducts;
+      }
+      if (skippedProducts.length) {
+        payload.skipped_products_map[item.mst] = skippedProducts;
       }
       payload[`selected_products_${item.safe_id}`] = selectedProducts;
     }
@@ -1108,16 +1724,92 @@ export class AppComponent {
   }
 
   skippedCompanies() {
-    return this.companies.filter(company => !company.process);
+    return this.skippedCompanyList;
   }
 
   openSkippedModal() {
     this.showSkippedModal = true;
   }
 
-  restoreSkippedCompany(company: any) {
-    company.process = true;
+  restoreSkippedCompany(item: any) {
+    if (item.kind === 'product') {
+      item.company.selected_products.add(item.productName);
+    } else {
+      item.company.process = true;
+    }
     this.verifyPrefixes();
+  }
+
+  refreshUiDerivedState() {
+    const profile = this.profiles.find(p => p.key === this.selectedProfile);
+    this.selectedProfileLabelText = profile?.label || '';
+    this.selectedProfileNoteText = profile?.note || '';
+    this.wordRuleCountValue = Object.keys(this.wordRules || {}).length + Object.keys(this.firstWordRules || {}).length;
+    const skippedItems: any[] = [];
+    for (const company of this.companies) {
+      if (!company.process) {
+        skippedItems.push({
+          key: `company|||${company.mst}`,
+          kind: 'company',
+          company,
+          mst: company.mst,
+          companyName: company.company,
+          label: 'Đơn vị bị bỏ qua'
+        });
+        continue;
+      }
+      for (const product of company.all_products || []) {
+        if (company.selected_products?.has(product.name)) continue;
+        skippedItems.push({
+          key: `product|||${company.mst}|||${product.name}`,
+          kind: 'product',
+          company,
+          mst: company.mst,
+          companyName: company.company,
+          productName: product.name,
+          label: 'Hàng hóa bị bỏ qua'
+        });
+      }
+    }
+    this.skippedCompanyList = skippedItems;
+  }
+
+  cachedBuildCodePreview(company: any, productName: string, trim = true) {
+    const key = `${this.selectedProfile}|${this.includeCompanyPrefix ? '1' : '0'}|${trim ? '1' : '0'}|${company?.mst || ''}|${company?.value || ''}|${productName || ''}`;
+    const cached = this.codePreviewCache.get(key);
+    if (cached !== undefined) return cached;
+    const code = this.buildCodePreview(company, productName || '', trim);
+    this.codePreviewCache.set(key, code);
+    return code;
+  }
+
+  invalidateCodePreviewCache() {
+    this.codePreviewCache.clear();
+  }
+
+  beginConfigOperation(label: string) {
+    const operationId = ++this.configOperationId;
+    this.configOperationLabel = label;
+    this.showConfigOperationLoading = false;
+    if (this.configOperationTimer) clearTimeout(this.configOperationTimer);
+    this.configOperationTimer = setTimeout(() => {
+      if (this.configOperationId === operationId) this.showConfigOperationLoading = true;
+    }, 2000);
+    return operationId;
+  }
+
+  endConfigOperation(operationId: number) {
+    if (operationId !== this.configOperationId) return;
+    if (this.configOperationTimer) {
+      clearTimeout(this.configOperationTimer);
+      this.configOperationTimer = null;
+    }
+    this.showConfigOperationLoading = false;
+    this.configOperationLabel = '';
+  }
+
+  yieldToBrowser() {
+    return new Promise<void>(resolve => setTimeout(resolve, 0));
   }
 
   showMessage(message: string) {
@@ -1185,5 +1877,9 @@ export class AppComponent {
 
   trackByKey(_: number, item: any) {
     return item.key || item.mst || item.name || item.word;
+  }
+
+  trackByIndex(index: number) {
+    return index;
   }
 }

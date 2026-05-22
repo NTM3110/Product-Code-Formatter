@@ -1,0 +1,64 @@
+{
+  "selected_profile": "son_phuong",
+  "profiles": {
+    "son_phuong": {
+      "prefixes": {},
+      "selected_products": {},
+      "removed_companies": {},
+      "word_rules": {
+        "tôn": "TON",
+        "đen": "DEN"
+      },
+      "first_word_rules": {},
+      "repeated_phrase_removals": [],
+      "price_group_rules": {},
+      "price_range_rules": {},
+      "manual_code_overrides": {},
+      "include_company_prefix": true,
+      "output_path": ""
+    },
+    "cao_thanh": {
+      "prefixes": {},
+      "selected_products": {},
+      "removed_companies": {},
+      "word_rules": {
+        "tôn": "TON",
+        "đen": "DEN"
+      },
+      "first_word_rules": {},
+      "repeated_phrase_removals": [
+        "inox"
+      ],
+      "price_group_rules": {},
+      "price_range_rules": {},
+      "manual_code_overrides": {},
+      "include_company_prefix": true,
+      "output_path": ""
+    },
+    "quang_thinh": {
+      "prefixes": {},
+      "selected_products": {},
+      "removed_companies": {},
+      "word_rules": {
+        "tôn": "TON",
+        "đen": "DEN"
+      },
+      "first_word_rules": {},
+      "repeated_phrase_removals": [],
+      "price_group_rules": {},
+      "price_range_rules": {},
+      "manual_code_overrides": {},
+      "include_company_prefix": true,
+      "output_path": ""
+    }
+  },
+  "columns": {
+    "company_col": "F",
+    "mst_col": "G",
+    "address_col": "H",
+    "product_col": "M",
+    "qty_col": "O",
+    "price_col": "",
+    "output_col": "L"
+  }
+}

@@ -1,0 +1,95 @@
+
+> frontend@0.0.0 start
+> ng serve --proxy-config proxy.conf.json
+
+- Building...
+
+Initial chunk files | Names         |  Raw size
+main.js             | main          | 168.27 kB | 
+polyfills.js        | polyfills     |  88.09 kB | 
+styles.css          | styles        | 464 bytes | 
+
+                    | Initial total | 256.80 kB
+
+Application bundle generation complete. [5.243 seconds]
+
+Watch mode enabled. Watching for file changes...
+  ➜  Local:   http://localhost:4200/
+  ➜  press h + enter to show help
+- Changes detected. Rebuilding...
+
+Application bundle generation failed. [2.964 seconds]
+
+✘ [ERROR] TS2554: Expected 0-1 arguments, but got 2. [plugin angular-compiler]
+
+    src/app/app.component.ts:158:34:
+      158 │         this.verifyPrefixes(true, false);
+          ╵                                   ~~~~~
+
+
+✘ [ERROR] TS2551: Property 'refreshDerivedCodeViewsChunked' does not exist on type 'AppComponent'. Did you mean 'refreshDerivedCodeViews'? [plugin angular-compiler]
+
+    src/app/app.component.ts:159:19:
+      159 │         await this.refreshDerivedCodeViewsChunked();
+          ╵                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  'refreshDerivedCodeViews' is declared here.
+
+    src/app/app.component.ts:626:2:
+      626 │   refreshDerivedCodeViews() {
+          ╵   ~~~~~~~~~~~~~~~~~~~~~~~
+
+
+✘ [ERROR] TS2554: Expected 0-1 arguments, but got 2. [plugin angular-compiler]
+
+    src/app/app.component.ts:342:34:
+      342 │         this.verifyPrefixes(true, false);
+          ╵                                   ~~~~~
+
+
+✘ [ERROR] TS2551: Property 'refreshDerivedCodeViewsChunked' does not exist on type 'AppComponent'. Did you mean 'refreshDerivedCodeViews'? [plugin angular-compiler]
+
+    src/app/app.component.ts:343:19:
+      343 │         await this.refreshDerivedCodeViewsChunked();
+          ╵                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  'refreshDerivedCodeViews' is declared here.
+
+    src/app/app.component.ts:626:2:
+      626 │   refreshDerivedCodeViews() {
+          ╵   ~~~~~~~~~~~~~~~~~~~~~~~
+
+
+✘ [ERROR] TS2554: Expected 0-1 arguments, but got 2. [plugin angular-compiler]
+
+    src/app/app.component.ts:449:36:
+      449 │           this.verifyPrefixes(true, false);
+          ╵                                     ~~~~~
+
+
+✘ [ERROR] TS2551: Property 'refreshDerivedCodeViewsChunked' does not exist on type 'AppComponent'. Did you mean 'refreshDerivedCodeViews'? [plugin angular-compiler]
+
+    src/app/app.component.ts:450:21:
+      450 │           await this.refreshDerivedCodeViewsChunked();
+          ╵                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  'refreshDerivedCodeViews' is declared here.
+
+    src/app/app.component.ts:626:2:
+      626 │   refreshDerivedCodeViews() {
+          ╵   ~~~~~~~~~~~~~~~~~~~~~~~
+
+
+- Changes detected. Rebuilding...
+
+Initial chunk files | Names         |  Raw size
+main.js             | main          | 169.98 kB | 
+polyfills.js        | polyfills     |  88.09 kB | 
+styles.css          | styles        | 464 bytes | 
+
+                    | Initial total | 258.52 kB
+
+Application bundle generation complete. [2.442 seconds]
+
+Page reload sent to client(s).
+^C^C

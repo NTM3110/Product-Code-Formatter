@@ -23,14 +23,18 @@
           <button class="btn-danger btn-sm" (click)="deleteProfileCache()" [disabled]="isLoading">Xóa cache</button>
         </div>
       </div>
-      <p class="profile-note">{{ selectedProfileNote() }}</p>
+      <div class="config-loading" *ngIf="showConfigOperationLoading" role="status" aria-live="polite">
+        <span class="config-loading-spinner" aria-hidden="true"></span>
+        <span>{{ configOperationLabel || 'Đang tải cấu hình...' }}</span>
+      </div>
+      <p class="profile-note">{{ selectedProfileNoteText }}</p>
     </div>
 
     <div class="error-banner" *ngIf="error">{{ error }}</div>
 
     <div class="step-content" *ngIf="step === 1">
       <div class="section-kicker">Bước 1</div>
-      <p class="description">Tải lên file Excel <strong>.xlsx</strong> hoặc <strong>.xlsm</strong> cho <strong>{{ selectedProfileLabel() }}</strong>.</p>
+      <p class="description">Tải lên file Excel <strong>.xlsx</strong> hoặc <strong>.xlsm</strong> cho <strong>{{ selectedProfileLabelText }}</strong>.</p>
       <div class="upload-area">
         <input type="file" id="file" (change)="onFileChange($event)" accept=".xlsx,.xlsm" class="hidden-input" />
         <label for="file" class="upload-label" [class.has-file]="fileToUpload">
@@ -48,7 +52,7 @@
 
     <div class="step-content" *ngIf="step === 2">
       <div class="section-kicker">Bước 2</div>
-      <p class="description">Chọn cột cho file <strong>{{ originalName }}</strong>. Các giá trị mặc định đã được đặt theo <strong>{{ selectedProfileLabel() }}</strong>.</p>
+      <p class="description">Chọn cột cho file <strong>{{ originalName }}</strong>. Các giá trị mặc định đã được đặt theo <strong>{{ selectedProfileLabelText }}</strong>.</p>
       <div class="form-grid">
         <div class="form-group">
           <label>Tên đơn vị bán <small>Cột chứa tên công ty trên hóa đơn</small></label>
@@ -126,14 +130,14 @@
       <div class="stats-grid">
         <div class="stat-card"><strong>{{ rowsToProcess }}</strong><span>Dòng xử lý</span></div>
         <div class="stat-card"><strong>{{ companyCount }}</strong><span>Đơn vị</span></div>
-        <div class="stat-card"><strong>{{ skippedCompanies().length }}</strong><span>Mục đã bỏ qua</span></div>
-        <div class="stat-card"><strong>{{ wordRuleCount() }}</strong><span>Từ thay riêng</span></div>
+        <div class="stat-card"><strong>{{ skippedCompanyList.length }}</strong><span>Mục đã bỏ qua</span></div>
+        <div class="stat-card"><strong>{{ wordRuleCountValue }}</strong><span>Từ thay riêng</span></div>
       </div>
 
       <div class="rule-summary-row">
         <div>
           <strong>Từ thay riêng</strong>
-          <span>{{ wordRuleCount() }} quy tắc đang áp dụng cho {{ selectedProfileLabel() }}</span>
+          <span>{{ wordRuleCountValue }} quy tắc đang áp dụng cho {{ selectedProfileLabelText }}</span>
         </div>
         <label class="prefix-toggle">
           <input type="checkbox" [(ngModel)]="includeCompanyPrefix" (ngModelChange)="verifyPrefixes()" />
@@ -191,7 +195,7 @@
           <button class="btn-secondary btn-sm company-location-button" (click)="openAddressModal(item)" *ngIf="item.address || item.addresses?.length">
             Xem vị trí công ty
           </button>
-          <div class="code-length-warning" *ngIf="longCodeCount(item) as count">
+          <div class="code-length-warning" *ngIf="longCodeCounts[item.mst] as count">
             Cảnh báo: {{ count }} mã VT dài hơn 50 ký tự
           </div>
         </td>
@@ -203,17 +207,23 @@
       <div class="actions sticky-actions">
         <button class="btn-secondary" (click)="goBack()" [disabled]="isLoading">Quay lại</button>
         <button class="btn-secondary" (click)="verifyPrefixes()" [disabled]="isLoading">Xác minh tiền tố</button>
-        <button class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceGroupModal()" [disabled]="!priceConflictRows.length">
-          Lọc đơn giá ({{ priceConflictRows.length }})
+        <button class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceGroupModal()" [disabled]="!companies.length">
+          Lọc đơn giá
         </button>
-        <button class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openMisorderModal()" [disabled]="!misorderGroups.length">
-          Từ đảo thứ tự ({{ misorderGroups.length }})
+        <button type="button" class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openSuspectModal()" [disabled]="!companies.length">
+          Danh sách tình nghi
         </button>
-        <button class="btn-secondary" (click)="openSkippedModal()">Mục đã bỏ qua ({{ skippedCompanies().length }})</button>
+        <button class="btn-secondary" (click)="openSkippedModal()">Mục đã bỏ qua ({{ skippedCompanyList.length }})</button>
         <button class="btn-secondary" (click)="saveProfileConfig()" [disabled]="isLoading">Lưu cấu hình</button>
         <button class="btn-primary" (click)="processFile()" [disabled]="isLoading">
-          {{ isLoading ? 'Đang xử lý...' : 'Xác nhận & Xử lý' }}
+          {{ processingProgress !== null ? ('Đang xử lý ' + processingProgress + '%') : 'Xác nhận & Xử lý' }}
         </button>
+        <div class="processing-progress" *ngIf="processingProgress !== null" role="progressbar" aria-label="Tiến độ xử lý file" [attr.aria-valuenow]="processingProgress" aria-valuemin="0" aria-valuemax="100">
+          <div class="processing-progress-bar">
+            <span [style.width.%]="processingProgress"></span>
+          </div>
+          <div class="processing-progress-text">{{ processingProgressLabel }} {{ processingProgress }}%</div>
+        </div>
       </div>
     </div>
   </div>
@@ -233,13 +243,17 @@
           <span class="product-copy">
             <span class="product-name">{{ prod.name || '(Tên hàng hóa trống)' }}</span>
             <span class="product-meta">
-              <span *ngIf="productRowSummary(prod)">{{ productRowSummary(prod) }}</span>
-              <span *ngIf="productPriceSummary(prod)">{{ productPriceSummary(prod) }}</span>
+              <span *ngIf="prod.rowSummary">{{ prod.rowSummary }}</span>
+              <span *ngIf="prod.priceSummary">{{ prod.priceSummary }}</span>
             </span>
           </span>
           <span class="product-code-preview">
             <label>Mã VT</label>
             <input class="form-control product-code-input" [(ngModel)]="prod.code" />
+            <span class="product-code-length" [class.over-limit]="productCodeTooLong(prod)">
+              {{ productCodeLength(prod) }} ký tự
+              <ng-container *ngIf="productCodeTooLong(prod)"> - vượt 50 ký tự</ng-container>
+            </span>
           </span>
         </div>
       </div>
@@ -253,7 +267,7 @@
 
 <div class="modal-overlay" *ngIf="showWordRuleModal">
   <div class="modal-content rules-modal">
-    <div class="modal-header">Từ thay riêng - {{ selectedProfileLabel() }}</div>
+    <div class="modal-header">Từ thay riêng - {{ selectedProfileLabelText }}</div>
     <div class="modal-body">
       <p class="modal-description">Nhập từ gốc trong file và mã muốn thay vào phần mã VT. Danh sách sẽ được sắp xếp theo bảng chữ cái khi áp dụng.</p>
       <div class="rule-section" *ngIf="selectedProfile === 'cao_thanh'">
@@ -284,6 +298,19 @@
         </div>
         <button class="btn-secondary btn-sm" (click)="addWordRule()">Thêm từ</button>
       </div>
+      <div class="rule-section">
+        <div class="rule-section-title">
+          <strong>Bỏ bớt nếu lặp lại</strong>
+          <span>Giữ lần xuất hiện đầu tiên, bỏ các lần lặp lại khi tạo mã VT. Cao Thành mặc định có inox.</span>
+        </div>
+        <div class="rule-grid repeat-rule-grid">
+          <div class="rule-row repeat-rule-row" *ngFor="let phrase of repeatedPhraseRemovalRows; let i = index; trackBy: trackByIndex">
+            <input class="form-control" [(ngModel)]="repeatedPhraseRemovalRows[i]" placeholder="Từ hoặc cụm từ" />
+            <button class="icon-btn" (click)="removeRepeatedPhraseRemoval(i)">×</button>
+          </div>
+        </div>
+        <button class="btn-secondary btn-sm" (click)="addRepeatedPhraseRemoval()">Thêm từ/cụm</button>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-secondary btn-sm" (click)="showWordRuleModal = false">Đóng</button>
@@ -308,20 +335,22 @@
 </div>
 
 <div class="modal-overlay" *ngIf="showSkippedModal">
-  <div class="modal-content skipped-modal">
-    <div class="modal-header">Mục đã bỏ qua</div>
-    <div class="modal-body">
-      <p class="modal-description">Các công ty không được xử lý sẽ được lưu vào cấu hình của {{ selectedProfileLabel() }}.</p>
-      <div class="empty-state" *ngIf="!skippedCompanies().length">Chưa có công ty nào bị bỏ qua.</div>
-      <div class="skipped-list" *ngIf="skippedCompanies().length">
-        <div class="skipped-item" *ngFor="let company of skippedCompanies(); trackBy: trackByKey">
-          <div>
-            <strong>{{ company.mst }}</strong>
-            <span>{{ company.company }}</span>
+    <div class="modal-content skipped-modal">
+      <div class="modal-header">Mục đã bỏ qua</div>
+      <div class="modal-body">
+        <p class="modal-description">Danh sách này gồm các đơn vị bị bỏ qua và các hàng hóa bị bỏ chọn trong những đơn vị vẫn đang được xử lý của {{ selectedProfileLabelText }}.</p>
+        <div class="empty-state" *ngIf="!skippedCompanyList.length">Chưa có công ty nào bị bỏ qua.</div>
+        <div class="skipped-list" *ngIf="skippedCompanyList.length">
+          <div class="skipped-item" *ngFor="let company of skippedCompanyList; trackBy: trackByKey">
+            <div>
+              <strong>{{ company.mst }}</strong>
+              <span>{{ company.companyName }}</span>
+              <span>{{ company.label }}</span>
+              <span *ngIf="company.kind === 'product'">{{ company.productName }}</span>
+            </div>
+            <button class="btn-secondary btn-sm" (click)="restoreSkippedCompany(company)">Khôi phục</button>
           </div>
-          <button class="btn-secondary btn-sm" (click)="restoreSkippedCompany(company)">Khôi phục</button>
         </div>
-      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-secondary btn-sm" (click)="showSkippedModal = false">Đóng</button>
@@ -333,32 +362,58 @@
   <div class="modal-content price-group-modal">
     <div class="modal-header">Lọc mã hàng theo đơn giá</div>
     <div class="modal-body">
-      <p class="modal-description">Chỉ tách mã VT cho hàng hóa có nhiều đơn giá. Khoảng giá được lưu theo mã nền để dùng lại trong các lần xử lý sau.</p>
+      <p class="modal-description">Gộp theo Mã VT cuối cùng sau tùy chỉnh. Trong mỗi Mã VT, hệ thống chia thành các nhóm đơn giá theo % lọc bạn nhập, rồi tính giá trung bình, giá trung bình sau điều chỉnh `(1 - %)` và lãi/lỗ % cho từng dòng.</p>
+      <div class="price-bulk-controls">
+        <div class="price-bulk-card">
+          <strong>Áp % lọc nhóm</strong>
+          <div class="percent-cell">
+            <input type="number" class="form-control price-percent-input" [(ngModel)]="priceFilterAllPercent" min="0.1" step="0.1" />
+            <span>%</span>
+            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceFilterPercentToAll()">Áp % lọc</button>
+          </div>
+        </div>
+        <div class="price-bulk-card">
+          <strong>Áp % lãi</strong>
+          <div class="percent-cell">
+            <input type="number" class="form-control price-percent-input" [(ngModel)]="priceAdjustAllPercent" min="0" step="0.1" />
+            <span>%</span>
+            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToAll()">Áp % lãi</button>
+          </div>
+        </div>
+      </div>
       <div class="price-group-scroll">
         <div class="price-company-group" *ngFor="let group of priceConflictGroups; trackBy: trackByKey">
           <div class="price-company-header">
-            <strong>{{ group.company.mst }}</strong>
-            <span>{{ group.company.company }}</span>
+            <strong>{{ group.title }}</strong>
+            <span>{{ group.rows.length }} mã cần lọc</span>
           </div>
           <table class="data-table price-main-table">
             <thead>
               <tr>
-                <th>Mã VT nền</th>
-                <th>Tên hàng hóa</th>
-                <th>Giá trong file</th>
-                <th>Mức</th>
-                <th>Biên độ</th>
+                <th>Mã VT</th>
+                <th>Hàng hóa / đơn vị</th>
+                <th>Số giá</th>
+                <th>Giá trung bình</th>
+                <th>% lọc nhóm</th>
               </tr>
             </thead>
             <tbody>
               <ng-container *ngFor="let row of group.rows; trackBy: trackByKey">
                 <tr>
                   <td><code>{{ row.code }}</code></td>
-                  <td>{{ row.product.name }}</td>
-                  <td>{{ formatPrice(row.min) }} → {{ formatPrice(row.max) }}</td>
-                  <td>{{ row.count }}</td>
+                  <td>
+                    <div><strong>{{ row.productDisplay }}</strong></div>
+                    <div class="sub-text">{{ row.companyDisplay }}</div>
+                    <div class="price-row-bulk-control percent-cell">
+                      <input type="number" class="form-control price-percent-input" [(ngModel)]="row.bulkAdjustPercent" min="0" step="0.1" />
+                      <span>% lãi</span>
+                      <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToRow(row)">Áp trong mã VT này</button>
+                    </div>
+                  </td>
+                  <td>{{ row.count }} mức / {{ row.priceRowCount }} dòng</td>
+                  <td>{{ formatPrice(row.average) }}</td>
                   <td class="percent-cell">
-                    <input type="number" class="form-control price-percent-input" [(ngModel)]="row.percent" (ngModelChange)="onPriceGroupPercentChange(row)" min="0.1" step="0.1" />
+                    <input type="number" class="form-control price-percent-input" [(ngModel)]="row.filterPercent" (ngModelChange)="onPriceGroupPercentChange(row)" min="0.1" step="0.1" />
                     <span>%</span>
                   </td>
                 </tr>
@@ -367,21 +422,66 @@
                     <table class="price-group-mini-table">
                       <thead>
                         <tr>
-                          <th>Nhóm</th>
-                          <th>Khoảng</th>
-                          <th>Dòng</th>
-                          <th>Tên hàng hóa</th>
-                          <th>Đơn giá</th>
+                          <th>Nhóm giá</th>
+                          <th>Khoảng đơn giá</th>
+                          <th>Số dòng</th>
+                          <th>Giá trung bình</th>
+                          <th>% lãi</th>
+                          <th>Giá TB sau chỉnh</th>
+                          <th>Cảnh báo</th>
+                          <th>Chi tiết</th>
                         </tr>
                       </thead>
                       <tbody>
-                        <tr *ngFor="let priceGroup of row.priceGroups; trackBy: trackByKey">
-                          <td><code>{{ priceGroup.suffix }}</code></td>
-                          <td>{{ priceGroup.rangeDisplay }}</td>
-                          <td>{{ priceGroup.exampleRowDisplay }}</td>
-                          <td>{{ priceGroup.exampleNameDisplay }}</td>
-                          <td>{{ priceGroup.examplePriceDisplay }}</td>
-                        </tr>
+                        <ng-container *ngFor="let bucket of row.buckets; trackBy: trackByKey">
+                          <tr>
+                            <td><strong>{{ bucket.label }}</strong></td>
+                            <td>{{ formatPrice(bucket.min) }} → {{ formatPrice(bucket.max) }}</td>
+                            <td>{{ bucket.count }}</td>
+                            <td>{{ formatPrice(bucket.averagePrice) }}</td>
+                            <td class="percent-cell">
+                              <input type="number" class="form-control price-percent-input" [(ngModel)]="bucket.marginPercent" (ngModelChange)="onPriceBucketMarginChange(bucket)" min="0" step="0.1" />
+                              <span>%</span>
+                            </td>
+                            <td>{{ formatPrice(bucket.adjustedAverage) }}</td>
+                            <td>
+                              <span *ngIf="bucketHasLoss(bucket)" class="price-loss-badge">
+                                Có {{ bucketLossCount(bucket) }} dòng lỗ
+                              </span>
+                            </td>
+                            <td>
+                              <button type="button" class="btn-secondary btn-sm" (click)="togglePriceBucket(bucket)">
+                                {{ expandedPriceBuckets[bucket.key] ? 'Ẩn dòng Excel' : 'Xem dòng Excel' }}
+                              </button>
+                            </td>
+                          </tr>
+                          <tr class="price-detail-subrow" *ngIf="expandedPriceBuckets[bucket.key]">
+                            <td colspan="8">
+                              <table class="price-group-mini-table">
+                                <thead>
+                                  <tr>
+                                    <th>Dòng</th>
+                                    <th>Đơn vị</th>
+                                    <th>Hàng hóa</th>
+                                    <th>Đơn giá</th>
+                                    <th>Chênh lệch</th>
+                                    <th>Lãi / lỗ %</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <tr *ngFor="let detail of priceBucketDetails(bucket); trackBy: trackByKey">
+                                    <td>{{ detail.excelRow }}</td>
+                                    <td>{{ detail.companyName }}</td>
+                                    <td>{{ detail.productName }}</td>
+                                    <td>{{ formatPrice(detail.price) }}</td>
+                                    <td><span class="price-delta" [class.profit]="detail.deltaAmount > 0" [class.loss]="detail.deltaAmount < 0" [class.neutral]="detail.deltaAmount === 0">{{ formatSignedPrice(detail.deltaAmount) }}</span></td>
+                                    <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ bucketDeltaLabel(detail) }} {{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                        </ng-container>
                       </tbody>
                     </table>
                   </td>
@@ -398,44 +498,94 @@
     </div>
   </div>
 </div>
-
-<div class="modal-overlay" *ngIf="showMisorderModal">
+<div class="modal-overlay" *ngIf="showSuspectModal">
   <div class="modal-content misorder-modal">
-    <div class="modal-header">Hàng hóa có cùng bộ từ</div>
+    <div class="modal-header">Danh sách tình nghi</div>
     <div class="modal-body">
-      <p class="modal-description">Các hàng hóa dưới đây có cùng danh sách từ nhưng thứ tự khác nhau. Chọn mã VT muốn dùng chung cho từng nhóm nếu cần đồng nhất.</p>
-      <div class="misorder-list">
-        <div class="misorder-group" *ngFor="let group of misorderGroups; trackBy: trackByKey">
-          <div class="misorder-company">
-            <strong>{{ group.company.mst }}</strong>
-            <span>{{ group.company.company }}</span>
-          </div>
-          <table class="data-table compact-table">
-            <thead>
-              <tr>
-                <th>Tên hàng hóa</th>
-                <th>Mã VT hiện tại</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr *ngFor="let item of group.items; trackBy: trackByKey">
-                <td>{{ item.product.name }}</td>
-                <td><code>{{ item.code }}</code></td>
-              </tr>
-            </tbody>
-          </table>
-          <div class="canonical-picker">
-            <label>Mã dùng chung</label>
-            <select class="form-control" [(ngModel)]="misorderCanonicalCodes[group.key]">
-              <option *ngFor="let item of group.items; trackBy: trackByKey" [value]="item.code">{{ item.code }}</option>
-            </select>
-          </div>
-        </div>
+      <p class="modal-description">Chọn đúng nhóm cần soát cho Cao Thành. Mỗi nhóm chỉ được tính khi bạn mở nhóm đó.</p>
+      <div class="suspect-tabs" role="tablist" aria-label="Nhóm tình nghi Cao Thành">
+        <button type="button" class="suspect-tab" role="tab" [class.active]="activeSuspectSection === 'near_phrase'" [attr.aria-selected]="activeSuspectSection === 'near_phrase'" (click)="selectSuspectSection('near_phrase')">Soát 2 từ đầu</button>
+        <button type="button" class="suspect-tab" role="tab" [class.active]="activeSuspectSection === 'misorder'" [attr.aria-selected]="activeSuspectSection === 'misorder'" (click)="selectSuspectSection('misorder')">Các cụm từ đảo thứ tự</button>
       </div>
+
+      <ng-container [ngSwitch]="activeSuspectSection">
+        <section *ngSwitchCase="'near_phrase'">
+          <p class="modal-description">Riêng Cao Thành: chỉ soát cụm 2 từ đầu vì phần này được giữ nguyên trong Mã VT. Các từ sau đã rút gọn thành chữ đầu nên không cần kiểm tra.</p>
+          <div class="empty-state" *ngIf="!nearPhraseGroups.length">Không có cụm 2 từ đầu gần giống.</div>
+          <div class="misorder-list" *ngIf="nearPhraseGroups.length">
+            <div class="misorder-group" *ngFor="let group of nearPhraseGroups; trackBy: trackByKey">
+              <table class="data-table compact-table">
+                <thead>
+                  <tr>
+                    <th>Cụm 2 từ đầu</th>
+                    <th>Mã hiện tại</th>
+                    <th>Ví dụ</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>{{ group.left.phrase }}</td>
+                    <td><code>{{ group.left.code }}</code></td>
+                    <td>{{ group.left.examples.join(' | ') }}</td>
+                  </tr>
+                  <tr>
+                    <td>{{ group.right.phrase }}</td>
+                    <td><code>{{ group.right.code }}</code></td>
+                    <td>{{ group.right.examples.join(' | ') }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="canonical-picker">
+                <label>Gộp thành mã</label>
+                <select class="form-control" [(ngModel)]="nearPhraseChoices[group.key]">
+                  <option value="">Không gộp</option>
+                  <option [value]="group.left.code">{{ group.left.code }}</option>
+                  <option [value]="group.right.code">{{ group.right.code }}</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section *ngSwitchCase="'misorder'">
+          <p class="modal-description">Các hàng hóa có cùng danh sách từ nhưng thứ tự khác nhau. Chọn mã VT muốn dùng chung cho từng nhóm nếu cần đồng nhất.</p>
+          <div class="empty-state" *ngIf="!misorderGroups.length">Không có cụm từ đảo thứ tự.</div>
+          <div class="misorder-list" *ngIf="misorderGroups.length">
+            <div class="misorder-group" *ngFor="let group of misorderGroups; trackBy: trackByKey">
+              <div class="misorder-company">
+                <strong>{{ group.company.mst }}</strong>
+                <span>{{ group.company.company }}</span>
+              </div>
+              <table class="data-table compact-table">
+                <thead>
+                  <tr>
+                    <th>Tên hàng hóa</th>
+                    <th>Mã VT hiện tại</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr *ngFor="let item of group.items; trackBy: trackByKey">
+                    <td>{{ item.product.name }}</td>
+                    <td><code>{{ item.code }}</code></td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="canonical-picker">
+                <label>Mã dùng chung</label>
+                <select class="form-control" [(ngModel)]="misorderCanonicalCodes[group.key]">
+                  <option *ngFor="let item of group.items; trackBy: trackByKey" [value]="item.code">{{ item.code }}</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </ng-container>
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary btn-sm" (click)="showMisorderModal = false">Đóng</button>
-      <button class="btn-primary btn-sm" (click)="applyMisorderChoices()">Dùng chung mã đã chọn</button>
+      <button type="button" class="btn-secondary btn-sm" (click)="closeSuspectModal()">Đóng</button>
+      <button type="button" class="btn-primary btn-sm" *ngIf="activeSuspectSection === 'near_phrase'" (click)="applyNearPhraseChoices()">Áp dụng gộp đã chọn</button>
+      <button type="button" class="btn-primary btn-sm" *ngIf="activeSuspectSection === 'misorder'" (click)="applyMisorderChoices()">Dùng chung mã đã chọn</button>
     </div>
   </div>
 </div>
