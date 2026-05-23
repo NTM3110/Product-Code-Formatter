@@ -506,6 +506,15 @@ def parse_price(value):
         return None
 
 
+def raw_text(value):
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def parse_quantity(value):
+    parsed = parse_price(value)
+    return parsed if parsed is not None and parsed > 0 else 1
+
+
 def fmt_price(value):
     if value is None:
         return ""
@@ -593,6 +602,29 @@ def remove_repeated_phrases(words, repeated_phrases):
     return result
 
 
+def normalize_cao_thanh_inox_grade_words(words):
+    result = []
+    for word in words:
+        current = normalize_code_token(word)
+        previous = normalize_code_token(result[-1]) if result else ""
+        if current == "304" and previous == "INOX":
+            continue
+        result.append(word)
+    return result
+
+
+def normalize_cao_thanh_con_reducer_words(words):
+    if not words:
+        return words
+    first = normalize_code_token(words[0])
+    last = normalize_code_token(words[-1], keep_slash=True)
+    if first != "CON" or not re.search(r"\d+(?:[.,]\d+)?/\d+", last):
+        return words
+    if any(normalize_code_token(word) == "THU" for word in words):
+        return words
+    return [words[0], "thu", *words[1:]]
+
+
 def make_product_part(profile, product, word_rules, first_word_rules=None, repeated_phrase_removals=None):
     first_word_rules = first_word_rules or {}
     name = "" if pd.isna(product) else str(product).strip()
@@ -600,6 +632,8 @@ def make_product_part(profile, product, word_rules, first_word_rules=None, repea
     if profile == "cao_thanh":
         name = re.sub(r"\([^)]*\)", " ", name)
         words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
+        words = normalize_cao_thanh_inox_grade_words(words)
+        words = normalize_cao_thanh_con_reducer_words(words)
         first = word_pieces(
             words[:2],
             first_word_rules,
@@ -745,13 +779,26 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
         product = "" if pd.isna(cell(df, i, pi)) else str(cell(df, i, pi)).strip()
         if not mst or not product:
             continue
+        quantity = parse_quantity(cell(df, i, qi)) if qi is not None else 1
+        price = parse_price(cell(df, i, pri)) if pri is not None else None
+        unit_index = pi + 1
+        amount_index = pri + 1 if pri is not None else -1
+        amount = parse_price(cell(df, i, amount_index)) if amount_index >= 0 else None
+        if (amount is None or amount <= 0) and price is not None:
+            amount = price * quantity
         rows.append({
             "excel_row": i + 1,
+            "stt": raw_text(cell(df, i, 0)),
+            "invoice_no": raw_text(cell(df, i, 1)),
+            "invoice_date": raw_text(cell(df, i, 2)),
             "mst": mst,
             "company": "" if pd.isna(cell(df, i, ci)) else str(cell(df, i, ci)).strip(),
             "address": "" if ai is None or pd.isna(cell(df, i, ai)) else str(cell(df, i, ai)).strip(),
             "product": product,
-            "price": parse_price(cell(df, i, pri)) if pri is not None else None,
+            "unit": raw_text(cell(df, i, unit_index)),
+            "quantity": quantity,
+            "price": price,
+            "amount": amount,
         })
     return rows
 
@@ -799,7 +846,13 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
             prices = [r["price"] for r in product_rows if r["price"] is not None]
             price_rows = [{
                 "price": r["price"],
+                "quantity": r["quantity"],
+                "amount": r["amount"],
                 "excelRow": r["excel_row"],
+                "stt": r["stt"],
+                "invoiceNo": r["invoice_no"],
+                "invoiceDate": r["invoice_date"],
+                "unit": r["unit"],
                 "name": r["product"],
             } for r in product_rows if r["price"] is not None]
             product_items.append({

@@ -1,10 +1,11 @@
-import { Component } from '@angular/core';
+﻿import { Component } from '@angular/core';
 import { CommonModule, KeyValuePipe } from '@angular/common';
 import { HttpClient, HttpErrorResponse, HttpEventType } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
 type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh';
 type SuspectSectionKey = 'near_phrase' | 'misorder';
+type Stage3Phase = 'customize' | 'price';
 
 type ConfigProfile = {
   prefixes: Record<string, string>;
@@ -29,24 +30,45 @@ type AppConfig = {
 type PriceDetailRow = {
   key: string;
   excelRow: string;
+  stt: string;
+  invoiceNo: string;
+  invoiceDate: string;
   companyName: string;
   productName: string;
+  unit: string;
   price: number;
+  quantity: number;
+  totalAmount: number;
+  costAmount: number;
   deltaAmount: number;
+  deltaTotal: number;
   deltaPercent: number;
 };
 
 type PriceBucket = {
   key: string;
   label: string;
+  finalCode?: string;
   count: number;
   min: number;
   max: number;
   averagePrice: number;
   marginPercent: number;
+  draftMarginPercent?: number;
   adjustedAverage: number;
-  rows: Array<{ key: string; excelRow: string; companyName: string; productName: string; price: number }>;
+  lossCount?: number;
+  hasLoss?: boolean;
+  quantity?: number;
+  totalAmount?: number;
+  rows: Array<{ key: string; excelRow: string; stt?: string; invoiceNo?: string; invoiceDate?: string; companyName: string; productName: string; unit?: string; price: number; quantity?: number; totalAmount?: number }>;
   details: PriceDetailRow[] | null;
+};
+
+type PrefixOption = {
+  key: string;
+  label: string;
+  value: string;
+  warning: string;
 };
 
 @Component({
@@ -58,6 +80,7 @@ type PriceBucket = {
 })
 export class AppComponent {
   step = 1;
+  stage3Phase: Stage3Phase = 'customize';
   error: string | null = null;
   isLoading = false;
   processingProgress: number | null = null;
@@ -100,6 +123,17 @@ export class AppComponent {
   showProductModal = false;
   currentCompany: any = null;
   currentProductList: any[] = [];
+  targetProductKey = '';
+  blinkingProductKey = '';
+  showPrefixModal = false;
+  prefixMstSuffixLength = 3;
+  productCodeGroups: any[] = [];
+  productCodeSections: any[] = [];
+  priceCodeSections: any[] = [];
+  expandedProductCodeSections: Record<string, boolean> = {};
+  expandedProductCodeGroups: Record<string, boolean> = {};
+  stageActionLoading = false;
+  stageActionLoadingLabel = '';
 
   wordRules: Record<string, string> = {};
   firstWordRules: Record<string, string> = {};
@@ -114,10 +148,13 @@ export class AppComponent {
   priceRangeRules: Record<string, any> = {};
   priceConflictRows: any[] = [];
   priceConflictGroups: any[] = [];
+  priceCodeSummary = { base: 0, single: 0, multi: 0, split: 0 };
   showPriceGroupModal = false;
+  showPriceModalRows = false;
   expandedPriceBuckets: Record<string, boolean> = {};
   priceFilterAllPercent = 8;
   priceAdjustAllPercent = 0;
+  priceAdjustAllPercentDirty = false;
   manualCodeOverrides: Record<string, string> = {};
   longCodeCounts: Record<string, number> = {};
   misorderGroups: any[] = [];
@@ -136,8 +173,22 @@ export class AppComponent {
   private configOperationTimer: ReturnType<typeof setTimeout> | null = null;
   private configOperationId = 0;
   private codePreviewCache = new Map<string, string>();
+  private priceGroupsCacheValid = false;
   private processingProgressTimer: ReturnType<typeof setInterval> | null = null;
   private processingProgressClearTimer: ReturnType<typeof setTimeout> | null = null;
+  private productBlinkClearTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly companyPrefixStopWords = new Set([
+    'CONG', 'TY', 'TNHH', 'TM', 'DV', 'CP', 'CO', 'LTD', 'MTV', 'XNK', 'XD',
+    'TINH', 'PHO', 'TP', 'HUYEN', 'QUAN', 'THI', 'XA', 'PHUONG'
+  ]);
+  private readonly vietnamLocationPhrases = [
+    'An Giang', 'Bà Rịa Vũng Tàu', 'Bắc Giang', 'Bắc Kạn', 'Bạc Liêu', 'Bắc Ninh', 'Bến Tre', 'Bình Dương', 'Bình Định', 'Bình Phước', 'Bình Thuận',
+    'Cà Mau', 'Cao Bằng', 'Cần Thơ', 'Đà Nẵng', 'Đắk Lắk', 'Đắk Nông', 'Điện Biên', 'Đồng Nai', 'Đồng Tháp', 'Gia Lai', 'Hà Giang', 'Hà Nam',
+    'Hà Nội', 'Hà Tĩnh', 'Hải Dương', 'Hải Phòng', 'Hậu Giang', 'Hòa Bình', 'Hồ Chí Minh', 'Hưng Yên', 'Khánh Hòa', 'Kiên Giang', 'Kon Tum',
+    'Lai Châu', 'Lâm Đồng', 'Lạng Sơn', 'Lào Cai', 'Long An', 'Nam Định', 'Nghệ An', 'Ninh Bình', 'Ninh Thuận', 'Phú Thọ', 'Phú Yên', 'Quảng Bình',
+    'Quảng Nam', 'Quảng Ngãi', 'Quảng Ninh', 'Quảng Trị', 'Sóc Trăng', 'Sơn La', 'Tây Ninh', 'Thái Bình', 'Thái Nguyên', 'Thanh Hóa',
+    'Thành phố Huế', 'Thừa Thiên Huế', 'Huế', 'Tiền Giang', 'Trà Vinh', 'Tuyên Quang', 'Vĩnh Long', 'Vĩnh Phúc', 'Yên Bái'
+  ].map(name => this.normalizeCompanyTokens(name));
 
   constructor(private http: HttpClient) {
     this.refreshUiDerivedState();
@@ -174,6 +225,7 @@ export class AppComponent {
     this.manualCodeOverrides = { ...(profile.manual_code_overrides || {}) };
     this.outputPath = profile.output_path || '';
     this.invalidateCodePreviewCache();
+    this.clearPriceGroupsCache();
     this.refreshUiDerivedState();
   }
 
@@ -505,6 +557,7 @@ export class AppComponent {
     if (!this.fileToUpload) return;
     this.error = null;
     this.isLoading = true;
+    this.clearPriceGroupsCache();
     const formData = new FormData();
     formData.append('file', this.fileToUpload);
     this.http.post<any>('/api/mapping', formData).subscribe({
@@ -524,6 +577,7 @@ export class AppComponent {
   checkCompanies() {
     this.error = null;
     this.isLoading = true;
+    this.clearPriceGroupsCache();
     const payload = this.basePayload();
     this.http.post<any>('/api/check', payload).subscribe({
       next: (res) => {
@@ -537,6 +591,7 @@ export class AppComponent {
         this.invalidateCodePreviewCache();
         this.verifyPrefixes();
         this.step = 3;
+        this.stage3Phase = 'customize';
         this.isLoading = false;
       },
       error: (err) => this.fail(err, 'Không kiểm tra được đơn vị.')
@@ -549,6 +604,9 @@ export class AppComponent {
     const skippedMap = profile.selected_products || {};
     const removedCompanies = profile.removed_companies || {};
     for (const c of this.companies) {
+      c.value = c.default_prefix || c.value || '';
+      c.process = true;
+      c.selected_products = new Set<string>((c.all_products || []).map((product: any) => product.name));
       if (prefixes[c.mst]) c.value = prefixes[c.mst];
       if (Array.isArray(skippedMap[c.mst])) {
         const skippedSet = new Set<string>(skippedMap[c.mst]);
@@ -590,12 +648,29 @@ export class AppComponent {
       return pa.localeCompare(pb) || lastSix(a.mst).localeCompare(lastSix(b.mst)) || a.company.localeCompare(b.company);
     };
     const normalSorter = (a: any, b: any) => lastSix(a.mst).localeCompare(lastSix(b.mst)) || a.company.localeCompare(b.company);
-    const visibleCompanies = this.companies.filter(c => c.process);
-    this.duplicateCompanies = visibleCompanies.filter(c => {
+    const processedCompanies = this.companies.filter(c => c.process);
+    this.duplicateCompanies = processedCompanies.filter(c => {
       const p = (c.value || '').trim().toUpperCase();
       return p && (prefixCount.get(p) || 0) > 1;
     }).sort(sorter);
-    this.normalCompanies = visibleCompanies.filter(c => !this.duplicateCompanies.includes(c)).sort(normalSorter);
+    this.normalCompanies = this.companies.filter(c => !this.duplicateCompanies.includes(c)).sort(normalSorter);
+  }
+
+  async runWithStageLoading(label: string, work: () => void | Promise<void>) {
+    this.stageActionLoadingLabel = label;
+    this.stageActionLoading = true;
+    await this.yieldToBrowser();
+    try {
+      await work();
+    } finally {
+      await this.yieldToBrowser();
+      this.stageActionLoading = false;
+      this.stageActionLoadingLabel = '';
+    }
+  }
+
+  onCompanyPrefixToggleChange() {
+    this.runWithStageLoading('Đang cập nhật nhóm mã VT...', () => this.verifyPrefixes());
   }
 
   verifyPrefixes(updateList = true, refreshDerived = true) {
@@ -642,16 +717,275 @@ export class AppComponent {
     this.refreshUiDerivedState();
   }
 
-  openProductModal(company: any) {
+  openPrefixModal() {
+    this.verifyPrefixes(true, false);
+    this.refreshUiDerivedState();
+    this.showPrefixModal = true;
+  }
+
+  closePrefixModal() {
+    this.showPrefixModal = false;
+  }
+
+  onPrefixSuffixLengthChange() {
+    this.prefixMstSuffixLength = Math.max(3, Math.floor(Number(this.prefixMstSuffixLength || 3)));
+    this.runWithStageLoading('Đang kiểm tra trùng MST...', () => this.verifyPrefixes(true, false));
+  }
+
+  verifyPrefixesWithLoading(label = 'Đang kiểm tra tiền tố...', updateList = true, refreshDerived = true) {
+    this.runWithStageLoading(label, () => this.verifyPrefixes(updateList, refreshDerived));
+  }
+
+  applyPrefixOption(company: any, value: string) {
+    company.value = this.normalizeCodeText(value || '');
+    this.runWithStageLoading('Đang áp dụng prefix...', () => this.verifyPrefixes());
+  }
+
+  onManualPrefixChange() {
+    this.runWithStageLoading('Đang cập nhật prefix...', () => this.verifyPrefixes());
+  }
+
+  prefixOptions(company: any): PrefixOption[] {
+    const current = this.normalizeCodeText(company?.value || '');
+    const mstSuffix = this.companyMstSuffix(company);
+    const initials = this.companyNameInitials(company?.company || '');
+    const initialsMst = initials && mstSuffix ? `${initials}${mstSuffix}` : '';
+    const options = [
+      { key: 'current', label: 'Đang chọn', value: current },
+      { key: 'mst', label: `${this.prefixMstSuffixLength} số cuối MST`, value: mstSuffix },
+      { key: 'initials', label: '2 chữ từ tên công ty', value: initials },
+      { key: 'initials-mst', label: '2 chữ + MST', value: initialsMst }
+    ];
+    return options
+      .filter(option => option.value)
+      .map(option => ({ ...option, warning: this.prefixOptionWarning(company, option.value, option.key) }));
+  }
+
+  prefixOptionWarning(company: any, value: string, source: string) {
+    const candidate = this.normalizeCodeText(value || '');
+    if (!candidate) return '';
+    const duplicatesSelected = this.companies.some(item => item !== company && item.process && this.normalizeCodeText(item.value || '') === candidate);
+    if (duplicatesSelected) return `Sẽ trùng ${candidate} với công ty khác`;
+    if (source === 'mst') {
+      const suffixDuplicated = this.companies.some(item => item !== company && item.process && this.companyMstSuffix(item) === candidate);
+      if (suffixDuplicated) return `Trùng ${this.prefixMstSuffixLength} số cuối MST, hãy thử ${this.prefixMstSuffixLength + 1} số, 2 chữ, 2 chữ + MST hoặc nhập tay.`;
+    }
+    return '';
+  }
+
+  companyMstSuffix(company: any) {
+    const digits = String(company?.mst || '').replace(/\D/g, '');
+    if (!digits) return '';
+    return digits.slice(-Math.max(3, Number(this.prefixMstSuffixLength || 3)));
+  }
+
+  normalizeCompanyTokens(value: string) {
+    return (value || '')
+      .replace(/\u0110/g, 'D')
+      .replace(/\u0111/g, 'd')
+      .replace(/[ĐÄ]/g, 'D')
+      .replace(/[đÄ‘]/g, 'd')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+  }
+
+  companyNameInitials(companyName: string) {
+    const tokens = this.removeLocationPhrases(this.normalizeCompanyTokens(companyName))
+      .filter(token => !this.companyPrefixStopWords.has(token));
+    const picked = tokens.slice(-2);
+    return picked.map(token => token[0] || '').join('');
+  }
+
+  removeLocationPhrases(tokens: string[]) {
+    const result: string[] = [];
+    for (let index = 0; index < tokens.length;) {
+      const phrase = this.vietnamLocationPhrases.find(items => items.length && items.every((item, offset) => tokens[index + offset] === item));
+      if (phrase) {
+        index += phrase.length;
+      } else {
+        result.push(tokens[index]);
+        index++;
+      }
+    }
+    return result;
+  }
+
+  goToPriceStage() {
+    this.runWithStageLoading('Đang chuẩn bị lọc giá...', () => {
+      this.verifyPrefixes();
+      if (this.companies.some(company => company.process && company.needs_manual)) {
+        this.showMessage('Còn tiền tố bị thiếu hoặc bị trùng. Hãy xử lý ở phần tùy chỉnh tiền tố trước khi lọc giá.');
+        return;
+      }
+      this.stage3Phase = 'price';
+      this.refreshPriceGroups();
+      if (this.selectedProfile === 'cao_thanh') this.showPriceGroupModal = true;
+    });
+  }
+
+  backToCustomizeStage() {
+    this.stage3Phase = 'customize';
+  }
+
+  navigateBackFromStepThree() {
+    if (this.stage3Phase === 'price') {
+      this.backToCustomizeStage();
+    } else {
+      this.step--;
+    }
+  }
+
+  refreshProductCodeGroups() {
+    const grouped = new Map<string, any>();
+    const sectioned = new Map<string, any>();
+    for (const company of this.companies || []) {
+      if (!company.process) continue;
+      const sectionKey = this.includeCompanyPrefix ? `company|||${company.mst}` : 'all-products';
+      if (!sectioned.has(sectionKey)) {
+        sectioned.set(sectionKey, {
+          key: sectionKey,
+          title: this.includeCompanyPrefix ? `${company.mst} - ${company.company}` : 'Tất cả mã VT',
+          company: this.includeCompanyPrefix ? company : null,
+          productCount: 0,
+          rowCount: 0,
+          groups: new Map<string, any>()
+        });
+      }
+      const section = sectioned.get(sectionKey);
+      for (const product of company.all_products || []) {
+        if (!company.selected_products?.has(product.name)) continue;
+        const code = this.productCodeFor(company, product.name || '');
+        const key = code || '(blank)';
+        if (!grouped.has(key)) {
+          grouped.set(key, {
+            key: `code-group|||${key}`,
+            code,
+            products: [],
+            companies: new Map<string, any>(),
+            productCount: 0,
+            rowCount: 0,
+            hasLongCode: false
+          });
+        }
+        const group = grouped.get(key);
+        group.products.push({
+          key: this.productKey(company.mst, product.name || ''),
+          company,
+          product,
+          productName: product.name || '(Tên hàng hóa trống)',
+          rowSummary: this.productRowSummary(product),
+          priceSummary: this.productPriceSummary(product)
+        });
+        group.companies.set(company.mst, company);
+        group.productCount++;
+        group.rowCount += Number(product.count || 0);
+        if ((this.productCodeFor(company, product.name || '', false) || '').length > 50) group.hasLongCode = true;
+        if (!section.groups.has(key)) {
+          section.groups.set(key, {
+            key: `${sectionKey}|||code|||${key}`,
+            code,
+            products: [],
+            companies: new Map<string, any>(),
+            productCount: 0,
+            rowCount: 0,
+            hasLongCode: false
+          });
+        }
+        const sectionGroup = section.groups.get(key);
+        sectionGroup.products.push({
+          key: this.productKey(company.mst, product.name || ''),
+          company,
+          product,
+          productName: product.name || '(Tên hàng hóa trống)',
+          rowSummary: this.productRowSummary(product),
+          priceSummary: this.productPriceSummary(product)
+        });
+        sectionGroup.companies.set(company.mst, company);
+        sectionGroup.productCount++;
+        sectionGroup.rowCount += Number(product.count || 0);
+        section.productCount++;
+        section.rowCount += Number(product.count || 0);
+        if ((this.productCodeFor(company, product.name || '', false) || '').length > 50) sectionGroup.hasLongCode = true;
+      }
+    }
+    this.productCodeGroups = Array.from(grouped.values()).map(group => ({
+      ...group,
+      companyList: Array.from(group.companies.values()).sort((a: any, b: any) => String(a.mst).localeCompare(String(b.mst))),
+      products: group.products.sort((a: any, b: any) => a.productName.localeCompare(b.productName, 'vi-VN'))
+    })).sort((a, b) => (a.code || '').localeCompare(b.code || '', 'vi-VN'));
+    this.productCodeSections = Array.from(sectioned.values()).map(section => ({
+      ...section,
+      codeCount: section.groups.size,
+      expanded: this.productSectionExpanded(section.key),
+      groups: Array.from(section.groups.values()).map((group: any) => ({
+        ...group,
+        expanded: this.productGroupExpanded(group.key),
+        companyList: Array.from(group.companies.values()).sort((a: any, b: any) => String(a.mst).localeCompare(String(b.mst))),
+        products: group.products.sort((a: any, b: any) => a.productName.localeCompare(b.productName, 'vi-VN'))
+      })).sort((a: any, b: any) => (a.code || '').localeCompare(b.code || '', 'vi-VN'))
+    })).sort((a, b) => a.title.localeCompare(b.title, 'vi-VN'));
+  }
+
+  productSectionExpanded(key: string) {
+    return this.expandedProductCodeSections[key] !== false;
+  }
+
+  productGroupExpanded(key: string) {
+    return this.expandedProductCodeGroups[key] !== false;
+  }
+
+  toggleProductCodeSection(section: any) {
+    this.expandedProductCodeSections[section.key] = !this.productSectionExpanded(section.key);
+    this.refreshProductCodeGroups();
+    this.refreshPriceCodeSections();
+  }
+
+  toggleProductCodeGroup(group: any) {
+    this.expandedProductCodeGroups[group.key] = !this.productGroupExpanded(group.key);
+    this.refreshProductCodeGroups();
+    this.refreshPriceCodeSections();
+  }
+
+  openProductModal(company: any, targetProductName = '') {
+    if (this.productBlinkClearTimer) {
+      clearTimeout(this.productBlinkClearTimer);
+      this.productBlinkClearTimer = null;
+    }
     this.currentCompany = company;
     this.currentProductList = (company.all_products || []).map((p: any) => ({
       ...p,
+      key: this.productKey(company.mst, p.name || ''),
       selected: company.selected_products.has(p.name),
       code: this.productCodeFor(company, p.name),
       rowSummary: this.productRowSummary(p),
       priceSummary: this.productPriceSummary(p)
     }));
+    this.targetProductKey = targetProductName ? this.productKey(company.mst, targetProductName) : '';
+    this.blinkingProductKey = this.targetProductKey;
     this.showProductModal = true;
+    if (this.targetProductKey) {
+      setTimeout(() => this.scrollToTargetProduct(), 0);
+      this.productBlinkClearTimer = setTimeout(() => {
+        this.blinkingProductKey = '';
+        this.productBlinkClearTimer = null;
+      }, 1600);
+    }
+  }
+
+  productModalRowId(product: any) {
+    return `product-row-${encodeURIComponent(product?.key || '')}`.replace(/%/g, '-');
+  }
+
+  scrollToTargetProduct() {
+    const product = this.currentProductList.find(item => item.key === this.targetProductKey);
+    if (!product) return;
+    const element = document.getElementById(this.productModalRowId(product));
+    element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
   productBaseCode(company: any, productName: string, trim = true) {
@@ -665,10 +999,11 @@ export class AppComponent {
 
   refreshDerivedCodeViews() {
     if (this.selectedProfile === 'cao_thanh') {
-      if (this.showPriceGroupModal) this.refreshPriceGroups();
+      if (this.showPriceGroupModal || this.stage3Phase === 'price') this.refreshPriceGroups();
     } else {
       this.priceConflictRows = [];
       this.priceConflictGroups = [];
+      this.priceCodeSections = [];
       this.misorderGroups = [];
       this.nearPhraseGroups = [];
     }
@@ -678,18 +1013,20 @@ export class AppComponent {
         product.code = this.productCodeFor(this.currentCompany, product.name || '');
       }
     }
+    this.refreshProductCodeGroups();
     if (this.showSuspectModal) this.refreshActiveSuspectSection();
   }
 
   async refreshDerivedCodeViewsChunked() {
     if (this.selectedProfile === 'cao_thanh') {
-      if (this.showPriceGroupModal) {
+      if (this.showPriceGroupModal || this.stage3Phase === 'price') {
         this.refreshPriceGroups();
         await this.yieldToBrowser();
       }
     } else {
       this.priceConflictRows = [];
       this.priceConflictGroups = [];
+      this.priceCodeSections = [];
       this.misorderGroups = [];
       this.nearPhraseGroups = [];
     }
@@ -699,6 +1036,7 @@ export class AppComponent {
         product.code = this.productCodeFor(this.currentCompany, product.name || '');
       }
     }
+    this.refreshProductCodeGroups();
     if (this.showSuspectModal) this.refreshActiveSuspectSection();
   }
 
@@ -769,7 +1107,8 @@ export class AppComponent {
   }
 
   saveProductSelection() {
-    if (this.currentCompany) {
+    this.runWithStageLoading('Đang lưu hàng hóa...', () => {
+      if (!this.currentCompany) return;
       this.currentCompany.selected_products = new Set<string>(
         this.currentProductList.filter(p => p.selected).map(p => p.name)
       );
@@ -787,15 +1126,21 @@ export class AppComponent {
       }
       this.manualCodeOverrides = nextOverrides;
       this.invalidateCodePreviewCache();
-    }
-    this.closeProductModal();
-    this.refreshDerivedCodeViews();
+      this.closeProductModal();
+      this.refreshDerivedCodeViews();
+    });
   }
 
   closeProductModal() {
+    if (this.productBlinkClearTimer) {
+      clearTimeout(this.productBlinkClearTimer);
+      this.productBlinkClearTimer = null;
+    }
     this.showProductModal = false;
     this.currentCompany = null;
     this.currentProductList = [];
+    this.targetProductKey = '';
+    this.blinkingProductKey = '';
   }
 
   openWordRuleModal() {
@@ -862,18 +1207,20 @@ export class AppComponent {
   }
 
   applyWordRules() {
-    try {
-      this.wordRules = this.rowsToRules(this.wordRuleRows, 'Từ thứ 3 trở đi');
-      this.firstWordRules = this.rowsToRules(this.firstWordRuleRows, 'Hai từ đầu tiên');
-      this.repeatedPhraseRemovals = this.normalizePhraseList(this.repeatedPhraseRemovalRows);
-    } catch (error) {
-      this.showMessage(error instanceof Error ? error.message : 'Quy tắc từ thay riêng bị trùng.');
-      return;
-    }
-    this.showWordRuleModal = false;
-    this.invalidateCodePreviewCache();
-    this.refreshDerivedCodeViews();
-    this.refreshUiDerivedState();
+    this.runWithStageLoading('Đang áp dụng quy tắc...', () => {
+      try {
+        this.wordRules = this.rowsToRules(this.wordRuleRows, 'Từ thứ 3 trở đi');
+        this.firstWordRules = this.rowsToRules(this.firstWordRuleRows, 'Hai từ đầu tiên');
+        this.repeatedPhraseRemovals = this.normalizePhraseList(this.repeatedPhraseRemovalRows);
+      } catch (error) {
+        this.showMessage(error instanceof Error ? error.message : 'Quy tắc từ thay riêng bị trùng.');
+        return;
+      }
+      this.showWordRuleModal = false;
+      this.invalidateCodePreviewCache();
+      this.refreshDerivedCodeViews();
+      this.refreshUiDerivedState();
+    });
   }
 
   normalizeRuleKey(value: string) {
@@ -894,8 +1241,24 @@ export class AppComponent {
   }
 
   refreshPriceGroups() {
+    if (this.priceGroupsCacheValid) {
+      this.refreshPriceConflictViews();
+      return;
+    }
     this.priceConflictRows = this.buildPriceConflictRows();
+    this.priceGroupsCacheValid = true;
+    this.refreshPriceConflictViews();
+  }
+
+  rebuildPriceGroups() {
+    this.priceGroupsCacheValid = false;
+    this.refreshPriceGroups();
+  }
+
+  refreshPriceConflictViews() {
     this.priceConflictGroups = this.groupPriceRows(this.priceConflictRows);
+    this.refreshPriceCodeSummary();
+    this.refreshPriceCodeSections();
   }
 
   buildPriceConflictRows() {
@@ -907,7 +1270,7 @@ export class AppComponent {
         const code = this.productCodeFor(company, product.name);
         if (!code) continue;
         const priceItems = (product.priceRows || [])
-          .map((item: any, index: number) => ({ item, index, price: Number(item.price) }))
+          .map((item: any, index: number) => ({ item, index, price: Number(item.price), quantity: this.validQuantity(item.quantity) }))
           .filter((item: any) => Number.isFinite(item.price));
         if (!priceItems.length) continue;
         const productKey = this.productKey(company.mst, product.name);
@@ -928,8 +1291,10 @@ export class AppComponent {
             max: 0,
             average: 0,
             filterPercent: Number(savedByProduct?.percent || savedByCode?.percent || 8),
+            draftFilterPercent: Number(savedByProduct?.percent || savedByCode?.percent || 8),
             bulkAdjustPercent: 0,
             savedRule: savedByProduct || savedByCode || null,
+            sectionBuckets: {},
             buckets: [] as PriceBucket[]
           };
           grouped.set(code, row);
@@ -949,8 +1314,14 @@ export class AppComponent {
             product,
             productKey,
             excelRow: priceItem.item.excelRow || '',
+            stt: priceItem.item.stt || '',
+            invoiceNo: priceItem.item.invoiceNo || '',
+            invoiceDate: priceItem.item.invoiceDate || '',
             name: priceItem.item.name || product.name,
-            price: priceItem.price
+            unit: priceItem.item.unit || '',
+            price: priceItem.price,
+            quantity: priceItem.quantity,
+            totalAmount: this.lineTotalAmount(priceItem.price, priceItem.quantity, priceItem.item.amount)
           });
         }
       }
@@ -959,12 +1330,14 @@ export class AppComponent {
     for (const row of grouped.values()) {
       const prices = row.sourceRows.map((item: any) => item.price);
       const unique = Array.from(new Set(prices));
-      if (unique.length < 2) continue;
       row.count = unique.length;
+      row.hasMultiplePrices = unique.length > 1;
       row.priceRowCount = prices.length;
       row.min = Math.min(...prices);
       row.max = Math.max(...prices);
-      row.average = prices.reduce((sum: number, price: number) => sum + price, 0) / prices.length;
+      row.quantity = this.totalQuantity(row.sourceRows);
+      row.totalAmount = this.totalAmount(row.sourceRows);
+      row.average = this.weightedAveragePrice(row.sourceRows);
       row.companyDisplay = row.companies.map((company: any) => `${company.mst} - ${company.company}`).join(' | ');
       row.productDisplay = row.products.map((product: any) => product.name).join(' | ');
       row.productCount = row.products.length;
@@ -975,7 +1348,191 @@ export class AppComponent {
   }
 
   groupPriceRows(rows: any[]) {
-    return rows.length ? [{ key: 'all-price-conflicts', title: 'Các Mã VT có nhiều đơn giá', rows }] : [];
+    const multiPriceRows = (rows || []).filter(row => row.hasMultiplePrices);
+    return multiPriceRows.length ? [{ key: 'all-price-conflicts', title: 'Các Mã VT có nhiều đơn giá', rows: multiPriceRows }] : [];
+  }
+
+  stageProductCodeTotal() {
+    this.ensurePriceCodeSummary();
+    return this.stage3Phase === 'price' ? this.priceCodeSummary.base : this.productCodeGroups.length;
+  }
+
+  singlePriceCodeTotal() {
+    this.ensurePriceCodeSummary();
+    return this.priceCodeSummary.single;
+  }
+
+  multiPriceCodeTotal() {
+    this.ensurePriceCodeSummary();
+    return this.priceCodeSummary.multi;
+  }
+
+  splitPriceCodeTotal() {
+    this.ensurePriceCodeSummary();
+    return this.priceCodeSummary.split;
+  }
+
+  ensurePriceCodeSummary() {
+    if (this.priceCodeSummary.base !== (this.priceConflictRows || []).length) {
+      this.refreshPriceCodeSummary();
+    }
+  }
+
+  refreshPriceCodeSummary() {
+    const rows = this.priceConflictRows || [];
+    this.priceCodeSummary = rows.reduce((summary, row) => {
+      summary.base += 1;
+      if (row.hasMultiplePrices) {
+        summary.multi += 1;
+      } else {
+        summary.single += 1;
+      }
+      summary.split += Math.max(1, (row.buckets || []).length);
+      return summary;
+    }, { base: 0, single: 0, multi: 0, split: 0 });
+  }
+
+  validQuantity(value: unknown) {
+    const quantity = Number(value);
+    return Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+  }
+
+  totalQuantity(rows: Array<{ quantity?: number }>) {
+    return (rows || []).reduce((sum, item) => sum + this.validQuantity(item.quantity), 0);
+  }
+
+  lineTotalAmount(price: unknown, quantity: unknown, totalAmount: unknown) {
+    const parsedAmount = Number(totalAmount);
+    if (Number.isFinite(parsedAmount) && parsedAmount > 0) return parsedAmount;
+    const parsedPrice = Number(price || 0);
+    return parsedPrice * this.validQuantity(quantity);
+  }
+
+  totalAmount(rows: Array<{ price?: number; quantity?: number; totalAmount?: number }>) {
+    return (rows || []).reduce((sum, item) => {
+      return sum + this.lineTotalAmount(item.price, item.quantity, item.totalAmount);
+    }, 0);
+  }
+
+  weightedAveragePrice(rows: Array<{ price?: number; quantity?: number; totalAmount?: number }>) {
+    const quantity = this.totalQuantity(rows);
+    return quantity > 0 ? this.totalAmount(rows) / quantity : 0;
+  }
+
+  refreshPriceCodeSections() {
+    const sectioned = new Map<string, any>();
+    for (const row of this.priceConflictRows || []) {
+      const companies = this.includeCompanyPrefix ? (row.companies || []) : [null];
+      for (const company of companies) {
+        const sectionKey = this.includeCompanyPrefix ? `company|||${company?.mst || ''}` : 'all-products';
+        if (!sectioned.has(sectionKey)) {
+          sectioned.set(sectionKey, {
+            key: sectionKey,
+            title: this.includeCompanyPrefix ? `${company?.mst || ''} - ${company?.company || ''}` : 'Tất cả mã VT',
+            company: this.includeCompanyPrefix ? company : null,
+            productCount: 0,
+            rowCount: 0,
+            singlePriceCodeCount: 0,
+            multiPriceCodeCount: 0,
+            groups: new Map<string, any>()
+          });
+        }
+        const section = sectioned.get(sectionKey);
+        const codeKey = row.code || '(blank)';
+        const groupKey = `${sectionKey}|||code|||${codeKey}`;
+        const sourceRows = this.includeCompanyPrefix && company
+          ? (row.sourceRows || []).filter((sourceRow: any) => sourceRow.company?.mst === company.mst)
+          : (row.sourceRows || []);
+        const products = this.includeCompanyPrefix && company
+          ? (row.products || []).filter((product: any) => product.company?.mst === company.mst)
+          : (row.products || []);
+        const buckets = this.priceSectionBuckets(row, sectionKey, sourceRows);
+        const priceRowCount = sourceRows.length || Number(row.priceRowCount || 0);
+        const productCount = products.length || Number(row.productCount || 0);
+        const lossCount = buckets.reduce((sum: number, bucket: any) => sum + Number(bucket.lossCount || 0), 0);
+        section.groups.set(codeKey, {
+          key: groupKey,
+          code: row.code,
+          productCount,
+          rowCount: priceRowCount,
+          priceRowCount,
+          hasMultiplePrices: row.hasMultiplePrices,
+          bucketCount: buckets.length,
+          average: this.weightedAveragePrice(sourceRows),
+          quantity: this.totalQuantity(sourceRows),
+          totalAmount: this.totalAmount(sourceRows),
+          filterPercent: Number(row.filterPercent || 0),
+          draftFilterPercent: Number(row.draftFilterPercent ?? row.filterPercent ?? 0),
+          productDisplay: products.map((product: any) => product.name).join(' | ') || row.productDisplay,
+          companyDisplay: this.includeCompanyPrefix ? '' : row.companyDisplay,
+          buckets,
+          hasLoss: lossCount > 0,
+          lossCount,
+          expanded: this.productGroupExpanded(groupKey)
+        });
+        section.productCount += productCount;
+        section.rowCount += priceRowCount;
+        if (row.hasMultiplePrices) {
+          section.multiPriceCodeCount++;
+        } else {
+          section.singlePriceCodeCount++;
+        }
+      }
+    }
+    this.priceCodeSections = Array.from(sectioned.values()).map(section => {
+      const groups = Array.from(section.groups.values()).sort((a: any, b: any) => (a.code || '').localeCompare(b.code || '', 'vi-VN'));
+      return {
+        ...section,
+        codeCount: section.groups.size,
+        expanded: this.productSectionExpanded(section.key),
+        groups,
+        priceSubsections: this.priceCodeSubsections(section.key, groups)
+      };
+    }).sort((a, b) => a.title.localeCompare(b.title, 'vi-VN'));
+  }
+
+  priceCodeSubsections(sectionKey: string, groups: any[]) {
+    const singleGroups = groups.filter(group => !group.hasMultiplePrices);
+    const multiGroups = groups.filter(group => group.hasMultiplePrices);
+    return [
+      this.priceCodeSubsection(sectionKey, 'multi', 'Mã VT nhiều đơn giá', 'Các mã cần kiểm tra/tách nhóm giá', multiGroups),
+      this.priceCodeSubsection(sectionKey, 'single', 'Mã VT 1 đơn giá', 'Các mã chỉ có một đơn giá', singleGroups)
+    ].filter(subsection => subsection.codeCount > 0);
+  }
+
+  priceCodeSubsection(sectionKey: string, type: string, title: string, description: string, groups: any[]) {
+    const key = `${sectionKey}|||price-kind|||${type}`;
+    return {
+      key,
+      type,
+      title,
+      description,
+      codeCount: groups.length,
+      rowCount: groups.reduce((sum, group) => sum + Number(group.priceRowCount || 0), 0),
+      bucketCount: groups.reduce((sum, group) => sum + Number(group.bucketCount || 0), 0),
+      groups,
+      expanded: this.productSectionExpanded(key)
+    };
+  }
+
+  priceSectionBuckets(row: any, sectionKey: string, sourceRows: any[]) {
+    const allRows = row.sourceRows || [];
+    if (sourceRows.length === allRows.length) return row.buckets || [];
+    row.sectionBuckets = row.sectionBuckets || {};
+    if (!row.sectionBuckets[sectionKey]) {
+      const sectionRow = {
+        ...row,
+        key: `${row.key}|||${sectionKey}`,
+        sourceRows
+      };
+      row.sectionBuckets[sectionKey] = this.buildPriceBuckets(sectionRow)
+        .map((bucket: PriceBucket, index: number) => this.preserveBucketDraft(bucket, row.buckets || [], index));
+    }
+    return row.sectionBuckets[sectionKey];
+  }
+
+  clearPriceRowSectionBuckets(row: any) {
+    row.sectionBuckets = {};
   }
 
   priceBaseline(average: number, percent: number) {
@@ -1000,7 +1557,7 @@ export class AppComponent {
         groupedRows.push([item]);
         continue;
       }
-      const average = current.reduce((sum, currentItem) => sum + currentItem.price, 0) / current.length;
+      const average = this.weightedAveragePrice(current);
       const deviation = average > 0 ? Math.abs((item.price - average) / average) * 100 : 0;
       if (deviation <= filterPercent) {
         current.push(item);
@@ -1010,28 +1567,71 @@ export class AppComponent {
     }
     return groupedRows.map((items, index) => {
       const key = `${row.key}|||bucket|||${index + 1}`;
-      const averagePrice = items.reduce((sum, item) => sum + item.price, 0) / items.length;
+      const averagePrice = this.weightedAveragePrice(items);
+      const quantity = this.totalQuantity(items);
+      const totalAmount = this.totalAmount(items);
       const savedGroup = this.savedPriceBucketRule(row, index, items);
       const marginPercent = Number(savedGroup?.adjust_percent || 0);
-      return {
+      const bucket: PriceBucket = {
         key,
         label: `Nhóm ${index + 1}`,
+        finalCode: this.finalPriceBucketCode(row.code, index, groupedRows.length),
         count: items.length,
         min: Math.min(...items.map(item => item.price)),
         max: Math.max(...items.map(item => item.price)),
         averagePrice,
         marginPercent,
+        draftMarginPercent: marginPercent,
         adjustedAverage: this.priceBaseline(averagePrice, marginPercent),
+        quantity,
+        totalAmount,
         rows: items.map(item => ({
           key: item.key,
           excelRow: String(item.excelRow || ''),
+          stt: String(item.stt || ''),
+          invoiceNo: String(item.invoiceNo || ''),
+          invoiceDate: String(item.invoiceDate || ''),
           companyName: String(item.company.company || ''),
           productName: String(item.product.name || item.name || ''),
-          price: Number(item.price || 0)
+          unit: String(item.unit || ''),
+          price: Number(item.price || 0),
+          quantity: this.validQuantity(item.quantity),
+          totalAmount: this.lineTotalAmount(item.price, item.quantity, item.totalAmount)
         })),
         details: null
       };
+      this.refreshPriceBucketSummary(bucket, false);
+      return bucket;
     });
+  }
+
+  refreshPriceBucketSummary(bucket: PriceBucket, clearDetails = true) {
+    const marginPercent = Number(bucket.marginPercent || 0);
+    bucket.adjustedAverage = this.priceBaseline(bucket.averagePrice, marginPercent);
+    bucket.lossCount = this.computeBucketLossCount(bucket);
+    bucket.hasLoss = bucket.lossCount > 0;
+    if (clearDetails) bucket.details = null;
+    return bucket;
+  }
+
+  preserveBucketDraft(bucket: PriceBucket, previousBuckets: PriceBucket[], index: number) {
+    const previous = this.matchPreviousBucket(bucket, previousBuckets, index);
+    if (!previous) return bucket;
+    const marginPercent = Number(previous.draftMarginPercent ?? previous.marginPercent ?? bucket.marginPercent ?? 0);
+    bucket.marginPercent = marginPercent;
+    bucket.draftMarginPercent = marginPercent;
+    return this.refreshPriceBucketSummary(bucket, false);
+  }
+
+  matchPreviousBucket(bucket: PriceBucket, previousBuckets: PriceBucket[], index: number) {
+    return previousBuckets.find(previous => previous.min === bucket.min && previous.max === bucket.max)
+      || previousBuckets[index]
+      || null;
+  }
+
+  finalPriceBucketCode(code: string, index: number, bucketCount: number) {
+    if (!code || bucketCount <= 1) return code || '';
+    return `${code}.${String(index + 1).padStart(3, '0')}`;
   }
 
   savedPriceBucketRule(row: any, index: number, items: Array<{ price: number }>) {
@@ -1050,14 +1650,25 @@ export class AppComponent {
       .sort((left, right) => Number(left.excelRow || 0) - Number(right.excelRow || 0) || left.productName.localeCompare(right.productName, 'vi-VN'))
       .map(item => {
         const deltaAmount = item.price - bucket.adjustedAverage;
-        const deltaPercent = bucket.adjustedAverage > 0 ? (deltaAmount / bucket.adjustedAverage) * 100 : 0;
+        const quantity = this.validQuantity(item.quantity);
+        const costAmount = bucket.adjustedAverage * quantity;
+        const deltaTotal = deltaAmount * quantity;
+        const deltaPercent = item.price > 0 ? (deltaAmount / item.price) * 100 : 0;
         return {
           key: item.key,
           excelRow: String(item.excelRow || ''),
+          stt: String(item.stt || ''),
+          invoiceNo: String(item.invoiceNo || ''),
+          invoiceDate: String(item.invoiceDate || ''),
           companyName: String(item.companyName || ''),
           productName: String(item.productName || ''),
+          unit: String(item.unit || ''),
           price: Number(item.price || 0),
+          quantity,
+          totalAmount: this.lineTotalAmount(item.price, item.quantity, item.totalAmount),
+          costAmount,
           deltaAmount,
+          deltaTotal,
           deltaPercent
         };
       });
@@ -1066,7 +1677,15 @@ export class AppComponent {
 
   togglePriceBucket(bucket: PriceBucket) {
     this.expandedPriceBuckets[bucket.key] = !this.expandedPriceBuckets[bucket.key];
-    if (this.expandedPriceBuckets[bucket.key]) this.priceBucketDetails(bucket);
+    if (this.priceBucketExpanded(bucket)) this.priceBucketDetails(bucket);
+  }
+
+  priceBucketExpanded(bucket: PriceBucket) {
+    return Boolean(this.expandedPriceBuckets[bucket.key]);
+  }
+
+  expandedPriceBucketDetails(bucket: PriceBucket) {
+    return this.priceBucketExpanded(bucket) ? this.priceBucketDetails(bucket) : [];
   }
 
   bucketDeltaLabel(detail: PriceDetailRow) {
@@ -1074,85 +1693,168 @@ export class AppComponent {
     return detail.deltaPercent > 0 ? 'Lãi' : 'Lỗ';
   }
 
-  bucketLossCount(bucket: PriceBucket) {
+  computeBucketLossCount(bucket: PriceBucket) {
     return (bucket.rows || []).filter(item => item.price < bucket.adjustedAverage).length;
   }
 
+  bucketLossCount(bucket: PriceBucket) {
+    return Number(bucket.lossCount ?? this.computeBucketLossCount(bucket));
+  }
+
   bucketHasLoss(bucket: PriceBucket) {
-    return this.bucketLossCount(bucket) > 0;
+    return Boolean(bucket.hasLoss ?? this.bucketLossCount(bucket) > 0);
   }
 
-  onPriceGroupPercentChange(row: any) {
-    row.buckets = this.buildPriceBuckets(row);
+  groupLossCount(group: any) {
+    return Number(group?.lossCount ?? (group?.buckets || []).reduce((sum: number, bucket: PriceBucket) => sum + this.bucketLossCount(bucket), 0));
   }
 
-  onPriceBucketMarginChange(bucket: PriceBucket) {
-    bucket.adjustedAverage = this.priceBaseline(bucket.averagePrice, Number(bucket.marginPercent || 0));
-    bucket.details = null;
+  groupHasLoss(group: any) {
+    return Boolean(group?.hasLoss ?? this.groupLossCount(group) > 0);
+  }
+
+  onPriceGroupPercentChange(_row: any) {
+  }
+
+  onPriceBucketMarginChange(_bucket: PriceBucket) {
+  }
+
+  onPriceAdjustAllPercentChange() {
+    this.priceAdjustAllPercentDirty = true;
   }
 
   applyPriceAdjustPercentToBuckets(buckets: PriceBucket[], percent: number) {
     const nextPercent = Number(percent || 0);
     for (const bucket of buckets || []) {
       bucket.marginPercent = nextPercent;
-      this.onPriceBucketMarginChange(bucket);
+      bucket.draftMarginPercent = nextPercent;
+      this.refreshPriceBucketSummary(bucket);
     }
   }
 
   applyPriceAdjustPercentToAll() {
-    for (const row of this.priceConflictRows) {
-      this.applyPriceAdjustPercentToBuckets(row.buckets || [], this.priceAdjustAllPercent);
-    }
+    return this.runWithStageLoading('Đang áp % lãi...', () => {
+      for (const row of this.priceConflictRows) {
+        this.applyPriceAdjustPercentToBuckets(row.buckets || [], this.priceAdjustAllPercent);
+        this.clearPriceRowSectionBuckets(row);
+      }
+      this.priceAdjustAllPercentDirty = false;
+      this.refreshPriceConflictViews();
+    });
   }
 
   applyPriceFilterPercentToAll() {
-    const nextPercent = Number(this.priceFilterAllPercent || 0);
-    for (const row of this.priceConflictRows) {
-      row.filterPercent = nextPercent;
-      this.onPriceGroupPercentChange(row);
-    }
+    return this.runWithStageLoading('Đang áp % lọc...', () => {
+      const nextPercent = this.percentValue(this.priceFilterAllPercent, 8);
+      for (const row of this.priceConflictRows) {
+        row.draftFilterPercent = nextPercent;
+        this.applyPriceRowFilterDraft(row);
+      }
+      this.refreshPriceConflictViews();
+    });
   }
 
   applyPriceAdjustPercentToRow(row: any) {
-    this.applyPriceAdjustPercentToBuckets(row.buckets || [], Number(row.bulkAdjustPercent || 0));
+    return this.runWithStageLoading('Đang áp % lãi trong mã VT...', () => {
+      this.applyPriceAdjustPercentToBuckets(row.buckets || [], this.percentValue(row.bulkAdjustPercent, 0));
+      this.clearPriceRowSectionBuckets(row);
+      this.refreshPriceConflictViews();
+    });
+  }
+
+  percentValue(value: unknown, fallback: number) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  applyPriceRowFilterDraft(row: any) {
+    const previousBuckets = row.buckets || [];
+    row.filterPercent = this.percentValue(row.draftFilterPercent, row.filterPercent || 8);
+    row.draftFilterPercent = row.filterPercent;
+    row.buckets = this.buildPriceBuckets(row)
+      .map((bucket: PriceBucket, index: number) => this.preserveBucketDraft(bucket, previousBuckets, index));
+    this.clearPriceRowSectionBuckets(row);
+  }
+
+  applyPriceRowBucketDrafts(row: any) {
+    for (const bucket of row.buckets || []) {
+      bucket.marginPercent = this.percentValue(bucket.draftMarginPercent, bucket.marginPercent || 0);
+      bucket.draftMarginPercent = bucket.marginPercent;
+      this.refreshPriceBucketSummary(bucket);
+    }
+    this.clearPriceRowSectionBuckets(row);
+  }
+
+  applyPriceDraftsToRows() {
+    if (this.priceAdjustAllPercentDirty) {
+      for (const row of this.priceConflictRows) {
+        this.applyPriceAdjustPercentToBuckets(row.buckets || [], this.priceAdjustAllPercent);
+        this.clearPriceRowSectionBuckets(row);
+      }
+      this.priceAdjustAllPercentDirty = false;
+    }
+    for (const row of this.priceConflictRows) {
+      const draftFilterPercent = this.percentValue(row.draftFilterPercent, row.filterPercent || 8);
+      if (draftFilterPercent !== Number(row.filterPercent || 0)) {
+        row.draftFilterPercent = draftFilterPercent;
+        this.applyPriceRowFilterDraft(row);
+      } else {
+        this.applyPriceRowBucketDrafts(row);
+      }
+    }
+    this.refreshPriceConflictViews();
   }
 
   openPriceGroupModal() {
     this.refreshPriceGroups();
+    this.showPriceModalRows = false;
     this.showPriceGroupModal = true;
   }
 
+  togglePriceModalRows() {
+    this.showPriceModalRows = !this.showPriceModalRows;
+  }
+
   applyPriceGroupRules() {
-    const next: Record<string, any> = {};
-    const ranges = { ...this.priceRangeRules };
-    for (const row of this.priceConflictRows) {
-      const percent = Number(row.filterPercent || 8);
-      const groups = (row.buckets || []).map((bucket: PriceBucket, index: number) => ({
-        index: index + 1,
-        label: bucket.label,
-        min_price: bucket.min,
-        max_price: bucket.max,
-        average_price: bucket.averagePrice,
-        adjust_percent: Number(bucket.marginPercent || 0)
-      }));
-      for (const product of row.products || []) {
-        next[product.key] = {
-          base_code: row.code,
+    return this.runWithStageLoading('Đang áp dụng lọc giá...', () => {
+      this.applyPriceDraftsToRows();
+      const next: Record<string, any> = {};
+      const ranges = { ...this.priceRangeRules };
+      for (const row of this.priceConflictRows) {
+        const percent = Number(row.filterPercent || 8);
+        const groups = (row.buckets || []).map((bucket: PriceBucket, index: number) => ({
+          index: index + 1,
+          label: bucket.label,
+          min_price: bucket.min,
+          max_price: bucket.max,
+          average_price: bucket.averagePrice,
+          adjust_percent: Number(bucket.marginPercent || 0)
+        }));
+        if (row.hasMultiplePrices !== false) {
+          for (const product of row.products || []) {
+            next[product.key] = {
+              base_code: row.code,
+              min_price: row.min,
+              max_price: row.max,
+              percent,
+              groups
+            };
+          }
+        }
+        ranges[row.code] = {
           min_price: row.min,
           max_price: row.max,
           percent,
           groups
         };
       }
-      ranges[row.code] = {
-        min_price: row.min,
-        max_price: row.max,
-        percent
-      };
-    }
-    this.priceGroupRules = next;
-    this.priceRangeRules = ranges;
-    this.showPriceGroupModal = false;
+      this.priceGroupRules = next;
+      this.priceRangeRules = ranges;
+      this.priceGroupsCacheValid = true;
+      this.refreshPriceConflictViews();
+      this.showPriceModalRows = false;
+      this.showPriceGroupModal = false;
+    });
   }
   openAddressModal(company: any) {
     this.currentAddressCompany = company;
@@ -1169,6 +1871,13 @@ export class AppComponent {
     return Math.abs(value - Math.round(value)) < 0.000001
       ? Math.round(value).toLocaleString('en-US')
       : value.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  }
+
+  formatQuantity(value: number) {
+    if (!Number.isFinite(value)) return '';
+    return Math.abs(value - Math.round(value)) < 0.000001
+      ? Math.round(value).toLocaleString('en-US')
+      : value.toLocaleString('en-US', { maximumFractionDigits: 3 });
   }
 
   normalizeProductWords(name: string) {
@@ -1313,6 +2022,18 @@ export class AppComponent {
     return hasThu ? words : [words[0], 'thu', ...words.slice(1)];
   }
 
+  normalizeCaoThanhInoxGradeWords(words: string[]) {
+    const normalized: string[] = [];
+    for (let index = 0; index < words.length; index++) {
+      const current = words[index];
+      const currentToken = this.normalizeCodeText(current);
+      const previousToken = this.normalizeCodeText(normalized[normalized.length - 1] || '');
+      if (currentToken === '304' && previousToken === 'INOX') continue;
+      normalized.push(current);
+    }
+    return normalized;
+  }
+
   trimCode(value: string) {
     return (value || '').replace(/\.+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 50).replace(/\.+$/g, '');
   }
@@ -1329,6 +2050,7 @@ export class AppComponent {
     let words = this.removeRepeatedPhrases(this.codeWords(sourceName), this.repeatedPhraseRemovals);
     let tail = '';
     if (this.selectedProfile === 'cao_thanh') {
+      words = this.normalizeCaoThanhInoxGradeWords(words);
       words = this.normalizeCaoThanhConReducerWords(words);
       const first = this.tokenParts(
         words.slice(0, 2),
@@ -1487,11 +2209,13 @@ export class AppComponent {
   }
 
   applyManualCodeOverrides(next: Record<string, string>) {
-    this.manualCodeOverrides = next;
-    this.closeSuspectModal();
-    this.invalidateCodePreviewCache();
-    this.refreshDerivedCodeViews();
-    this.refreshUiDerivedState();
+    this.runWithStageLoading('Đang gộp mã tình nghi...', () => {
+      this.manualCodeOverrides = next;
+      this.closeSuspectModal();
+      this.invalidateCodePreviewCache();
+      this.refreshDerivedCodeViews();
+      this.refreshUiDerivedState();
+    });
   }
   phraseDistance(left: string, right: string) {
     if (Math.abs(left.length - right.length) > 1) return 2;
@@ -1732,12 +2456,14 @@ export class AppComponent {
   }
 
   restoreSkippedCompany(item: any) {
-    if (item.kind === 'product') {
-      item.company.selected_products.add(item.productName);
-    } else {
-      item.company.process = true;
-    }
-    this.verifyPrefixes();
+    this.runWithStageLoading('Đang khôi phục mục đã bỏ qua...', () => {
+      if (item.kind === 'product') {
+        item.company.selected_products.add(item.productName);
+      } else {
+        item.company.process = true;
+      }
+      this.verifyPrefixes();
+    });
   }
 
   refreshUiDerivedState() {
@@ -1772,6 +2498,7 @@ export class AppComponent {
       }
     }
     this.skippedCompanyList = skippedItems;
+    this.refreshProductCodeGroups();
   }
 
   cachedBuildCodePreview(company: any, productName: string, trim = true) {
@@ -1785,6 +2512,20 @@ export class AppComponent {
 
   invalidateCodePreviewCache() {
     this.codePreviewCache.clear();
+    this.invalidatePriceGroupsCache();
+  }
+
+  invalidatePriceGroupsCache() {
+    this.priceGroupsCacheValid = false;
+  }
+
+  clearPriceGroupsCache() {
+    this.priceGroupsCacheValid = false;
+    this.priceConflictRows = [];
+    this.priceConflictGroups = [];
+    this.priceCodeSections = [];
+    this.priceCodeSummary = { base: 0, single: 0, multi: 0, split: 0 };
+    this.expandedPriceBuckets = {};
   }
 
   beginConfigOperation(label: string) {
@@ -1871,7 +2612,11 @@ export class AppComponent {
   }
 
   goBack() {
-    if (this.step > 1) this.step--;
+    if (this.step === 3) {
+      this.navigateBackFromStepThree();
+    } else if (this.step > 1) {
+      this.step--;
+    }
     this.error = null;
   }
 

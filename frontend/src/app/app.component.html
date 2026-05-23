@@ -1,4 +1,4 @@
-<div class="container">
+﻿<div class="container">
   <div class="card">
     <div class="header">
       <div class="step-indicator">
@@ -119,103 +119,239 @@
 
       <div class="actions">
         <button class="btn-secondary" (click)="goBack()" [disabled]="isLoading">Quay lại</button>
-        <button class="btn-primary" (click)="checkCompanies()" [disabled]="isLoading">
-          {{ isLoading ? 'Đang kiểm tra...' : 'Kiểm tra đơn vị' }}
+        <button class="btn-primary check-loading-button" (click)="checkCompanies()" [disabled]="isLoading">
+          <ng-container *ngIf="isLoading; else checkReady">
+            <span class="button-loading-icon" aria-hidden="true"></span>
+            <span>Đang kiểm tra</span>
+            <span class="loading-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+          </ng-container>
+          <ng-template #checkReady>Kiểm tra đơn vị</ng-template>
         </button>
       </div>
     </div>
 
     <div class="step-content" *ngIf="step === 3">
       <div class="section-kicker">Bước 3</div>
+      <p class="description" *ngIf="stage3Phase === 'customize'">Kiểm soát mã VT cuối cùng trước khi lọc giá. Danh sách bên dưới đã nhóm theo Mã VT sau tùy chỉnh.</p>
+      <p class="description" *ngIf="stage3Phase === 'price'">Lọc đơn giá là stage sau của bước 3. Bạn có thể quay lại tùy chỉnh prefix, tình nghi và mã VT bất cứ lúc nào.</p>
       <div class="stats-grid">
         <div class="stat-card"><strong>{{ rowsToProcess }}</strong><span>Dòng xử lý</span></div>
-        <div class="stat-card"><strong>{{ companyCount }}</strong><span>Đơn vị</span></div>
-        <div class="stat-card"><strong>{{ skippedCompanyList.length }}</strong><span>Mục đã bỏ qua</span></div>
-        <div class="stat-card"><strong>{{ wordRuleCountValue }}</strong><span>Từ thay riêng</span></div>
+        <div class="stat-card" *ngIf="stage3Phase === 'customize'; else singlePriceStat"><strong>{{ companyCount }}</strong><span>Đơn vị</span></div>
+        <ng-template #singlePriceStat><div class="stat-card"><strong>{{ singlePriceCodeTotal() }}</strong><span>Mã VT 1 đơn giá</span></div></ng-template>
+        <div class="stat-card" *ngIf="stage3Phase === 'customize'; else priceTotalStat"><strong>{{ stageProductCodeTotal() }}</strong><span>Mã VT tổng</span></div>
+        <ng-template #priceTotalStat><div class="stat-card"><strong>{{ stageProductCodeTotal() }} -> {{ splitPriceCodeTotal() }}</strong><span>Mã VT tổng sau tách giá</span></div></ng-template>
+        <div class="stat-card" *ngIf="stage3Phase === 'customize'; else multiPriceStat"><strong>{{ wordRuleCountValue }}</strong><span>Từ thay riêng</span></div>
+        <ng-template #multiPriceStat><div class="stat-card"><strong>{{ multiPriceCodeTotal() }}</strong><span>Mã VT nhiều đơn giá</span></div></ng-template>
       </div>
 
-      <div class="rule-summary-row">
+      <div class="rule-summary-row" *ngIf="stage3Phase === 'customize'">
         <div>
-          <strong>Từ thay riêng</strong>
-          <span>{{ wordRuleCountValue }} quy tắc đang áp dụng cho {{ selectedProfileLabelText }}</span>
+          <strong>Stage 3.1 - Tùy chỉnh trước lọc giá</strong>
+          <span>Prefix, danh sách tình nghi và hàng hóa đang được kiểm soát bằng modal.</span>
         </div>
         <label class="prefix-toggle">
-          <input type="checkbox" [(ngModel)]="includeCompanyPrefix" (ngModelChange)="verifyPrefixes()" />
+          <input type="checkbox" [(ngModel)]="includeCompanyPrefix" (ngModelChange)="onCompanyPrefixToggleChange()" />
           <span>Dùng tiền tố công ty</span>
         </label>
-        <button class="btn-secondary btn-sm" (click)="openWordRuleModal()">Sửa quy tắc</button>
+        <button class="btn-secondary btn-sm" (click)="openPrefixModal()" [disabled]="stageActionLoading">Tùy chỉnh prefix</button>
+        <button class="btn-secondary btn-sm" (click)="openWordRuleModal()" [disabled]="stageActionLoading">Sửa quy tắc</button>
       </div>
 
-      <div class="table-container company-scroll-container">
-        <table class="data-table verify-table">
-          <thead>
-            <tr>
-              <th>Xử lý</th>
-              <th>MST</th>
-              <th>Đơn vị, hàng hóa & địa chỉ</th>
-              <th>Dòng</th>
-              <th>Tiền tố</th>
-              <th>Trạng thái</th>
-            </tr>
-          </thead>
-          <tbody class="group-header-row" *ngIf="duplicateCompanies.length">
-            <tr><td colspan="6" class="group-header">Trùng tiền tố cần kiểm tra</td></tr>
-          </tbody>
-          <tbody>
-            <tr *ngFor="let item of duplicateCompanies; trackBy: trackByKey" [class.unselected]="!item.process">
-              <ng-container *ngTemplateOutlet="companyRow; context: {$implicit: item}"></ng-container>
-            </tr>
-          </tbody>
-          <tbody class="group-header-row">
-            <tr><td colspan="6" class="group-header">Các đơn vị khác</td></tr>
-          </tbody>
-          <tbody>
-            <tr *ngFor="let item of normalCompanies; trackBy: trackByKey" [class.unselected]="!item.process">
-              <ng-container *ngTemplateOutlet="companyRow; context: {$implicit: item}"></ng-container>
-            </tr>
-          </tbody>
-        </table>
+      <div class="stage-loading-panel" *ngIf="stageActionLoading" role="status" aria-live="polite">
+        <span class="config-loading-spinner" aria-hidden="true"></span>
+        <span>{{ stageActionLoadingLabel || 'Đang cập nhật...' }}</span>
       </div>
 
-      <ng-template #companyRow let-item>
-        <td class="center">
-          <label class="process-check">
-            <input type="checkbox" [(ngModel)]="item.process" (ngModelChange)="verifyPrefixes()" />
-            <span class="check-visual" aria-hidden="true"></span>
-            <span class="sr-only">Chọn xử lý {{ item.company }}</span>
-          </label>
-        </td>
-        <td><strong>{{ item.mst }}</strong></td>
-        <td>
-          <div class="main-name">{{ item.company }}</div>
-          <div class="sub-text">{{ item.all_names?.join(' | ') }}</div>
-          <button class="btn-link" (click)="openProductModal(item)">
-            Hàng hóa {{ item.selected_products.size }} / {{ item.all_products.length }}
-          </button>
-          <button class="btn-secondary btn-sm company-location-button" (click)="openAddressModal(item)" *ngIf="item.address || item.addresses?.length">
-            Xem vị trí công ty
-          </button>
-          <div class="code-length-warning" *ngIf="longCodeCounts[item.mst] as count">
-            Cảnh báo: {{ count }} mã VT dài hơn 50 ký tự
+      <div class="code-group-list" *ngIf="stage3Phase === 'customize'" [class.loading]="stageActionLoading">
+        <div class="empty-state" *ngIf="!productCodeSections.length">Chưa có mã VT nào đang được chọn xử lý.</div>
+        <section class="code-company-section" *ngFor="let section of productCodeSections; trackBy: trackByKey">
+          <div class="code-company-header">
+            <div>
+              <span class="code-group-label">{{ includeCompanyPrefix ? 'Công ty' : 'Danh sách mã VT' }}</span>
+              <strong>{{ section.title }}</strong>
+            </div>
+            <div class="code-group-meta">
+              <span>{{ section.productCount }} hàng hóa</span>
+              <span>{{ section.codeCount }} mã VT</span>
+              <span>{{ section.rowCount }} dòng</span>
+              <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeSection(section)" [disabled]="stageActionLoading">
+                {{ section.expanded ? 'Thu gọn công ty' : 'Mở công ty' }}
+              </button>
+            </div>
           </div>
-        </td>
-        <td class="center"><span class="badge">{{ item.count }}</span></td>
-        <td><input class="form-control prefix-input" [(ngModel)]="item.value" (ngModelChange)="verifyPrefixes(false)" [disabled]="!item.process || !includeCompanyPrefix" /></td>
-        <td><span class="status-badge" [class.warn]="item.needs_manual" [class.ok]="!item.needs_manual">{{ item.status }}</span></td>
-      </ng-template>
+          <div class="code-section-body" *ngIf="section.expanded">
+            <div class="code-group-card" *ngFor="let group of section.groups; trackBy: trackByKey" [class.warn]="group.hasLongCode || !group.code">
+              <div class="code-group-header">
+                <div>
+                  <span class="code-group-label">Mã VT</span>
+                  <code>{{ group.code || '(Trống)' }}</code>
+                </div>
+                <div class="code-group-meta">
+                  <span>{{ group.productCount }} hàng hóa</span>
+                  <span>{{ group.rowCount }} dòng</span>
+                  <span *ngIf="group.hasLongCode" class="code-length-warning">Vượt 50 ký tự</span>
+                  <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeGroup(group)" [disabled]="stageActionLoading">
+                    {{ group.expanded ? 'Thu gọn mã' : 'Mở mã' }}
+                  </button>
+                </div>
+              </div>
+              <div class="sub-text" *ngIf="!includeCompanyPrefix">Đơn vị: <span *ngFor="let company of group.companyList; let last = last">{{ company.mst }} - {{ company.company }}<ng-container *ngIf="!last"> | </ng-container></span></div>
+              <div class="code-product-list" *ngIf="group.expanded">
+                <div class="code-product-item" *ngFor="let item of group.products; trackBy: trackByKey">
+                  <div>
+                    <strong>{{ item.productName }}</strong>
+                    <span class="product-meta">
+                      <span>{{ item.company.mst }}</span>
+                      <span *ngIf="item.rowSummary">{{ item.rowSummary }}</span>
+                      <span *ngIf="item.priceSummary">{{ item.priceSummary }}</span>
+                    </span>
+                  </div>
+                  <button class="btn-secondary btn-sm" (click)="openProductModal(item.company, item.productName)" [disabled]="stageActionLoading">Sửa hàng hóa đơn vị này</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="rule-summary-row" *ngIf="stage3Phase === 'price'">
+        <div>
+          <strong>Stage 3.2 - Lọc đơn giá</strong>
+          <span>Gộp theo Mã VT cuối cùng và tính giá bán trung bình theo đơn giá nhân số lượng.</span>
+        </div>
+        <button class="btn-secondary btn-sm" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceGroupModal()">Mở lại lọc đơn giá</button>
+      </div>
+
+      <div class="code-group-list price-code-group-list" *ngIf="stage3Phase === 'price' && !showPriceGroupModal" [class.loading]="stageActionLoading">
+        <div class="empty-state" *ngIf="!priceCodeSections.length">Chưa có mã VT nào cần lọc đơn giá.</div>
+        <section class="code-company-section" *ngFor="let section of priceCodeSections; trackBy: trackByKey">
+          <div class="code-company-header">
+            <div>
+              <span class="code-group-label">{{ includeCompanyPrefix ? 'Công ty' : 'Danh sách mã VT' }}</span>
+              <strong>{{ section.title }}</strong>
+            </div>
+            <div class="code-group-meta">
+              <span>{{ section.codeCount }} mã VT</span>
+              <span>{{ section.rowCount }} dòng giá</span>
+              <span>{{ section.singlePriceCodeCount }} mã 1 giá</span>
+              <span>{{ section.multiPriceCodeCount }} mã nhiều giá</span>
+              <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeSection(section)" [disabled]="stageActionLoading">
+                {{ section.expanded ? 'Thu gọn công ty' : 'Mở công ty' }}
+              </button>
+            </div>
+          </div>
+          <div class="code-section-body" *ngIf="section.expanded">
+            <section class="code-group-card price-kind-section" *ngFor="let subsection of section.priceSubsections; trackBy: trackByKey" [class.single-price-kind]="subsection.type === 'single'" [class.multi-price-kind]="subsection.type === 'multi'">
+              <div class="code-group-header price-kind-header">
+                <div>
+                  <span class="code-group-label">{{ subsection.description }}</span>
+                  <strong>{{ subsection.title }}</strong>
+                </div>
+                <div class="code-group-meta">
+                  <span>{{ subsection.codeCount }} mã VT</span>
+                  <span>{{ subsection.rowCount }} dòng giá</span>
+                  <span>{{ subsection.bucketCount }} nhóm giá</span>
+                  <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeSection(subsection)" [disabled]="stageActionLoading">
+                    {{ subsection.expanded ? 'Thu gọn phần' : 'Mở phần' }}
+                  </button>
+                </div>
+              </div>
+              <div class="code-product-list" *ngIf="subsection.expanded">
+                <div class="code-group-card" *ngFor="let group of subsection.groups; trackBy: trackByKey" [class.warn]="group.hasLoss">
+                  <div class="code-group-header">
+                    <div>
+                      <span class="code-group-label">Mã VT</span>
+                      <code>{{ group.code || '(Trống)' }}</code>
+                    </div>
+                    <div class="code-group-meta">
+                      <span>{{ group.productCount }} hàng hóa gộp</span>
+                      <span>{{ group.bucketCount }} nhóm giá</span>
+                      <span>{{ group.priceRowCount }} dòng giá</span>
+                      <span>Giá bán TB {{ formatPrice(group.average) }}</span>
+                      <span>{{ group.filterPercent | number:'1.0-2' }}% lọc</span>
+                      <span *ngIf="group.hasLoss" class="price-loss-badge">Có {{ group.lossCount }} dòng lỗ</span>
+                      <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeGroup(group)" [disabled]="stageActionLoading">
+                        {{ group.expanded ? 'Thu gọn mã' : 'Mở mã' }}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="sub-text price-group-context" *ngIf="!includeCompanyPrefix">Đơn vị: {{ group.companyDisplay }}</div>
+                  <div class="code-product-list" *ngIf="group.expanded">
+                    <div class="code-product-item price-bucket-item" *ngFor="let bucket of group.buckets; trackBy: trackByKey">
+                      <div class="price-bucket-summary">
+                        <div>
+                        <strong>{{ bucket.label }}</strong>
+                        <span class="product-meta">
+                          <span>Mã sau lọc <code>{{ bucket.finalCode || group.code }}</code></span>
+                          <span>{{ formatPrice(bucket.min) }} → {{ formatPrice(bucket.max) }}</span>
+                          <span>{{ bucket.count }} dòng</span>
+                          <span>{{ formatQuantity(bucket.quantity) }} SL</span>
+                          <span>Giá bán TB {{ formatPrice(bucket.averagePrice) }}</span>
+                          <span>{{ bucket.marginPercent | number:'1.0-2' }}% lãi</span>
+                          <span>Giá vốn TB {{ formatPrice(bucket.adjustedAverage) }}</span>
+                        </span>
+                        </div>
+                        <div class="price-bucket-actions">
+                          <span *ngIf="bucket.hasLoss" class="price-loss-badge">Có {{ bucket.lossCount }} dòng lỗ</span>
+                          <button type="button" class="btn-secondary btn-sm" (click)="togglePriceBucket(bucket)">
+                            {{ priceBucketExpanded(bucket) ? 'Ẩn dòng Excel' : 'Xem dòng Excel' }}
+                          </button>
+                        </div>
+                      </div>
+                      <div class="price-inline-detail" *ngIf="priceBucketExpanded(bucket)">
+                        <table class="price-group-mini-table">
+                          <thead>
+                            <tr>
+                              <th>STT</th>
+                              <th>Số HD</th>
+                              <th>Ngày HD</th>
+                              <th>Đơn vị tính</th>
+                              <th>Đơn giá</th>
+                              <th>Số lượng</th>
+                              <th>Thành tiền</th>
+                              <th>Tiền vốn</th>
+                              <th>Chênh lệch thành tiền</th>
+                              <th>%</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr *ngFor="let detail of expandedPriceBucketDetails(bucket); trackBy: trackByKey">
+                              <td>{{ detail.stt || detail.excelRow }}</td>
+                              <td>{{ detail.invoiceNo }}</td>
+                              <td>{{ detail.invoiceDate }}</td>
+                              <td>{{ detail.unit }}</td>
+                              <td>{{ formatPrice(detail.price) }}</td>
+                              <td>{{ formatQuantity(detail.quantity) }}</td>
+                              <td>{{ formatPrice(detail.totalAmount) }}</td>
+                              <td>{{ formatPrice(detail.costAmount) }}</td>
+                              <td><span class="price-delta" [class.profit]="detail.deltaTotal > 0" [class.loss]="detail.deltaTotal < 0" [class.neutral]="detail.deltaTotal === 0">{{ formatSignedPrice(detail.deltaTotal) }}</span></td>
+                              <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ bucketDeltaLabel(detail) }} {{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
 
       <div class="actions sticky-actions">
         <button class="btn-secondary" (click)="goBack()" [disabled]="isLoading">Quay lại</button>
-        <button class="btn-secondary" (click)="verifyPrefixes()" [disabled]="isLoading">Xác minh tiền tố</button>
-        <button class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceGroupModal()" [disabled]="!companies.length">
-          Lọc đơn giá
+        <button class="btn-secondary" *ngIf="stage3Phase === 'customize'" (click)="openPrefixModal()" [disabled]="isLoading || stageActionLoading">Tùy chỉnh prefix</button>
+        <button class="btn-primary price-next-action" *ngIf="selectedProfile === 'cao_thanh' && stage3Phase === 'customize'" (click)="goToPriceStage()" [disabled]="!companies.length || stageActionLoading">
+          <span class="config-loading-spinner action-spinner" *ngIf="stageActionLoading" aria-hidden="true"></span>
+          {{ stageActionLoading ? 'Đang chuẩn bị lọc giá...' : 'Bước tiếp theo: Lọc đơn giá' }}
         </button>
-        <button type="button" class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh'" (click)="openSuspectModal()" [disabled]="!companies.length">
+        <button type="button" class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh' && stage3Phase === 'customize'" (click)="openSuspectModal()" [disabled]="!companies.length || stageActionLoading">
           Danh sách tình nghi
         </button>
-        <button class="btn-secondary" (click)="openSkippedModal()">Mục đã bỏ qua ({{ skippedCompanyList.length }})</button>
-        <button class="btn-secondary" (click)="saveProfileConfig()" [disabled]="isLoading">Lưu cấu hình</button>
-        <button class="btn-primary" (click)="processFile()" [disabled]="isLoading">
+        <button class="btn-secondary" *ngIf="stage3Phase === 'customize'" (click)="openSkippedModal()" [disabled]="stageActionLoading">Mục đã bỏ qua ({{ skippedCompanyList.length }})</button>
+        <button class="btn-secondary" (click)="saveProfileConfig()" [disabled]="isLoading || stageActionLoading">Lưu cấu hình</button>
+        <button class="btn-primary" *ngIf="selectedProfile !== 'cao_thanh' || stage3Phase === 'price'" (click)="processFile()" [disabled]="isLoading">
           {{ processingProgress !== null ? ('Đang xử lý ' + processingProgress + '%') : 'Xác nhận & Xử lý' }}
         </button>
         <div class="processing-progress" *ngIf="processingProgress !== null" role="progressbar" aria-label="Tiến độ xử lý file" [attr.aria-valuenow]="processingProgress" aria-valuemin="0" aria-valuemax="100">
@@ -229,13 +365,100 @@
   </div>
 </div>
 
+<div class="modal-overlay" *ngIf="showPrefixModal">
+  <div class="modal-content prefix-modal">
+    <div class="modal-header">Tùy chỉnh prefix công ty</div>
+    <div class="modal-body">
+      <p class="modal-description">Có thể lấy từ {{ prefixMstSuffixLength }} số cuối MST, 2 chữ đầu của 2 từ cuối sau khi bỏ tỉnh/thành Việt Nam, hoặc ghép 2 chữ với MST. Prefix trùng sẽ được cảnh báo trước khi xử lý.</p>
+      <div class="config-loading" *ngIf="stageActionLoading" role="status" aria-live="polite">
+        <span class="config-loading-spinner" aria-hidden="true"></span>
+        <span>{{ stageActionLoadingLabel || 'Đang cập nhật prefix...' }}</span>
+      </div>
+      <div class="prefix-modal-toolbar">
+        <label class="prefix-toggle">
+          <input type="checkbox" [(ngModel)]="includeCompanyPrefix" (ngModelChange)="onCompanyPrefixToggleChange()" />
+          <span>Dùng tiền tố công ty</span>
+        </label>
+        <label class="prefix-suffix-control">
+          <span>Số cuối MST</span>
+          <input type="number" class="form-control price-percent-input" [(ngModel)]="prefixMstSuffixLength" (ngModelChange)="onPrefixSuffixLengthChange()" min="3" step="1" />
+        </label>
+        <button class="btn-secondary btn-sm" (click)="verifyPrefixesWithLoading()" [disabled]="stageActionLoading">Xác minh tiền tố</button>
+      </div>
+      <div class="table-container company-scroll-container">
+        <table class="data-table verify-table">
+          <thead>
+            <tr>
+              <th>Xử lý</th>
+              <th>MST</th>
+              <th>Đơn vị, hàng hóa & địa chỉ</th>
+              <th>Dòng</th>
+              <th>Tiền tố</th>
+              <th>Lựa chọn nhanh</th>
+              <th>Trạng thái</th>
+            </tr>
+          </thead>
+          <tbody class="group-header-row" *ngIf="duplicateCompanies.length">
+            <tr><td colspan="7" class="group-header">Trùng tiền tố cần kiểm tra</td></tr>
+          </tbody>
+          <tbody>
+            <tr *ngFor="let item of duplicateCompanies; trackBy: trackByKey" [class.unselected]="!item.process">
+              <ng-container *ngTemplateOutlet="prefixCompanyRow; context: {$implicit: item}"></ng-container>
+            </tr>
+          </tbody>
+          <tbody class="group-header-row">
+            <tr><td colspan="7" class="group-header">Các đơn vị khác</td></tr>
+          </tbody>
+          <tbody>
+            <tr *ngFor="let item of normalCompanies; trackBy: trackByKey" [class.unselected]="!item.process">
+              <ng-container *ngTemplateOutlet="prefixCompanyRow; context: {$implicit: item}"></ng-container>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <ng-template #prefixCompanyRow let-item>
+        <td class="center">
+          <label class="process-check">
+            <input type="checkbox" [(ngModel)]="item.process" (ngModelChange)="verifyPrefixesWithLoading('Đang cập nhật lựa chọn...')" />
+            <span class="check-visual" aria-hidden="true"></span>
+            <span class="sr-only">Chọn xử lý {{ item.company }}</span>
+          </label>
+        </td>
+        <td><strong>{{ item.mst }}</strong></td>
+        <td>
+          <div class="main-name">{{ item.company }}</div>
+          <div class="sub-text">{{ item.all_names?.join(' | ') }}</div>
+          <button class="btn-link" (click)="openProductModal(item)">Hàng hóa {{ item.selected_products.size }} / {{ item.all_products.length }}</button>
+          <button class="btn-secondary btn-sm company-location-button" (click)="openAddressModal(item)" *ngIf="item.address || item.addresses?.length">Xem vị trí công ty</button>
+          <div class="code-length-warning" *ngIf="longCodeCounts[item.mst] as count">Cảnh báo: {{ count }} mã VT dài hơn 50 ký tự</div>
+        </td>
+        <td class="center"><span class="badge">{{ item.count }}</span></td>
+        <td><input class="form-control prefix-input" [(ngModel)]="item.value" (ngModelChange)="onManualPrefixChange()" [disabled]="!item.process || !includeCompanyPrefix" /></td>
+        <td>
+          <div class="prefix-option-list">
+            <button type="button" class="prefix-option" *ngFor="let option of prefixOptions(item); trackBy: trackByKey" [class.active]="option.value === item.value" [class.warn]="option.warning" (click)="applyPrefixOption(item, option.value)" [disabled]="!item.process || !includeCompanyPrefix">
+              <span>{{ option.label }}: <strong>{{ option.value }}</strong></span>
+              <small *ngIf="option.warning">{{ option.warning }}</small>
+            </button>
+          </div>
+        </td>
+        <td><span class="status-badge" [class.warn]="item.needs_manual" [class.ok]="!item.needs_manual">{{ item.status }}</span></td>
+      </ng-template>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary btn-sm" (click)="closePrefixModal()">Đóng</button>
+      <button class="btn-primary btn-sm" (click)="closePrefixModal()">Xong</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" *ngIf="showProductModal">
   <div class="modal-content product-modal">
     <div class="modal-header">Chọn hàng hóa để xử lý</div>
     <div class="modal-body">
       <p class="modal-description"><strong>{{ currentCompany?.mst }}</strong> - {{ currentCompany?.company }}</p>
       <div class="product-list">
-        <div class="product-item" *ngFor="let prod of currentProductList; trackBy: trackByKey">
+        <div class="product-item" *ngFor="let prod of currentProductList; trackBy: trackByKey" [attr.id]="productModalRowId(prod)" [class.target-product]="prod.key === targetProductKey" [class.blink-product-code]="prod.key === blinkingProductKey">
           <label class="product-check">
             <input type="checkbox" [(ngModel)]="prod.selected" />
             <span class="check-visual" aria-hidden="true"></span>
@@ -362,26 +585,39 @@
   <div class="modal-content price-group-modal">
     <div class="modal-header">Lọc mã hàng theo đơn giá</div>
     <div class="modal-body">
-      <p class="modal-description">Gộp theo Mã VT cuối cùng sau tùy chỉnh. Trong mỗi Mã VT, hệ thống chia thành các nhóm đơn giá theo % lọc bạn nhập, rồi tính giá trung bình, giá trung bình sau điều chỉnh `(1 - %)` và lãi/lỗ % cho từng dòng.</p>
+      <p class="modal-description">Gộp theo Mã VT cuối cùng sau tùy chỉnh. Trong mỗi Mã VT, hệ thống chia thành các nhóm đơn giá theo % lọc bạn nhập, rồi tính giá bán trung bình theo số lượng, giá vốn trung bình sau điều chỉnh `(1 - %)` và lãi/lỗ % cho từng dòng.</p>
+      <div class="config-loading" *ngIf="stageActionLoading" role="status" aria-live="polite">
+        <span class="config-loading-spinner" aria-hidden="true"></span>
+        <span>{{ stageActionLoadingLabel || 'Đang áp dụng...' }}</span>
+      </div>
       <div class="price-bulk-controls">
         <div class="price-bulk-card">
           <strong>Áp % lọc nhóm</strong>
           <div class="percent-cell">
             <input type="number" class="form-control price-percent-input" [(ngModel)]="priceFilterAllPercent" min="0.1" step="0.1" />
             <span>%</span>
-            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceFilterPercentToAll()">Áp % lọc</button>
+            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceFilterPercentToAll()" [disabled]="stageActionLoading">Áp % lọc</button>
           </div>
         </div>
         <div class="price-bulk-card">
           <strong>Áp % lãi</strong>
           <div class="percent-cell">
-            <input type="number" class="form-control price-percent-input" [(ngModel)]="priceAdjustAllPercent" min="0" step="0.1" />
+            <input type="number" class="form-control price-percent-input" [(ngModel)]="priceAdjustAllPercent" (ngModelChange)="onPriceAdjustAllPercentChange()" min="0" step="0.1" />
             <span>%</span>
-            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToAll()">Áp % lãi</button>
+            <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToAll()" [disabled]="stageActionLoading">Áp % lãi</button>
           </div>
         </div>
       </div>
-      <div class="price-group-scroll">
+      <div class="rule-summary-row price-modal-list-toggle">
+        <div>
+          <strong>Danh sách mã VT nhiều đơn giá</strong>
+          <span>Để nhập % lãi mượt hơn, danh sách chi tiết chỉ render khi bạn mở phần này.</span>
+        </div>
+        <button type="button" class="btn-secondary btn-sm" (click)="togglePriceModalRows()" [disabled]="stageActionLoading">
+          {{ showPriceModalRows ? 'Ẩn danh sách' : 'Mở danh sách' }}
+        </button>
+      </div>
+      <div class="price-group-scroll" *ngIf="showPriceModalRows">
         <div class="price-company-group" *ngFor="let group of priceConflictGroups; trackBy: trackByKey">
           <div class="price-company-header">
             <strong>{{ group.title }}</strong>
@@ -391,9 +627,9 @@
             <thead>
               <tr>
                 <th>Mã VT</th>
-                <th>Hàng hóa / đơn vị</th>
+                <th>Đơn vị</th>
                 <th>Số giá</th>
-                <th>Giá trung bình</th>
+                <th>Giá bán trung bình</th>
                 <th>% lọc nhóm</th>
               </tr>
             </thead>
@@ -402,18 +638,17 @@
                 <tr>
                   <td><code>{{ row.code }}</code></td>
                   <td>
-                    <div><strong>{{ row.productDisplay }}</strong></div>
                     <div class="sub-text">{{ row.companyDisplay }}</div>
                     <div class="price-row-bulk-control percent-cell">
                       <input type="number" class="form-control price-percent-input" [(ngModel)]="row.bulkAdjustPercent" min="0" step="0.1" />
                       <span>% lãi</span>
-                      <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToRow(row)">Áp trong mã VT này</button>
+                      <button type="button" class="btn-secondary btn-sm" (click)="applyPriceAdjustPercentToRow(row)" [disabled]="stageActionLoading">Áp trong mã VT này</button>
                     </div>
                   </td>
                   <td>{{ row.count }} mức / {{ row.priceRowCount }} dòng</td>
                   <td>{{ formatPrice(row.average) }}</td>
                   <td class="percent-cell">
-                    <input type="number" class="form-control price-percent-input" [(ngModel)]="row.filterPercent" (ngModelChange)="onPriceGroupPercentChange(row)" min="0.1" step="0.1" />
+                    <input type="number" class="form-control price-percent-input" [(ngModel)]="row.draftFilterPercent" (ngModelChange)="onPriceGroupPercentChange(row)" min="0.1" step="0.1" />
                     <span>%</span>
                   </td>
                 </tr>
@@ -424,10 +659,10 @@
                         <tr>
                           <th>Nhóm giá</th>
                           <th>Khoảng đơn giá</th>
-                          <th>Số dòng</th>
-                          <th>Giá trung bình</th>
+                          <th>Số dòng / SL</th>
+                          <th>Giá bán trung bình</th>
                           <th>% lãi</th>
-                          <th>Giá TB sau chỉnh</th>
+                          <th>Giá vốn trung bình</th>
                           <th>Cảnh báo</th>
                           <th>Chi tiết</th>
                         </tr>
@@ -437,44 +672,52 @@
                           <tr>
                             <td><strong>{{ bucket.label }}</strong></td>
                             <td>{{ formatPrice(bucket.min) }} → {{ formatPrice(bucket.max) }}</td>
-                            <td>{{ bucket.count }}</td>
+                            <td>{{ bucket.count }} / {{ formatQuantity(bucket.quantity) }}</td>
                             <td>{{ formatPrice(bucket.averagePrice) }}</td>
                             <td class="percent-cell">
-                              <input type="number" class="form-control price-percent-input" [(ngModel)]="bucket.marginPercent" (ngModelChange)="onPriceBucketMarginChange(bucket)" min="0" step="0.1" />
+                              <input type="number" class="form-control price-percent-input" [(ngModel)]="bucket.draftMarginPercent" (ngModelChange)="onPriceBucketMarginChange(bucket)" min="0" step="0.1" />
                               <span>%</span>
                             </td>
                             <td>{{ formatPrice(bucket.adjustedAverage) }}</td>
                             <td>
-                              <span *ngIf="bucketHasLoss(bucket)" class="price-loss-badge">
-                                Có {{ bucketLossCount(bucket) }} dòng lỗ
+                              <span *ngIf="bucket.hasLoss" class="price-loss-badge">
+                                Có {{ bucket.lossCount }} dòng lỗ
                               </span>
                             </td>
                             <td>
                               <button type="button" class="btn-secondary btn-sm" (click)="togglePriceBucket(bucket)">
-                                {{ expandedPriceBuckets[bucket.key] ? 'Ẩn dòng Excel' : 'Xem dòng Excel' }}
+                                {{ priceBucketExpanded(bucket) ? 'Ẩn dòng Excel' : 'Xem dòng Excel' }}
                               </button>
                             </td>
                           </tr>
-                          <tr class="price-detail-subrow" *ngIf="expandedPriceBuckets[bucket.key]">
+                          <tr class="price-detail-subrow" *ngIf="priceBucketExpanded(bucket)">
                             <td colspan="8">
                               <table class="price-group-mini-table">
                                 <thead>
                                   <tr>
-                                    <th>Dòng</th>
-                                    <th>Đơn vị</th>
-                                    <th>Hàng hóa</th>
+                                    <th>STT</th>
+                                    <th>Số HD</th>
+                                    <th>Ngày HD</th>
+                                    <th>Đơn vị tính</th>
                                     <th>Đơn giá</th>
-                                    <th>Chênh lệch</th>
-                                    <th>Lãi / lỗ %</th>
+                                    <th>Số lượng</th>
+                                    <th>Thành tiền</th>
+                                    <th>Tiền vốn</th>
+                                    <th>Chênh lệch thành tiền</th>
+                                    <th>%</th>
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  <tr *ngFor="let detail of priceBucketDetails(bucket); trackBy: trackByKey">
-                                    <td>{{ detail.excelRow }}</td>
-                                    <td>{{ detail.companyName }}</td>
-                                    <td>{{ detail.productName }}</td>
+                                  <tr *ngFor="let detail of expandedPriceBucketDetails(bucket); trackBy: trackByKey">
+                                    <td>{{ detail.stt || detail.excelRow }}</td>
+                                    <td>{{ detail.invoiceNo }}</td>
+                                    <td>{{ detail.invoiceDate }}</td>
+                                    <td>{{ detail.unit }}</td>
                                     <td>{{ formatPrice(detail.price) }}</td>
-                                    <td><span class="price-delta" [class.profit]="detail.deltaAmount > 0" [class.loss]="detail.deltaAmount < 0" [class.neutral]="detail.deltaAmount === 0">{{ formatSignedPrice(detail.deltaAmount) }}</span></td>
+                                    <td>{{ formatQuantity(detail.quantity) }}</td>
+                                    <td>{{ formatPrice(detail.totalAmount) }}</td>
+                                    <td>{{ formatPrice(detail.costAmount) }}</td>
+                                    <td><span class="price-delta" [class.profit]="detail.deltaTotal > 0" [class.loss]="detail.deltaTotal < 0" [class.neutral]="detail.deltaTotal === 0">{{ formatSignedPrice(detail.deltaTotal) }}</span></td>
                                     <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ bucketDeltaLabel(detail) }} {{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
                                   </tr>
                                 </tbody>
@@ -494,7 +737,7 @@
     </div>
     <div class="modal-footer">
       <button class="btn-secondary btn-sm" (click)="showPriceGroupModal = false">Đóng</button>
-      <button class="btn-primary btn-sm" (click)="applyPriceGroupRules()">Áp dụng lọc</button>
+      <button class="btn-primary btn-sm" (click)="applyPriceGroupRules()" [disabled]="stageActionLoading">Áp dụng lọc</button>
     </div>
   </div>
 </div>
