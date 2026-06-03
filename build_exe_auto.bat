@@ -133,7 +133,10 @@ taskkill /F /IM ProductCodeFormatter.exe /T >nul 2>&1
 
 echo.
 echo Building EXE...
-"%VENV_PY%" -m PyInstaller --noconsole --onefile --icon "app_icon.ico" --add-data "static;static" --add-data "app_icon.ico;." --name ProductCodeFormatter app.py
+set "PYI_WORKPATH=C:\tmp\ProductCodeFormatter-pyi-build"
+if not exist "C:\tmp" mkdir "C:\tmp"
+if exist "%PYI_WORKPATH%" rmdir /s /q "%PYI_WORKPATH%"
+"%VENV_PY%" -m PyInstaller --clean --workpath "%PYI_WORKPATH%" --noconsole --onefile --icon "app_icon.ico" --add-data "static;static" --add-data "app_icon.ico;." --add-data "mau HD ban ra.xlsx;." --name ProductCodeFormatter app.py
 if not %errorlevel%==0 (
     echo ERROR: PyInstaller build failed.
     pause

@@ -8,7 +8,10 @@ import time
 import unicodedata
 import uuid
 import webbrowser
+import zipfile
 from collections import Counter
+from copy import copy
+from io import BytesIO
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -17,6 +20,7 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask.json.provider import DefaultJSONProvider
 
+APP_VERSION = "0.1"
 
 class CustomJSONProvider(DefaultJSONProvider):
     def default(self, o):
@@ -74,6 +78,19 @@ PROFILE_ALIASES = {
 
 MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
+DEFAULT_INVOICE_STATUS_COL = "AJ"
+DEFAULT_INVOICE_STATUS_SKIP_VALUES = [
+    "Hóa đơn đã bị điều chỉnh",
+    "Hóa đơn bị thay thế",
+    "Hóa đơn đã bị thay thế",
+    "Hóa đơn đã bị hủy",
+]
+IGNORED_INVOICE_STATUSES = {
+    "hoa don da bi dieu chinh",
+    "hoa don bi thay the",
+    "hoa don da bi thay the",
+    "hoa don da bi huy",
+}
 
 
 def empty_profile_config(profile_key_name=None):
@@ -86,14 +103,17 @@ def empty_profile_config(profile_key_name=None):
         "repeated_phrase_removals": ["inox"] if profile_key_name == "cao_thanh" else [],
         "price_group_rules": {},
         "price_range_rules": {},
+        "price_adjust_all_percent": 0,
         "manual_code_overrides": {},
         "include_company_prefix": True,
         "output_path": "",
+        "columns": {},
     }
 
 
 def default_config():
     return {
+        "app_version": APP_VERSION,
         "selected_profile": "son_phuong",
         "profiles": {key: empty_profile_config(key) for key in PROFILE_LABELS},
         "columns": {
@@ -104,6 +124,8 @@ def default_config():
             "qty_col": "O",
             "price_col": "",
             "output_col": "L",
+            "invoice_status_col": DEFAULT_INVOICE_STATUS_COL,
+            "invoice_status_skip_values": DEFAULT_INVOICE_STATUS_SKIP_VALUES[:],
         },
     }
 
@@ -223,6 +245,21 @@ def price_ranges_from_groups(price_group_rules):
     return normalize_price_range_rules(ranges)
 
 
+def legacy_price_adjust_all_percent(profile, price_groups, price_ranges):
+    if "price_adjust_all_percent" in profile:
+        return float(profile.get("price_adjust_all_percent") or 0)
+    margins = set()
+    rule_sets = [price_ranges.values(), price_groups.values()]
+    for rules in rule_sets:
+        for rule in rules:
+            for group in rule.get("groups") or []:
+                try:
+                    margins.add(float(group.get("adjust_percent") or 0))
+                except Exception:
+                    continue
+    return margins.pop() if len(margins) == 1 else 0
+
+
 def normalize_profile_config(profile_key_name, profile):
     defaults = empty_profile_config(profile_key_name)
     profile = profile if isinstance(profile, dict) else {}
@@ -247,18 +284,24 @@ def normalize_profile_config(profile_key_name, profile):
         "repeated_phrase_removals": normalize_phrase_list(profile.get("repeated_phrase_removals", defaults["repeated_phrase_removals"])),
         "price_group_rules": price_groups,
         "price_range_rules": price_ranges,
+        "price_adjust_all_percent": legacy_price_adjust_all_percent(profile, price_groups, price_ranges),
         "manual_code_overrides": products,
         "include_company_prefix": profile.get("include_company_prefix") is not False,
         "output_path": str(profile.get("output_path") or ""),
+        "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
     }
 
 
 def normalize_config(data):
     cfg = default_config()
+    cfg["app_version"] = APP_VERSION
     if isinstance(data, dict):
         selected = data.get("selected_profile") or data.get("active_profile") or data.get("format_rule")
         cfg["selected_profile"] = profile_key(selected) if selected else cfg["selected_profile"]
         cfg["columns"].update(data.get("columns") or {})
+        cfg["columns"].setdefault("invoice_status_col", DEFAULT_INVOICE_STATUS_COL)
+        if not isinstance(cfg["columns"].get("invoice_status_skip_values"), list):
+            cfg["columns"]["invoice_status_skip_values"] = DEFAULT_INVOICE_STATUS_SKIP_VALUES[:]
         profiles = data.get("profiles") or {}
         if not isinstance(profiles, dict):
             profiles = {}
@@ -271,6 +314,9 @@ def normalize_config(data):
             cfg["profiles"][key].update(normalize_profile_config(key, profiles.get(key) or {}))
     if cfg["selected_profile"] not in PROFILE_LABELS:
         cfg["selected_profile"] = "son_phuong"
+    cfg["columns"].setdefault("invoice_status_col", DEFAULT_INVOICE_STATUS_COL)
+    if not isinstance(cfg["columns"].get("invoice_status_skip_values"), list):
+        cfg["columns"]["invoice_status_skip_values"] = DEFAULT_INVOICE_STATUS_SKIP_VALUES[:]
     return cfg
 
 
@@ -327,10 +373,31 @@ def normalize_price_range_rules(value):
             continue
         if min_price > max_price:
             min_price, max_price = max_price, min_price
+        groups = []
+        for group in rule.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            try:
+                group_min = float(group.get("min_price"))
+                group_max = float(group.get("max_price"))
+                adjust_percent = float(group.get("adjust_percent", 0))
+            except Exception:
+                continue
+            if group_min > group_max:
+                group_min, group_max = group_max, group_min
+            groups.append({
+                "index": int(group.get("index") or len(groups) + 1),
+                "label": str(group.get("label") or f"Nhóm {len(groups) + 1}"),
+                "min_price": group_min,
+                "max_price": group_max,
+                "average_price": float(group.get("average_price")) if group.get("average_price") is not None else None,
+                "adjust_percent": adjust_percent,
+            })
         result[str(key)] = {
             "min_price": min_price,
             "max_price": max_price,
             "percent": percent,
+            "groups": groups,
         }
     return result
 
@@ -390,10 +457,47 @@ def normalize_rule_key(text):
     return re.sub(r"\s+", " ", text)
 
 
+VIETNAM_LOCATION_PHRASES = sorted(
+    [
+        tuple(normalize_token(word) for word in name.split())
+        for name in [
+            "An Giang", "Bà Rịa Vũng Tàu", "Bắc Giang", "Bắc Kạn", "Bạc Liêu", "Bắc Ninh", "Bến Tre",
+            "Bình Dương", "Bình Định", "Bình Phước", "Bình Thuận", "Cà Mau", "Cao Bằng", "Cần Thơ",
+            "Đà Nẵng", "Đắk Lắk", "Đắk Nông", "Điện Biên", "Đồng Nai", "Đồng Tháp", "Gia Lai", "Hà Giang",
+            "Hà Nam", "Hà Nội", "Hà Tĩnh", "Hải Dương", "Hải Phòng", "Hậu Giang", "Hòa Bình", "Hồ Chí Minh",
+            "Hưng Yên", "Khánh Hòa", "Kiên Giang", "Kon Tum", "Lai Châu", "Lâm Đồng", "Lạng Sơn", "Lào Cai",
+            "Long An", "Nam Định", "Nghệ An", "Ninh Bình", "Ninh Thuận", "Phú Thọ", "Phú Yên", "Quảng Bình",
+            "Quảng Nam", "Quảng Ngãi", "Quảng Ninh", "Quảng Trị", "Sóc Trăng", "Sơn La", "Tây Ninh",
+            "Thái Bình", "Thái Nguyên", "Thanh Hóa", "Thành phố Huế", "Thừa Thiên Huế", "Huế", "Tiền Giang",
+            "Trà Vinh", "Tuyên Quang", "Vĩnh Long", "Vĩnh Phúc", "Yên Bái",
+        ]
+    ],
+    key=len,
+    reverse=True,
+)
+
+
+def remove_company_location_phrases(tokens):
+    result = []
+    index = 0
+    while index < len(tokens):
+        phrase = next(
+            (items for items in VIETNAM_LOCATION_PHRASES if tuple(tokens[index:index + len(items)]) == items),
+            None,
+        )
+        if phrase:
+            index += len(phrase)
+        else:
+            result.append(tokens[index])
+            index += 1
+    return result
+
+
 def suggest_prefix(company):
     words = re.sub(r"[^A-Za-z0-9À-ỹĐđ ]+", " ", str(company)).split()
     skip = {"CONG", "TY", "TNHH", "TM", "DV", "CP", "CO", "LTD", "MTV", "THUONG", "MAI"}
-    meaningful = [normalize_token(w) for w in words if normalize_token(w) and normalize_token(w) not in skip]
+    meaningful = remove_company_location_phrases([normalize_token(w) for w in words if normalize_token(w)])
+    meaningful = [word for word in meaningful if word not in skip]
     tail_words = meaningful[-2:]
     prefix = "".join(w[:1] for w in tail_words)
     return prefix or normalize_token(company)[:2]
@@ -508,6 +612,22 @@ def parse_price(value):
 
 def raw_text(value):
     return "" if pd.isna(value) else str(value).strip()
+
+
+def normalized_invoice_status(value):
+    return rm_accents(raw_text(value)).casefold()
+
+
+def normalized_invoice_status_set(values):
+    if not isinstance(values, list):
+        return IGNORED_INVOICE_STATUSES
+    selected = {normalized_invoice_status(value) for value in values if raw_text(value)}
+    return selected
+
+
+def ignored_invoice_status(value, skip_statuses=None):
+    status = rm_accents(raw_text(value)).casefold()
+    return status in normalized_invoice_status_set(skip_statuses)
 
 
 def parse_quantity(value):
@@ -742,6 +862,7 @@ def merge_price_ranges(old_rules, new_rules):
             merged[key]["min_price"] = min(merged[key]["min_price"], rule["min_price"])
             merged[key]["max_price"] = max(merged[key]["max_price"], rule["max_price"])
             merged[key]["percent"] = rule.get("percent") or merged[key].get("percent") or 8
+            merged[key]["groups"] = rule.get("groups") or merged[key].get("groups") or []
         else:
             merged[key] = rule
     return merged
@@ -752,12 +873,13 @@ def product_key(mst, product):
 
 
 def read_workbook(path):
-    xl = pd.ExcelFile(path)
-    sheet = xl.sheet_names[0]
-    return sheet, pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+    with pd.ExcelFile(path) as xl:
+        sheet = xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=object)
+    return sheet, df
 
 
-def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None):
+def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None):
     ci, mi, pi = map(excel_col_to_index, [company_col, mst_col, product_col])
     qi = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
     indexes = [ci, mi, pi]
@@ -769,10 +891,16 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
     ai = excel_col_to_index(address_col) if address_col else None
     if ai is not None:
         indexes.append(ai)
+    status_col = str(invoice_status_col or "").strip().upper()
+    status_index = excel_col_to_index(status_col) if status_col else None
+    if status_index is not None and df.shape[1] > status_index:
+        indexes.append(status_index)
     if df.shape[1] <= max(indexes):
         raise ValueError("Selected columns exceed the number of columns in the sheet.")
     rows = []
     for i in range(len(df)):
+        if status_index is not None and df.shape[1] > status_index and ignored_invoice_status(cell(df, i, status_index), invoice_status_skip_values):
+            continue
         if qi is not None and not should_process_qty(cell(df, i, qi)):
             continue
         mst = "" if pd.isna(cell(df, i, mi)) else str(cell(df, i, mi)).strip()
@@ -789,8 +917,8 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
         rows.append({
             "excel_row": i + 1,
             "stt": raw_text(cell(df, i, 0)),
-            "invoice_no": raw_text(cell(df, i, 1)),
-            "invoice_date": raw_text(cell(df, i, 2)),
+            "invoice_no": raw_text(cell(df, i, 2)),
+            "invoice_date": raw_text(cell(df, i, 3)),
             "mst": mst,
             "company": "" if pd.isna(cell(df, i, ci)) else str(cell(df, i, ci)).strip(),
             "address": "" if ai is None or pd.isna(cell(df, i, ai)) else str(cell(df, i, ai)).strip(),
@@ -820,9 +948,9 @@ def unique_values(values):
     return result
 
 
-def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg):
+def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None):
     _, df = read_workbook(path)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col)
+    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col, invoice_status_col, invoice_status_skip_values)
     by = {}
     addresses = {}
     products = {}
@@ -944,6 +1072,8 @@ def process_workbook(path, out, data):
     qty_col = str(data.get("qty_col", "P") or "").upper()
     price_col = str(data.get("price_col", "R") or "").upper()
     output_col = data.get("output_col", "M").upper()
+    invoice_status_col = str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper()
+    invoice_status_skip_values = data.get("invoice_status_skip_values")
     ci, mi, pi, oi = map(excel_col_to_index, [company_col, mst_col, product_col, output_col])
     pri = excel_col_to_index(price_col) if price_col else None
     qi = excel_col_to_index(qty_col) if qty_col else None
@@ -964,7 +1094,7 @@ def process_workbook(path, out, data):
     price_range_rules = data.get("price_range_rules") or {}
     manual_code_overrides = data.get("manual_code_overrides") or {}
     prefix_map, selected_products = validate_payload(data)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col)
+    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values)
 
     occupied = {}
     for r in rows:
@@ -983,9 +1113,11 @@ def process_workbook(path, out, data):
         if group is not None:
             occupied.setdefault(key, set()).add(group)
 
-    for i in range(len(df)):
-        mst = "" if pd.isna(cell(df, i, mi)) else str(cell(df, i, mi)).strip()
-        prod = "" if pd.isna(cell(df, i, pi)) else str(cell(df, i, pi)).strip()
+    processed_row_indexes = set()
+    for row in rows:
+        i = row["excel_row"] - 1
+        mst = row["mst"]
+        prod = row["product"]
         if (include_company_prefix and mst not in prefix_map) or prod not in selected_products.get(mst, set()):
             continue
         key = product_key(mst, prod)
@@ -998,16 +1130,246 @@ def process_workbook(path, out, data):
             code += price_group_suffix(parse_price(cell(df, i, pri)), rule, occupied.get(key))
         if code:
             df.iat[i, oi] = code
+            processed_row_indexes.add(i)
+
+    header_index = None
+    for i in range(len(df)):
+        output_header = rm_accents(raw_text(cell(df, i, oi))).upper()
+        product_header = rm_accents(raw_text(cell(df, i, pi))).upper()
+        qty_header = rm_accents(raw_text(cell(df, i, qi))).upper() if qi is not None else ""
+        if "MA VT" in output_header or ("TEN" in product_header and "HANG" in product_header) or "SO LUONG" in qty_header:
+            header_index = i
+            break
+    if header_index is None:
+        header_index = min(processed_row_indexes, default=len(df)) - 1
+
+    keep_indexes = [
+        i for i in range(len(df))
+        if i <= header_index or i in processed_row_indexes
+    ]
+    df = df.iloc[keep_indexes].reset_index(drop=True)
 
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         df.to_excel(w, sheet_name=sheet, index=False, header=False)
+    return df
+
+
+def up_ban_ra_tax_values(value):
+    rate = parse_price(value)
+    if rate is None:
+        return "", ""
+    percent = rate * 100 if abs(rate) <= 1 else rate
+    rounded = int(round(percent))
+    if abs(percent - rounded) < 0.000001:
+        return f"{rounded:02d}", rounded
+    return f"{percent:02g}", percent
+
+
+def up_ban_ra_template_sheet(workbook):
+    for ws in workbook.worksheets:
+        if rm_accents(ws.title).casefold() == "up ban ra":
+            return ws
+    return workbook.worksheets[0]
+
+
+def create_up_ban_ra_workbook(processed_df):
+    from openpyxl import load_workbook
+
+    template_path = RESOURCE_DIR / "mau HD ban ra.xlsx"
+    if not template_path.exists():
+        raise ValueError("Không tìm thấy file mẫu mau HD ban ra.xlsx để tạo file UP bán ra.")
+
+    wb = load_workbook(template_path)
+    ws = up_ban_ra_template_sheet(wb)
+    ws.title = "UP Bán ra"
+    for other in list(wb.worksheets):
+        if other is not ws:
+            wb.remove(other)
+
+    max_column = ws.max_column
+    data_styles = [copy(ws.cell(2, col)._style) for col in range(1, max_column + 1)]
+    data_number_formats = [ws.cell(2, col).number_format for col in range(1, max_column + 1)]
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    source_indexes = {name: excel_col_to_index(name) for name in ["C", "D", "J", "L", "O", "P", "Q", "R", "W"]}
+    output_row = 2
+    for row in range(len(processed_df)):
+        code = raw_text(cell(processed_df, row, source_indexes["L"]))
+        invoice_no = raw_text(cell(processed_df, row, source_indexes["C"]))
+        quantity = parse_price(cell(processed_df, row, source_indexes["O"]))
+        if not code or not invoice_no or quantity is None or rm_accents(code).casefold() == "ma vt":
+            continue
+
+        tax_code, tax_rate = up_ban_ra_tax_values(cell(processed_df, row, source_indexes["R"]))
+        values = {
+            "A": cell(processed_df, row, source_indexes["J"]),
+            "E": cell(processed_df, row, source_indexes["C"]),
+            "F": cell(processed_df, row, source_indexes["D"]),
+            "H": cell(processed_df, row, source_indexes["O"]),
+            "O": cell(processed_df, row, source_indexes["P"]),
+            "P": cell(processed_df, row, source_indexes["Q"]),
+            "V": tax_code,
+            "W": tax_rate,
+            "Y": cell(processed_df, row, source_indexes["W"]),
+            "Z": "1311",
+            "AA": "",
+            "AB": "",
+            "AC": "632",
+            "AE": "33311",
+            "AG": cell(processed_df, row, source_indexes["L"]),
+            "AH": "Xuất bán hàng",
+            "AK": 1,
+            "AQ": "CTY",
+            "AS": 1,
+        }
+        for col in range(1, max_column + 1):
+            output_cell = ws.cell(output_row, col)
+            output_cell._style = copy(data_styles[col - 1])
+            output_cell.number_format = data_number_formats[col - 1]
+        for column, value in values.items():
+            ws[f"{column}{output_row}"] = "" if pd.isna(value) else value
+        output_row += 1
+
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return stream
+
+
+def up_ban_ra_output_path(formatted_path):
+    return formatted_path.with_name(f"{formatted_path.stem}_UP_ban_ra.xlsx")
+
+
+def process_zip_stream(formatted_path, up_path):
+    stream = BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(formatted_path, formatted_path.name)
+        archive.write(up_path, up_path.name)
+    stream.seek(0)
+    return stream
 
 
 def preview_data(df):
-    view = df.iloc[:8, :min(18, df.shape[1])].copy()
-    view.columns = [index_to_excel_col(i) for i in range(view.shape[1])]
+    preview_indexes = list(range(df.shape[1]))
+    view = df.iloc[:8, preview_indexes].copy()
+    view.columns = [index_to_excel_col(i) for i in preview_indexes]
     view = view.fillna("")
     return [{col: str(val) if val != "" else "" for col, val in row.items()} for _, row in view.iterrows()]
+
+
+def invoice_status_options(df, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, skip_statuses=None):
+    status_col = str(invoice_status_col or "").strip().upper()
+    if not status_col:
+        return []
+    status_index = excel_col_to_index(status_col)
+    if df.shape[1] <= status_index:
+        return []
+    counts = Counter()
+    display_values = {}
+    for i in range(len(df)):
+        value = raw_text(cell(df, i, status_index))
+        if not value:
+            continue
+        normalized = normalized_invoice_status(value)
+        if normalized == "trang thai hoa don":
+            continue
+        counts[normalized] += 1
+        display_values.setdefault(normalized, value)
+    selected = normalized_invoice_status_set(skip_statuses)
+    return [
+        {
+            "value": display_values[key],
+            "count": count,
+            "skip": key in selected,
+        }
+        for key, count in counts.most_common()
+    ]
+
+
+def safe_excel_sheet_name(value, used_names):
+    name = re.sub(r"[:\\/?*\[\]]", " ", str(value or "Sheet")).strip() or "Sheet"
+    name = name[:31]
+    base = name
+    counter = 2
+    while name in used_names:
+        suffix = f" {counter}"
+        name = f"{base[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    used_names.add(name)
+    return name
+
+
+def safe_excel_filename(value):
+    stem = Path(str(value or "bao_cao_ban_hang.xlsx")).stem or "bao_cao_ban_hang"
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .") or "bao_cao_ban_hang"
+    return f"{stem}.xlsx"
+
+
+def coerce_excel_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value) if isinstance(value, (float, np.floating)) else int(value)
+    return str(value)
+
+
+def make_excel_workbook(sheets):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    used_names = set()
+    header_fill = PatternFill("solid", fgColor="EAF4FF")
+    total_fill = PatternFill("solid", fgColor="F7FBFF")
+    bold_font = Font(bold=True)
+
+    for sheet in sheets:
+        rows = sheet.get("rows") if isinstance(sheet, dict) else []
+        rows = rows if isinstance(rows, list) else []
+        ws = wb.create_sheet(safe_excel_sheet_name(sheet.get("name") if isinstance(sheet, dict) else "Sheet", used_names))
+        headers = sheet.get("headers") if isinstance(sheet, dict) and isinstance(sheet.get("headers"), list) else []
+        headers = [str(header) for header in headers if str(header).strip()]
+        if not headers:
+            headers = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
+        if not headers:
+            ws.append(["Không có dữ liệu"])
+            continue
+
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = bold_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for row in rows:
+            values = [coerce_excel_value(row.get(header)) if isinstance(row, dict) else "" for header in headers]
+            ws.append(values)
+            if str(row.get(headers[0], "") if isinstance(row, dict) else "").upper() == "TỔNG CỘNG":
+                for cell in ws[ws.max_row]:
+                    cell.font = bold_font
+                    cell.fill = total_fill
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for column_index, header in enumerate(headers, start=1):
+            letter = get_column_letter(column_index)
+            width = min(max(len(str(header)) + 4, 12), 36)
+            for cell in ws[letter][1: min(ws.max_row, 50)]:
+                width = min(max(width, len(str(cell.value or "")) + 2), 36)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '#,##0.00'
+                    cell.alignment = Alignment(horizontal="right")
+            ws.column_dimensions[letter].width = width
+
+    if not wb.worksheets:
+        wb.create_sheet("Bao cao")
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return stream
 
 
 @app.route("/api/config", methods=["GET"])
@@ -1059,7 +1421,32 @@ def mapping():
                 samples.append(str(v).strip())
         label = letter + ((" - " + " | ".join(samples[:2])[:45]) if samples else "")
         cols.append({"letter": letter, "label": label})
-    return jsonify({"original_name": original, "saved_name": saved, "columns": cols, "preview": preview_data(df)})
+    return jsonify({
+        "original_name": original,
+        "saved_name": saved,
+        "columns": cols,
+        "preview": preview_data(df),
+        "invoice_statuses": invoice_status_options(df, DEFAULT_INVOICE_STATUS_COL, DEFAULT_INVOICE_STATUS_SKIP_VALUES),
+    })
+
+
+@app.route("/api/invoice_statuses", methods=["POST"])
+def invoice_statuses():
+    data = request.get_json() or {}
+    saved = data.get("saved_name", "")
+    path = UPLOAD_DIR / saved
+    if not path.exists():
+        return jsonify({"error": "Uploaded file was not found. Please upload again."}), 400
+    try:
+        _, df = read_workbook(path)
+        statuses = invoice_status_options(
+            df,
+            str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper(),
+            data.get("invoice_status_skip_values"),
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"invoice_statuses": statuses})
 
 
 @app.route("/api/check", methods=["POST"])
@@ -1081,6 +1468,8 @@ def check():
             data.get("qty_col", "P").upper(),
             data.get("price_col", "R").upper(),
             cfg,
+            str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper(),
+            data.get("invoice_status_skip_values"),
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1089,6 +1478,25 @@ def check():
         "saved_name": saved,
     })
     return jsonify(result)
+
+
+@app.route("/api/export_price_report", methods=["POST"])
+def export_price_report():
+    data = request.get_json() or {}
+    sheets = data.get("sheets") or []
+    if not isinstance(sheets, list) or not sheets:
+        return jsonify({"error": "Không có dữ liệu để xuất Excel."}), 400
+    try:
+        workbook = make_excel_workbook(sheets)
+        filename = safe_excel_filename(data.get("filename") or "bao_cao_ban_hang.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return send_file(
+        workbook,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.route("/api/process", methods=["POST"])
@@ -1101,7 +1509,10 @@ def process():
         return jsonify({"error": "Uploaded file was not found. Please upload again."}), 400
     try:
         out = resolve_output_path(original, data.get("output_path", ""))
-        process_workbook(path, out, data)
+        processed_df = process_workbook(path, out, data)
+        up_stream = create_up_ban_ra_workbook(processed_df)
+        up_out = up_ban_ra_output_path(out)
+        up_out.write_bytes(up_stream.getvalue())
         cfg = load_config()
         profile = data.get("profile", cfg.get("selected_profile", "son_phuong"))
         cfg["selected_profile"] = profile
@@ -1118,6 +1529,7 @@ def process():
             "repeated_phrase_removals": normalize_phrase_list(data.get("repeated_phrase_removals", old_profile.get("repeated_phrase_removals", []))),
             "price_group_rules": data.get("price_group_rules", {}),
             "price_range_rules": merged_price_ranges,
+            "price_adjust_all_percent": float(data.get("price_adjust_all_percent") or 0),
             "manual_code_overrides": data.get("manual_code_overrides", {}),
             "include_company_prefix": data.get("include_company_prefix") is not False,
             "output_path": data.get("output_path", ""),
@@ -1125,7 +1537,13 @@ def process():
         save_config(cfg)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-    return send_file(str(out.resolve()), as_attachment=True)
+    zip_name = f"{Path(original).stem}_ket_qua_xu_ly.zip"
+    return send_file(
+        process_zip_stream(out, up_out),
+        as_attachment=True,
+        download_name=zip_name,
+        mimetype="application/zip",
+    )
 
 
 @app.route("/", defaults={"path": ""})

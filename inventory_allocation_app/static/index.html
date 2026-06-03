@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phân bổ kho hàng hóa</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Đối chiếu mua vào - bán ra</p>
+      <h1>Phân bổ kho hàng hóa</h1>
+      <p class="subtitle">Ưu tiên lấy mã VT có lãi thấp nhất trước, phần thiếu chuyển sang kho thành phẩm.</p>
+      <p class="version-pill">Version <span id="app_version">0.0</span></p>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="workflow" class="card workflow-card">
+      <div class="step-indicator" aria-label="Quy trình">
+        <div class="step active">1. Mua vào</div>
+        <div class="line"></div>
+        <div class="step">2. Phân ống/hộp</div>
+        <div class="line"></div>
+        <div class="step">3. Priority</div>
+        <div class="line"></div>
+        <div class="step">4. Bán ra & xử lý</div>
+      </div>
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Cấu hình xử lý</p>
+          <h2>Chọn công ty, tải file và tùy chỉnh logic</h2>
+        </div>
+        <div class="stage-head-actions">
+          <button id="edit_stage" class="button muted hidden" type="button">Sửa cấu hình</button>
+          <button id="reset_mapping" class="button muted" type="button">Về mặc định</button>
+        </div>
+      </div>
+      <p class="help">Chọn công ty trước. Với Sơn Phương, Stage 1 bắt đầu từ file mua vào để app giải thích cách nhận diện thép ống/hộp; Stage 2 là tùy chỉnh priority chọn mã.</p>
+
+      <div class="stage-panel company-card workflow-step-card">
+        <div class="stage-panel-title">
+          <strong>Công ty áp dụng</strong>
+          <span>Logic xử lý được cố định cho lần tính tiếp theo.</span>
+        </div>
+        <div class="company-config">
+          <label class="range-field option-field company-select">
+            <span>Công ty / logic xử lý</span>
+            <select id="company_profile">
+              <option value="yen_thanh">Yến Thanh - mã VT có hậu tố .001/.002</option>
+              <option value="son_phuong">Sơn Phương - thép ống/hộp các loại</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="stage-panel workflow-step-card" data-wizard-step="1">
+        <div class="section-kicker">Bước 1</div>
+        <div class="stage-panel-title">
+          <strong>Tải file mua vào và kiểm tra nhận diện</strong>
+          <span>Upload mua vào trước để kiểm tra mã/tên hàng dùng cho kho.</span>
+        </div>
+        <div class="file-grid stage-one-files">
+          <label class="upload required">
+            <span class="upload-mark">XLSX</span>
+            <span class="tag">Bắt buộc</span>
+            <strong>1. Hóa đơn mua vào đã xử lý mã VT</strong>
+            <input id="purchase_file" type="file" accept=".xlsx,.xlsm">
+            <span id="purchase_name" class="filename">Chưa chọn file</span>
+          </label>
+          <label class="upload">
+            <span class="upload-mark">XLSX</span>
+            <span class="tag optional">Tùy chọn</span>
+            <strong>Tồn đầu kỳ theo mã VT</strong>
+            <input id="opening_file" type="file" accept=".xlsx,.xlsm">
+            <span id="opening_name" class="filename">Không có tồn đầu kỳ</span>
+            <small class="default-note">Mã không có trong file này mặc định tồn đầu kỳ = 0.</small>
+            <a class="template-link" href="/api/opening-template">Tải file mẫu</a>
+          </label>
+        </div>
+        <div id="company_detection_rules" class="detection-rules"></div>
+      </div>
+
+      <div class="stage-panel workflow-step-card" data-wizard-step="2">
+        <div class="section-kicker">Bước 2</div>
+        <div class="stage-panel-title">
+          <strong>Kiểm tra phân loại ống/hộp</strong>
+          <span>Đọc file mua vào để kiểm tra mã nào được đưa vào nhóm ống, hộp hoặc bị bỏ qua.</span>
+        </div>
+        <div class="mapping-grid single-mapping-grid">
+          <details class="mapping" data-kind="purchase" open>
+            <summary>Chọn cột hóa đơn mua vào</summary>
+            <div class="fields"></div>
+            <div class="preview" id="purchase_preview"></div>
+          </details>
+        </div>
+        <div id="steel_detection_summary" class="stats compact-stats"></div>
+        <div class="preview-toolbar">
+          <p id="steel_detection_status" class="help">Chọn file mua vào để xem bảng phân loại.</p>
+          <button id="filter_unknown_steel" class="button muted hidden" type="button">Chỉ hiện không phân loại</button>
+        </div>
+        <div id="steel_detection_table" class="table-scroll compact hidden">
+          <table>
+            <thead>
+              <tr>
+                <th>Dòng</th>
+                <th>Mã VT</th>
+                <th>Mã chuẩn</th>
+                <th>Tên hàng hóa</th>
+                <th>Phân loại</th>
+                <th>Lý do</th>
+                <th class="num">SL</th>
+                <th class="num">Đơn giá</th>
+              </tr>
+            </thead>
+            <tbody id="steel_detection_rows"></tbody>
+          </table>
+        </div>
+        <div id="company_rule_panel" class="stage-panel-sub hidden">
+          <div class="stage-panel-title inline">
+            <strong>Cách nhận diện theo từng công ty</strong>
+            <span>App lưu lại bảng này khi đọc file mua vào để lần sau dễ đối chiếu cách normalize mã.</span>
+          </div>
+          <div id="company_rule_table" class="table-scroll compact">
+            <table>
+              <thead>
+                <tr>
+                  <th>Công ty</th>
+                  <th>MST</th>
+                  <th class="num">Dòng</th>
+                  <th class="num">Ống</th>
+                  <th class="num">Hộp</th>
+                  <th class="num">Không rõ</th>
+                  <th class="num">Mã chuẩn</th>
+                  <th>Ví dụ mã chuẩn nhiều nhất</th>
+                  <th>Ví dụ dòng đọc được</th>
+                </tr>
+              </thead>
+              <tbody id="company_rule_rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage-panel workflow-step-card" data-wizard-step="3">
+        <div class="section-kicker">Bước 3</div>
+        <div class="stage-panel-title">
+          <strong>Tùy chỉnh priority chọn mã</strong>
+          <span id="policy_company_hint">Điều kiện hiển thị theo công ty đang chọn.</span>
+        </div>
+        <p class="help" id="policy_help">Yến Thanh dùng khoảng lãi/lỗ theo hậu tố .001/.002. Sơn Phương không dùng khoảng lãi/lỗ, chỉ dùng priority chọn mã.</p>
+        <div class="policy-fields">
+          <label class="range-field loss shared-policy-field">
+            <span>Lỗ tối đa chấp nhận</span>
+            <span class="input-percent"><input id="max_loss_percent" type="number" min="0" step="0.01" placeholder="10"><b>%</b></span>
+          </label>
+          <label class="range-field profit shared-policy-field">
+            <span>Lãi tối đa chấp nhận</span>
+            <span class="input-percent"><input id="max_profit_percent" type="number" min="0" step="0.01" placeholder="25"><b>%</b></span>
+          </label>
+          <label class="range-field option-field yen-thanh-field">
+            <span>Bỏ hậu tố mã bán ra</span>
+            <span class="input-check"><input id="ignore_sale_suffix" type="checkbox"> Gộp .001/.002 về mã gốc</span>
+          </label>
+          <label class="range-field option-field yen-thanh-field">
+            <span>Xuất âm KTP</span>
+            <span class="input-check"><input id="allow_negative_export" type="checkbox"> Phần thiếu HH xuất âm ở kho thành phẩm</span>
+          </label>
+          <label class="range-field option-field yen-thanh-field">
+            <span>HD mua vào sau ngày bán</span>
+            <span class="input-check"><input id="allow_future_purchase_reorder" type="checkbox"> Đưa HD mua vào lên trước để đủ KHH</span>
+          </label>
+          <label class="range-field yen-thanh-field">
+            <span>Khoảng tìm HD mua vào sau</span>
+            <span class="input-percent"><input id="future_purchase_window_days" type="number" min="1" max="366" step="1" placeholder="31"><b>ngày</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Mỗi dòng "Thép ống hộp các loại"</span>
+            <span class="input-percent"><input id="sp_split_pipe_box" type="number" min="1" step="1" placeholder="2"><b>loại</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Mỗi dòng "Thép hộp các loại"</span>
+            <span class="input-percent"><input id="sp_split_box" type="number" min="1" step="1" placeholder="2"><b>loại</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Mỗi dòng "Thép ống các loại"</span>
+            <span class="input-percent"><input id="sp_split_pipe" type="number" min="1" step="1" placeholder="2"><b>loại</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Chênh đơn giá giữa các loại trong cùng dòng</span>
+            <span class="input-percent"><input id="generic_split_variance_percent" type="number" min="0" step="0.01" placeholder="Không giới hạn"><b>%</b></span>
+          </label>
+          <label class="range-field son-phuong-field barem-upload-field">
+            <span>File barem bổ sung (tùy chọn)</span>
+            <span class="mini-upload">
+              <input id="barem_file" type="file" accept=".xlsx,.xlsm">
+              <b>Chọn file để ghi đè / bổ sung</b>
+              <small id="barem_name">Chưa chọn file</small>
+            </span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Du di sau khi làm tròn barem</span>
+            <span class="input-percent"><input id="barem_tolerance_percent" type="number" min="0" step="0.01" placeholder="5"><b>%</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Kg nhỏ nhất mỗi mã VT / dòng bán ra</span>
+            <span class="input-percent"><input id="generic_min_take_quantity" type="number" min="0" step="0.01" placeholder="Không giới hạn"><b>kg</b></span>
+          </label>
+          <label class="range-field son-phuong-field">
+            <span>Kg lớn nhất mỗi mã VT / dòng bán ra</span>
+            <span class="input-percent"><input id="generic_max_take_quantity" type="number" min="0" step="0.01" placeholder="Không giới hạn"><b>kg</b></span>
+          </label>
+          <div class="range-result son-phuong-field son-phuong-note">App có sẵn 4 bảng barem Hòa Phát. File tải lên chỉ dùng để ghi đè hoặc bổ sung. App dò theo loại đen/mạ kẽm, ống/hộp và dimension chuẩn hóa từ tên hàng.</div>
+          <button id="show_default_barem" class="button muted son-phuong-field" type="button">Xem bảng barem mặc định</button>
+          <div id="range_label" class="range-result">Không giới hạn khoảng lãi/lỗ</div>
+          <button id="apply_policy" class="button muted apply-policy" type="button">Áp dụng điều kiện</button>
+          <button id="unlimit_policy" class="button muted apply-policy" type="button">Không giới hạn & tính lại</button>
+        </div>
+      </div>
+
+      <div class="stage-panel workflow-step-card" data-wizard-step="4">
+        <div class="section-kicker">Bước 4</div>
+        <div class="stage-panel-title">
+          <strong>Tải bán ra và chọn cột Excel</strong>
+          <span>Mở nhóm cần sửa. Preview chỉ cuộn bên trong nhóm, không kéo rộng toàn trang.</span>
+        </div>
+        <div class="file-grid sales-file-grid">
+          <label class="upload required">
+            <span class="upload-mark">XLSX</span>
+            <span class="tag">Bắt buộc</span>
+            <strong>2. Hóa đơn bán ra</strong>
+            <input id="sales_file" type="file" accept=".xlsx,.xlsm">
+            <span id="sales_name" class="filename">Chưa chọn file</span>
+          </label>
+        </div>
+        <div class="mapping-grid">
+          <details class="mapping" data-kind="sales">
+            <summary>Hóa đơn bán ra</summary>
+            <div class="fields"></div>
+            <div class="preview" id="sales_preview"></div>
+          </details>
+          <details class="mapping" data-kind="opening">
+            <summary>Tồn đầu kỳ</summary>
+            <div class="fields"></div>
+            <div class="preview" id="opening_preview"></div>
+          </details>
+        </div>
+      </div>
+
+      <div id="analyze_progress" class="progress-wrap hidden" aria-live="polite">
+        <div class="progress-phase">
+          <div class="progress-meta">
+            <span id="upload_label">1. Tải file lên server</span>
+            <b id="upload_percent">0%</b>
+          </div>
+          <div class="progress-track"><div id="upload_fill" class="progress-fill"></div></div>
+        </div>
+        <div class="progress-phase">
+          <div class="progress-meta">
+            <span id="calc_label">2. Chờ tính toán</span>
+            <b id="calc_percent">0%</b>
+          </div>
+          <div class="progress-track"><div id="calc_fill" class="progress-fill calc"></div></div>
+        </div>
+      </div>
+      <div class="actions stage-actions bottom-actions">
+        <button id="wizard_back" class="button muted" type="button">Quay lại</button>
+        <button id="wizard_next" class="button primary" type="button">Tiếp tục</button>
+        <button id="analyze" class="button primary" type="button">Tính phân bổ kho</button>
+        <span id="status" class="status" aria-live="polite"></span>
+      </div>
+      <details class="stage-panel update-panel">
+        <summary>Cập nhật phiên bản .exe</summary>
+        <p class="help">Chọn file InventoryAllocator.exe mới. Khi cập nhật, app sẽ dừng tiến trình cũ, xóa shortcut desktop liên quan, thay exe mới, tạo lại icon cà phê đen trên desktop, mở app mới và tự reload trang.</p>
+        <div class="update-row">
+          <input id="update_exe_file" type="file" accept=".exe">
+          <button id="update_exe" class="button muted" type="button">Cập nhật .exe</button>
+          <span id="update_status" class="status" aria-live="polite"></span>
+        </div>
+      </details>
+    </section>
+
+    <section id="result" class="card result hidden">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Kết quả</p>
+          <h2>Sổ chi tiết hàng hóa</h2>
+        </div>
+        <a id="download" class="button primary" href="#">Xử lý & xuất HĐ bán ra</a>
+      </div>
+      <div class="ledger-toolbar">
+        <div>
+          <p class="eyebrow" id="ledger_warehouse">KHO: KHH - KHO VẬT TƯ, HÀNG HÓA</p>
+          <p id="ledger_range_text" class="help">Từ ngày -- đến ngày --</p>
+        </div>
+        <div class="ledger-range-controls">
+          <label>Từ ngày <input id="ledger_from" type="date"></label>
+          <label>Đến ngày <input id="ledger_to" type="date"></label>
+          <button id="apply_ledger_range" class="button muted" type="button">Áp dụng</button>
+        </div>
+      </div>
+      <div id="summary" class="stats"></div>
+      <div id="warnings" class="warnings hidden"></div>
+      <nav class="tabs">
+        <button class="tab active" data-target="ledger_panel" type="button">Sổ chi tiết hàng hóa</button>
+        <button class="tab" data-target="inventory_summary_panel" type="button">Tổng hợp nhập xuất tồn</button>
+        <button class="tab" data-target="sales_summary_panel" type="button">Báo cáo bán hàng</button>
+        <button class="tab" data-target="sales_invoice_panel" type="button">Bảng kê HĐ bán hàng</button>
+        <button class="tab" data-target="verification_panel" type="button">Kiểm tra đối chiếu</button>
+        <button class="tab" data-target="ambiguous_steel_panel" type="button">Thép không rõ</button>
+        <button class="tab" data-target="barem_missing_panel" type="button">Mã thiếu barem</button>
+        <button class="tab" data-target="future_reorder_panel" type="button">HD mua đưa lên trước</button>
+        <button class="tab" data-target="sale_only_panel" type="button">Mã chỉ bán ra</button>
+      </nav>
+      <div id="ledger_panel" class="panel">
+        <div id="ledger_warehouse_tabs" class="warehouse-tabs"></div>
+        <p id="ledger_empty" class="empty-result hidden">Không có phát sinh trong khoảng ngày đã chọn.</p>
+        <div class="ledger-frame">
+          <div id="ledger_loading" class="ledger-loading hidden">
+            <div class="spinner"></div>
+            <span>Đang áp dụng khoảng ngày...</span>
+          </div>
+          <div id="single_ledger_scroll" class="table-scroll ledger-scroll">
+          <table class="result-table ledger-table">
+            <thead>
+              <tr>
+                <th colspan="2">CHỨNG TỪ</th>
+                <th rowspan="2" class="col-customer">KHÁCH HÀNG</th>
+                <th rowspan="2" class="col-description">DIỄN GIẢI</th>
+                <th rowspan="2" class="col-account">TK<br>ĐỐI ỨNG</th>
+                <th rowspan="2" class="num col-price">ĐƠN GIÁ</th>
+                <th colspan="2">NHẬP</th>
+                <th colspan="2">XUẤT</th>
+                <th colspan="2">TỒN THEO NGÀY</th>
+              </tr>
+              <tr>
+                <th class="col-ledger-date">NGÀY</th>
+                <th class="col-ledger-doc">SỐ</th>
+                <th class="num col-qty">SỐ LƯỢNG</th>
+                <th class="num col-money">THÀNH TIỀN</th>
+                <th class="num col-qty">SỐ LƯỢNG</th>
+                <th class="num col-money">THÀNH TIỀN</th>
+                <th class="num col-qty">SỐ LƯỢNG</th>
+                <th class="num col-money">THÀNH TIỀN</th>
+              </tr>
+            </thead>
+            <tbody id="ledger_rows"></tbody>
+          </table>
+          </div>
+          <div id="combined_ledger_scroll" class="table-scroll ledger-scroll hidden">
+            <table class="result-table combined-ledger-table">
+              <thead>
+                <tr>
+                  <th>Ngày</th><th>Số</th><th>Khách hàng</th><th>Diễn giải</th><th>TK đối ứng</th>
+                  <th>Mã kho</th><th>Mã VT chi tiết</th><th class="num">Đơn giá</th>
+                  <th class="num">Nhập số lượng</th><th class="num">Nhập thành tiền</th>
+                  <th class="num">Xuất số lượng</th><th class="num">Xuất thành tiền</th>
+                  <th class="num">Đơn Giá bán</th><th class="num">TT bán</th><th class="num">Tỉ lệ lãi/lỗ</th>
+                  <th class="num">Tồn số lượng</th><th class="num">Tồn thành tiền</th><th>Giải thích logic</th>
+                </tr>
+              </thead>
+              <tbody id="combined_ledger_rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div id="inventory_summary_panel" class="panel hidden">
+        <div id="summary_warehouse_tabs" class="warehouse-tabs"></div>
+        <div class="inventory-summary-head">
+          <h3>TỔNG HỢP NHẬP XUẤT TỒN</h3>
+          <p id="inventory_summary_warehouse">KHO: --</p>
+          <p id="inventory_summary_range">TỪ NGÀY: -- ĐẾN NGÀY: --</p>
+        </div>
+        <p id="inventory_summary_empty" class="empty-result hidden">Không có phát sinh trong khoảng ngày đã chọn.</p>
+        <div class="table-scroll result-scroll summary-scroll">
+          <table class="result-table inventory-summary-table">
+            <thead>
+              <tr>
+                <th rowspan="2">STT</th>
+                <th rowspan="2">MÃ VẬT TƯ</th>
+                <th rowspan="2">TÊN VẬT TƯ</th>
+                <th rowspan="2">ĐVT</th>
+                <th colspan="2">TỒN ĐẦU KỲ</th>
+                <th colspan="2">NHẬP TRONG KỲ</th>
+                <th colspan="2">XUẤT TRONG KỲ</th>
+                <th colspan="2">TỒN CUỐI KỲ</th>
+              </tr>
+              <tr>
+                <th class="num">SỐ LƯỢNG</th>
+                <th class="num">TIỀN</th>
+                <th class="num">SỐ LƯỢNG</th>
+                <th class="num">TIỀN</th>
+                <th class="num">SỐ LƯỢNG</th>
+                <th class="num">TIỀN</th>
+                <th class="num">SỐ LƯỢNG</th>
+                <th class="num">TIỀN</th>
+              </tr>
+            </thead>
+            <tbody id="inventory_summary_rows"></tbody>
+            <tfoot id="inventory_summary_footer"></tfoot>
+          </table>
+        </div>
+      </div>
+      <div id="inventory_detail_modal" class="detail-modal hidden" role="dialog" aria-modal="true" aria-labelledby="inventory_detail_title">
+        <div class="detail-modal-card sales-detail-modal-card">
+          <div class="detail-modal-head">
+            <div>
+              <p class="eyebrow">CHI TIẾT NHẬP XUẤT TỒN</p>
+              <h3 id="inventory_detail_title">--</h3>
+              <p id="inventory_detail_subtitle">--</p>
+            </div>
+            <button id="inventory_detail_close" class="button muted" type="button">Đóng</button>
+          </div>
+          <div class="table-scroll detail-modal-scroll">
+            <table class="result-table detail-breakdown-table">
+              <thead>
+                <tr>
+                  <th>Ngày c.từ</th><th>Mã c.t</th><th>Số c.từ</th><th>Tên khách hàng</th><th>Diễn giải</th>
+                  <th>Mã nx</th><th>Mã kho</th><th class="num">Giá</th><th class="num">SL nhập</th>
+                  <th class="num">Thành tiền n</th><th class="num">SL xuất</th><th class="num">Thành tiền xuất</th>
+                  <th>Tên nx</th><th>Mã khách</th><th>Mã c.ti</th><th>Mã ĐVCS</th>
+                </tr>
+              </thead>
+              <tbody id="inventory_detail_rows"></tbody>
+              <tfoot id="inventory_detail_footer"></tfoot>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div id="sales_summary_panel" class="panel hidden">
+        <div id="sales_summary_warehouse_tabs" class="warehouse-tabs"></div>
+        <div class="inventory-summary-head">
+          <h3>BÁO CÁO TỔNG HỢP BÁN HÀNG</h3>
+          <p id="sales_summary_warehouse">KHO: --</p>
+          <p id="sales_summary_range">TỪ NGÀY: -- ĐẾN NGÀY: --</p>
+        </div>
+        <div class="table-scroll result-scroll summary-scroll">
+          <table class="result-table inventory-summary-table">
+            <thead>
+              <tr>
+                <th>STT</th><th>MÃ VẬT TƯ</th><th>TÊN VẬT TƯ</th><th>ĐVT</th>
+                <th class="num">SỐ LƯỢNG</th><th class="num">TIỀN VỐN</th><th class="num">TIỀN HÀNG</th>
+                <th class="num">TIỀN LÃI/LỖ</th><th class="num">% LÃI/LỖ</th><th class="num">TIỀN THUẾ</th><th class="num">TỔNG TIỀN TT</th>
+              </tr>
+            </thead>
+            <tbody id="sales_summary_rows"></tbody>
+            <tfoot id="sales_summary_footer"></tfoot>
+          </table>
+        </div>
+      </div>
+      <div id="sales_detail_modal" class="detail-modal hidden" role="dialog" aria-modal="true" aria-labelledby="sales_detail_title">
+        <div class="detail-modal-card">
+          <div class="detail-modal-head">
+            <div>
+              <p class="eyebrow">CHI TIẾT BÁN HÀNG</p>
+              <h3 id="sales_detail_title">--</h3>
+              <p id="sales_detail_subtitle">--</p>
+            </div>
+            <button id="sales_detail_close" class="button muted" type="button">Đóng</button>
+          </div>
+          <div class="table-scroll detail-modal-scroll">
+            <table class="result-table sales-detail-table">
+              <thead>
+                <tr>
+                  <th>Ngày HĐ</th><th>Số HĐ</th><th>Khách hàng</th><th>Mã kho</th><th>Mã VT</th><th>Tên vật tư</th><th>ĐVT</th>
+                  <th class="num">Số lượng</th><th class="num">Giá vốn</th><th class="num">Tiền vốn</th>
+                  <th class="num">Giá bán</th><th class="num">Tiền hàng</th><th class="num">Tiền lãi/lỗ</th><th class="num">% lãi/lỗ</th><th class="num">Thuế suất</th>
+                  <th class="num">Tiền thuế</th><th class="num">Tổng tiền TT</th>
+                </tr>
+              </thead>
+              <tbody id="sales_detail_rows"></tbody>
+              <tfoot id="sales_detail_footer"></tfoot>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div id="sales_invoice_panel" class="panel hidden">
+        <div id="sales_invoice_warehouse_tabs" class="warehouse-tabs"></div>
+        <div class="inventory-summary-head">
+          <h3>BẢNG KÊ HOÁ ĐƠN BÁN HÀNG</h3>
+          <p id="sales_invoice_warehouse">KHO: --</p>
+          <p id="sales_invoice_range">TỪ NGÀY: -- ĐẾN NGÀY: --</p>
+        </div>
+        <div class="table-scroll result-scroll summary-scroll">
+          <table class="result-table invoice-report-table">
+            <thead>
+              <tr>
+                <th>NGÀY</th><th>SỐ</th><th>DIỄN GIẢI</th><th>MÃ BP<br>ĐVT</th><th>MÃ KHO<br>MÃ NX</th>
+                <th class="num">SỐ LƯỢNG</th><th class="num">GIÁ VỐN</th><th class="num">TIỀN VỐN</th>
+                <th class="num">GIÁ BÁN</th><th class="num">TIỀN HÀNG</th>
+              </tr>
+            </thead>
+            <tbody id="sales_invoice_rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="verification_panel" class="panel hidden">
+        <div class="table-scroll result-scroll summary-scroll">
+          <table class="result-table verification-table">
+            <thead>
+              <tr>
+                <th>Nhóm</th><th>Kiểm tra</th><th class="num">Giá trị file gốc</th><th class="num">Giá trị sau xử lý</th>
+                <th class="num">Chênh lệch</th><th class="num">Ngưỡng</th><th>Kết quả</th><th>Ý nghĩa</th>
+              </tr>
+            </thead>
+            <tbody id="verification_rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="sale_only_panel" class="panel hidden">
+        <section class="missing-stock">
+          <div class="subsection-head">
+            <div>
+              <h3>Các mã VT chỉ bán ra mà không có tồn kho</h3>
+              <p class="help">Không có mã gốc tương ứng trong file tồn đầu kỳ hoặc hóa đơn mua vào, kể cả các mã tách như .001/.002.</p>
+            </div>
+            <span id="sale_only_count" class="count-pill">0 mã</span>
+          </div>
+          <p id="sale_only_empty" class="empty-result">Không có mã VT chỉ xuất hiện ở hóa đơn bán ra.</p>
+          <div id="sale_only_table" class="table-scroll compact hidden">
+            <table>
+              <thead>
+                <tr>
+                  <th>Mã VT bán ra</th><th>Mã gốc</th><th>Tên hàng</th>
+                  <th class="num">Tồn đầu kỳ</th><th class="num">Mua vào</th>
+                  <th class="num">Số dòng</th><th class="num">Tổng SL bán</th><th>Dòng hóa đơn</th>
+                </tr>
+              </thead>
+              <tbody id="sale_only_rows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+      <div id="barem_missing_panel" class="panel hidden">
+        <section class="missing-stock">
+          <div class="subsection-head">
+            <div>
+              <h3>Các mã mua vào thiếu khối lượng 1 barem</h3>
+              <p class="help">Sơn Phương: mã thiếu barem bị bỏ qua khi tách dòng “các loại”. App dò barem theo mã VT, sau đó theo loại ống/hộp + dimension để dùng chung cho nhiều công ty.</p>
+            </div>
+            <span id="barem_missing_count" class="count-pill">0 mã</span>
+          </div>
+          <p id="barem_missing_empty" class="empty-result">Không có mã thiếu barem trong nhóm ứng viên đã xét.</p>
+          <div id="barem_missing_table" class="table-scroll compact hidden">
+            <table>
+              <thead>
+                <tr>
+                  <th>Mã VT</th><th>Tên hàng</th><th class="num">SL tồn còn lại</th>
+                  <th>Số HĐ</th><th>Ngày HĐ</th><th>Dòng Excel</th><th>Lý do</th>
+                </tr>
+              </thead>
+              <tbody id="barem_missing_rows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+      <div id="future_reorder_panel" class="panel hidden">
+        <section class="missing-stock">
+          <div class="subsection-head">
+            <div>
+              <h3>HD mua vào được đưa lên trước ngày bán</h3>
+              <p class="help">Yến Thanh: chỉ xuất hiện khi bật tùy chọn tìm HD mua vào sau ngày bán. Các dòng này được tính là KHH và được highlight trong sổ chi tiết.</p>
+            </div>
+            <span id="future_reorder_count" class="count-pill">0 dòng</span>
+          </div>
+          <p id="future_reorder_empty" class="empty-result">Không có HD mua vào nào bị đưa lên trước.</p>
+          <div id="future_reorder_table" class="table-scroll compact hidden">
+            <table>
+              <thead>
+                <tr>
+                  <th>Mã VT mua</th><th>Mã VT bán</th><th>Tên hàng</th><th>Số HD mua</th>
+                  <th>Ngày mua gốc</th><th>Ngày hiệu lực</th><th>Số HD bán</th><th>Ngày bán</th>
+                  <th class="num">SL lấy</th><th class="num">Đơn giá vốn</th><th class="num">Số ngày kéo lên</th><th>Ghi chú</th>
+                </tr>
+              </thead>
+              <tbody id="future_reorder_rows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+      <div id="ambiguous_steel_panel" class="panel hidden">
+        <section class="missing-stock">
+          <div class="subsection-head">
+            <div>
+              <h3>Các mã thép không xác định rõ để áp barem</h3>
+              <p class="help">Nhóm theo công ty: hộp/CN/vuông thiếu đủ 2 cạnh + độ dày, hoặc tên hàng có dấu hiệu thép nhưng không rõ ống tròn hay hộp.</p>
+            </div>
+            <span id="ambiguous_steel_count" class="count-pill">0 dòng</span>
+          </div>
+          <p id="ambiguous_steel_empty" class="empty-result">Không có dòng thép không rõ trong file mua vào.</p>
+          <div id="ambiguous_steel_table" class="table-scroll compact hidden">
+            <table>
+              <thead>
+                <tr>
+                  <th>Công ty</th><th>MST</th><th>Mã VT</th><th>Tên hàng</th>
+                  <th class="num">SL</th><th class="num">Đơn giá</th><th>Số HĐ</th><th>Ngày HĐ</th>
+                  <th>Dòng Excel</th><th>Loại đọc được</th><th>Dimension</th><th>Lý do</th>
+                </tr>
+              </thead>
+              <tbody id="ambiguous_steel_rows"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <div id="barem_modal" class="detail-modal hidden" role="dialog" aria-modal="true" aria-labelledby="barem_modal_title">
+    <div class="detail-modal-card barem-modal-card">
+      <div class="detail-modal-head">
+        <div>
+          <p class="eyebrow">Barem mặc định Hòa Phát</p>
+          <h3 id="barem_modal_title">Khối lượng kg / 1 barem</h3>
+          <p>Dữ liệu này được dùng trực tiếp khi tách dòng bán ra “các loại”.</p>
+        </div>
+        <button id="barem_modal_close" class="button muted" type="button">Đóng</button>
+      </div>
+      <div id="barem_modal_tabs" class="warehouse-tabs barem-tabs"></div>
+      <div class="table-scroll detail-modal-scroll">
+        <table class="result-table barem-table">
+          <thead>
+            <tr>
+              <th>Quy cách</th>
+              <th>Độ dày</th>
+              <th class="num">Trọng lượng kg / barem</th>
+            </tr>
+          </thead>
+          <tbody id="barem_modal_rows"></tbody>
+        </table>
+      </div>
+      <p id="barem_modal_count" class="help"></p>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - paragraph [ref=e4]: Đối chiếu mua vào - bán ra
+      - heading "Phân bổ kho hàng hóa" [level=1] [ref=e5]
+      - paragraph [ref=e6]: Ưu tiên lấy mã VT có lãi thấp nhất trước, phần thiếu chuyển sang kho thành phẩm.
+      - paragraph [ref=e7]:
+        - text: Version
+        - generic [ref=e8]: "0.0"
+  - main [ref=e9]:
+    - generic [ref=e10]:
+      - generic "Quy trình" [ref=e11]:
+        - generic [ref=e12]: 1. Mua vào
+        - generic [ref=e14]: 2. Phân ống/hộp
+        - generic [ref=e16]: 3. Priority
+        - generic [ref=e18]: 4. Bán ra & xử lý
+      - generic [ref=e19]:
+        - generic [ref=e20]:
+          - paragraph [ref=e21]: Cấu hình xử lý
+          - heading "Chọn công ty, tải file và tùy chỉnh logic" [level=2] [ref=e22]
+        - button "Về mặc định" [ref=e24] [cursor=pointer]
+      - paragraph [ref=e25]: Chọn công ty trước. Với Sơn Phương, Stage 1 bắt đầu từ file mua vào để app giải thích cách nhận diện thép ống/hộp; Stage 2 là tùy chỉnh priority chọn mã.
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - strong [ref=e28]: Công ty áp dụng
+          - generic [ref=e29]: Logic xử lý được cố định cho lần tính tiếp theo.
+        - generic [ref=e31]:
+          - generic [ref=e32]: Công ty / logic xử lý
+          - combobox "Công ty / logic xử lý" [ref=e33]:
+            - option "Yến Thanh - mã VT có hậu tố .001/.002" [selected]
+            - option "Sơn Phương - thép ống/hộp các loại"
+      - generic [ref=e34]:
+        - generic [ref=e35]: Bước 1
+        - generic [ref=e36]:
+          - strong [ref=e37]: Tải file mua vào và kiểm tra nhận diện
+          - generic [ref=e38]: Upload mua vào trước để kiểm tra mã/tên hàng dùng cho kho.
+        - generic [ref=e39]:
+          - generic [ref=e40] [cursor=pointer]:
+            - generic [ref=e41]: XLSX
+            - generic [ref=e42]: Bắt buộc
+            - strong [ref=e43]: 1. Hóa đơn mua vào đã xử lý mã VT
+            - button "XLSX Bắt buộc 1. Hóa đơn mua vào đã xử lý mã VT Chưa chọn file"
+            - generic [ref=e44]: Chưa chọn file
+          - generic [ref=e45] [cursor=pointer]:
+            - generic [ref=e46]: XLSX
+            - generic [ref=e47]: Tùy chọn
+            - strong [ref=e48]: Tồn đầu kỳ theo mã VT
+            - button "XLSX Tùy chọn Tồn đầu kỳ theo mã VT Không có tồn đầu kỳ Mã không có trong file này mặc định tồn đầu kỳ = 0. Tải file mẫu"
+            - generic [ref=e49]: Không có tồn đầu kỳ
+            - generic [ref=e50]: Mã không có trong file này mặc định tồn đầu kỳ = 0.
+            - link "Tải file mẫu" [ref=e51]:
+              - /url: /api/opening-template
+        - generic [ref=e53]:
+          - strong [ref=e54]: Yến Thanh - phân biệt theo mã VT đã xử lý
+          - generic [ref=e55]:
+            - generic [ref=e56]:
+              - generic [ref=e57]: Mã gốc và hậu tố
+              - generic [ref=e58]: Mã bán ra có thể gắn .001/.002/.003 theo lô mua vào cùng mã gốc.
+            - generic [ref=e59]:
+              - generic [ref=e60]: Chọn lô
+              - generic [ref=e61]: Ưu tiên lô theo ngày nhập, tồn kho và khoảng lãi/lỗ đã cấu hình.
+            - generic [ref=e62]:
+              - generic [ref=e63]: Không đủ kho HH
+              - generic [ref=e64]: Phần không lấy được từ kho hàng hóa sẽ chuyển sang kho thành phẩm, trừ khi bật xuất âm.
+      - text: − + +
+      - button "Tiếp tục" [ref=e66] [cursor=pointer]
+      - group [ref=e67]:
+        - generic "Cập nhật phiên bản .exe" [ref=e68] [cursor=pointer]

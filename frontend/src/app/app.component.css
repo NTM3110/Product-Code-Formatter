@@ -719,9 +719,13 @@ select.form-control {
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--space-4);
   margin-bottom: var(--space-4);
+}
+
+.loss-report-stats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .stat-card,
@@ -1283,15 +1287,6 @@ button:disabled {
   background: var(--color-surface-blue);
 }
 
-.suspect-reason {
-  margin: var(--space-3) var(--space-4) 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--color-warning-soft);
-  color: var(--color-warning);
-  font-weight: 700;
-}
-
 .price-bulk-controls {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1334,8 +1329,7 @@ button:disabled {
   font-weight: 800;
 }
 
-.price-delta.profit,
-.price-profit {
+.price-delta.profit {
   color: var(--color-success);
 }
 
@@ -1347,7 +1341,6 @@ button:disabled {
 .price-delta.neutral {
   color: var(--color-muted);
 }
-
 
 .suspect-tabs {
   display: grid;
@@ -1396,11 +1389,20 @@ button:disabled {
   padding: 0 var(--space-3) var(--space-3);
 }
 
+.price-inline-detail,
+.price-detail-subrow td {
+  overflow-x: auto;
+}
+
 .price-group-mini-table,
 .compact-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
+}
+
+.price-group-mini-table {
+  min-width: 1050px;
 }
 
 .price-group-mini-table th,

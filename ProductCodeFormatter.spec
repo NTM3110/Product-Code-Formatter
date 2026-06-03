@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('static', 'static'), ('app_icon.ico', '.')],
+    datas=[('static', 'static'), ('app_icon.ico', '.'), ('mau HD ban ra.xlsx', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

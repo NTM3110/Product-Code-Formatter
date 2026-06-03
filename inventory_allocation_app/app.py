@@ -1,0 +1,4290 @@
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import unicodedata
+import uuid
+import webbrowser
+from collections import defaultdict
+from datetime import date, datetime
+from io import BytesIO
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_file, send_from_directory
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
+
+if getattr(sys, "frozen", False):
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", "."))
+    BASE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "InventoryAllocator"
+else:
+    RESOURCE_DIR = Path(__file__).resolve().parent
+    BASE_DIR = RESOURCE_DIR
+
+STATIC_DIR = RESOURCE_DIR / "static"
+ASSET_DIR = RESOURCE_DIR / "assets"
+ICON_PATH = ASSET_DIR / "black_coffee.ico"
+OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DETECTION_RULE_CACHE_PATH = BASE_DIR / "company_detection_rules.json"
+
+app = Flask(__name__, static_folder=None)
+ANALYSIS_JOBS = {}
+ANALYSIS_LOCK = threading.Lock()
+
+APP_VERSION = "0.0"
+VARIANT_SUFFIX = re.compile(r"^(.*?)(?:\.(\d{3}))$")
+DIAMETER_CHARS = "ØøΦφ⌀"
+QUANTITY_EPSILON = 0.00000001
+APP_PORT = 5082
+
+DEFAULT_MAPPING = {
+    "purchase": {
+        "sheet": "",
+        "header_row": 2,
+        "data_start_row": 3,
+        "invoice_col": "C",
+        "date_col": "D",
+        "code_col": "L",
+        "product_col": "M",
+        "qty_col": "O",
+        "price_col": "P",
+    },
+    "sales": {
+        "sheet": "",
+        "header_row": 2,
+        "data_start_row": 3,
+        "invoice_col": "C",
+        "date_col": "D",
+        "code_col": "L",
+        "product_col": "M",
+        "qty_col": "O",
+        "price_col": "P",
+    },
+    "opening": {
+        "sheet": "",
+        "header_row": 1,
+        "data_start_row": 2,
+        "invoice_col": "",
+        "date_col": "",
+        "code_col": "A",
+        "product_col": "B",
+        "qty_col": "C",
+        "price_col": "D",
+    },
+}
+
+DEFAULT_POLICY = {
+    "max_loss_percent": None,
+    "max_profit_percent": None,
+    "ignore_sale_suffix": False,
+    "allow_negative_export": True,
+    "company_profile": "yen_thanh",
+    "son_phuong_split_counts": {
+        "pipe_box": 2,
+        "box": 2,
+        "pipe": 2,
+    },
+    "generic_split_variance_percent": 0,
+    "barem_tolerance_percent": 5,
+    "generic_min_take_quantity": None,
+    "generic_max_take_quantity": None,
+    "allow_future_purchase_reorder": False,
+    "future_purchase_window_days": 31,
+}
+
+
+def text(value):
+    return "" if value is None else str(value).strip()
+
+
+def first_present(*values):
+    for value in values:
+        if value is not None and text(value) != "":
+            return value
+    return None
+
+
+def number(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip().replace(" ", "")
+    if not raw:
+        return None
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
+    raw = re.sub(r"[^0-9.\-]", "", raw)
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def column_index(column):
+    raw = text(column).upper()
+    if not re.fullmatch(r"[A-Z]+", raw):
+        raise ValueError(f"Cột Excel không hợp lệ: {column}")
+    return column_index_from_string(raw)
+
+
+def normalize_code(value):
+    value = text(value).replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn").upper()
+    return re.sub(r"[^A-Z0-9./]+", "", value)
+
+
+def strip_son_phuong_company_prefix(value):
+    code = normalize_code(value)
+    if "." not in code:
+        return code
+    prefix, remainder = code.split(".", 1)
+    if re.fullmatch(r"[A-Z]{1,4}", prefix) and re.search(r"[A-Z]", remainder) and re.search(r"\d", remainder):
+        return remainder
+    return code
+
+
+def son_phuong_company_prefix(value):
+    code = normalize_code(value)
+    if "." not in code:
+        return ""
+    prefix, remainder = code.split(".", 1)
+    if re.fullmatch(r"[A-Z]{1,4}", prefix) and re.search(r"[A-Z]", remainder) and re.search(r"\d", remainder):
+        return prefix
+    return ""
+
+
+def apply_company_prefix(prefix, code):
+    prefix = normalize_code(prefix)
+    code = normalize_code(code)
+    if prefix and code and not code.startswith(f"{prefix}."):
+        return f"{prefix}.{code}"
+    return code
+
+
+def son_phuong_product_family(product_name):
+    normalized = normalize_match_text(product_name)
+    compact = re.sub(r"[^A-Z0-9]+", "", normalized)
+    if not compact:
+        return ""
+    thickness_match = re.search(r"(\d+(?:[.,]\d+)?)\s*MM\b", normalized)
+    thickness = ""
+    if thickness_match:
+        thickness = thickness_match.group(1).replace(",", ".").rstrip("0").rstrip(".")
+    if "THEPBANMA" in compact or "BANMA" in compact:
+        return f"THEP_BAN_MA:{thickness}" if thickness else "THEP_BAN_MA"
+    if "CUONCANNONG" in compact or ("THEPCUON" in compact and "NONG" in compact):
+        return "THEP_CUON_CAN_NONG"
+    if re.search(r"\bTHEP\s*C\b", normalized) or compact.startswith("THEPC"):
+        return f"THEP_C:{thickness}" if thickness else "THEP_C"
+    shape_match = re.search(r"\bTHEP\s+(?:HINH\s+|GOC\s+)?([VUIHL])\s*[-.]?\s*(\d+(?:[.,]\d+)?)\b", normalized)
+    if not shape_match:
+        shape_match = re.search(r"^THEP(?:HINH|GOC)?([VUIHL])(\d+(?:[.,]\d+)?)$", compact)
+    if shape_match:
+        shape_kind = shape_match.group(1)
+        shape_size = canonical_dimension_token(shape_match.group(2))
+        return f"THEP_HINH_{shape_kind}:{shape_size}" if shape_size else f"THEP_HINH_{shape_kind}"
+    return generated_code_from_product(product_name)
+
+
+def son_phuong_line_match_keys(line):
+    keys = set()
+    for field in ("variant_code", "base_code", "source_variant_code", "original_variant_code"):
+        value = normalize_code(line.get(field, ""))
+        if value:
+            keys.add(value)
+            stripped = strip_son_phuong_company_prefix(value)
+            if stripped:
+                keys.add(stripped)
+    family = son_phuong_product_family(line.get("product_name", ""))
+    if family:
+        keys.add(f"NAME:{family}")
+        if ":" in family:
+            keys.add(f"NAME:{family.split(':', 1)[0]}")
+    return keys
+
+
+def steel_profile_code(profile_key):
+    if not profile_key:
+        return ""
+    parts = str(profile_key).split("|", 2)
+    if len(parts) != 3:
+        return ""
+    kind, coating, dimensions = parts
+    kind_label = {"box": "HOP", "pipe": "ONG"}.get(kind, kind.upper())
+    coating_label = {"galvanized": "MK", "black": "DEN"}.get(coating, coating.upper())
+    return f"{kind_label}.{coating_label}.{dimensions.upper()}"
+
+
+def normalize_match_text(value):
+    value = text(value).replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn")
+    return value.upper()
+
+
+def dimension_part_count(value):
+    raw = normalize_match_text(value).replace(",", ".")
+    matches = re.findall(r"\d+(?:\.\d+)?(?:\s*[Xx\*]\s*\d+(?:\.\d+)?){1,4}", raw)
+    counts = [len(re.split(r"\s*[Xx\*]\s*", match)) for match in matches]
+    return max(counts) if counts else 0
+
+
+def canonical_dimension_token(value):
+    number_value = number(value)
+    if number_value is None:
+        return ""
+    return f"{number_value:.4f}".rstrip("0").rstrip(".")
+
+
+def is_decimal_token(value):
+    return "." in canonical_dimension_token(value)
+
+
+def extract_dimension_tokens(value):
+    raw = normalize_match_text(value).replace(",", ".")
+    matches = re.findall(r"\d+(?:\.\d+)?(?:\s*[Xx\*]\s*\d+(?:\.\d+)?){1,4}", raw)
+    best = []
+    for match in matches:
+        tokens = [canonical_dimension_token(part) for part in re.split(r"\s*[Xx\*]\s*", match)]
+        tokens = [token for token in tokens if token]
+        if len(tokens) >= len(best):
+            best = tokens
+    if len(best) >= 3:
+        last = number(best[-1])
+        if last in {6, 6000}:
+            best = best[:-1]
+    pipe_matches = re.findall(r"(?:^|[^A-Z0-9])(?:D|F|PHI|Ø|Φ)\s*(\d+(?:\.\d+)?)(?:\s*[Xx\*]\s*(\d+(?:\.\d+)?))?", raw)
+    for diameter, thickness in pipe_matches:
+        tokens = [canonical_dimension_token(diameter)]
+        if thickness:
+            tokens.append(canonical_dimension_token(thickness))
+        if len(tokens) >= len(best):
+            best = [token for token in tokens if token]
+    return best
+
+
+def steel_coating(product_name="", variant_code=""):
+    normalized = normalize_match_text(f"{product_name} {variant_code}")
+    compact = re.sub(r"\s+", "", normalized)
+    if "DEN" in normalized:
+        return "black"
+    if "MA KEM" in normalized or "MAKEM" in compact or re.search(r"\bMK\b", normalized) or " KEM" in normalized:
+        return "galvanized"
+    return "galvanized"
+
+
+def steel_profile_key(product_name="", variant_code=""):
+    kind = steel_kind(product_name, variant_code)
+    if kind not in {"pipe", "box"}:
+        return None
+    product_tokens = extract_dimension_tokens(product_name)
+    tokens = product_tokens or extract_dimension_tokens(variant_code)
+    if not product_tokens:
+        normalized_name = normalize_match_text(product_name)
+        has_steel_context = (
+            "THEP" in normalized_name
+            or bool(re.search(r"\bONG\b", normalized_name))
+            or bool(re.search(r"\bHOP\b", normalized_name))
+            or "VUONG" in normalized_name
+            or bool(re.search(r"\bCN\b", normalized_name))
+            or any(char in text(product_name) for char in DIAMETER_CHARS)
+        )
+        if not has_steel_context:
+            return None
+    if kind == "pipe" and len(tokens) < 2:
+        return None
+    if kind == "box" and len(tokens) == 2 and (number(tokens[0]) or 0) >= 8:
+        tokens = [tokens[0], tokens[0], tokens[1]]
+    if kind == "box" and len(tokens) < 3:
+        return None
+    return f"{kind}|{steel_coating(product_name, variant_code)}|{'x'.join(tokens)}"
+
+
+def steel_profile_summary(product_name="", variant_code=""):
+    key = steel_profile_key(product_name, variant_code)
+    if not key:
+        return {
+            "profile_key": "",
+            "profile_code": "",
+            "kind": steel_kind(product_name, variant_code),
+            "coating": steel_coating(product_name, variant_code),
+            "dimension": "",
+        }
+    kind, coating, dimension = key.split("|", 2)
+    return {
+        "profile_key": key,
+        "profile_code": steel_profile_code(key),
+        "kind": kind,
+        "coating": coating,
+        "dimension": dimension,
+    }
+
+
+def steel_kind_detail(product_name="", variant_code=""):
+    raw = text(product_name)
+    normalized = normalize_match_text(raw)
+    compact = re.sub(r"\s+", "", normalized)
+    has_ong_word = bool(re.search(r"\bONG\b", normalized))
+    tokens = extract_dimension_tokens(raw) or extract_dimension_tokens(variant_code)
+    explicit_pipe = (
+        any(char in raw for char in DIAMETER_CHARS)
+        or "PHI" in normalized
+        or "TRON" in normalized
+        or re.search(r"(^|[^A-Z])F\s*\d", normalized)
+        or re.search(r"(^|[^A-Z])D\s*\d", normalized)
+    )
+    part_count = dimension_part_count(raw)
+    if part_count >= 4:
+        return "box", "Có kích thước 4 phần nên xác định là thép hộp."
+    has_box_word = (
+        "ONG HOP" in normalized
+        or "ONGHOP" in compact
+        or re.search(r"\bTHEP\s+HOP\b", normalized)
+        or (
+            re.search(r"\bHOP\b", normalized)
+            and "HOP DONG" not in normalized
+            and (tokens or "THEP" in normalized)
+        )
+    )
+    if has_box_word or "VUONG" in normalized or re.search(r"\bCN\b", normalized):
+        return "box", "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
+    if explicit_pipe:
+        return "pipe", "Tên hàng có dấu hiệu ống: Φ/Ø/F/phi/tròn."
+    if has_ong_word:
+        return "pipe", "Tên hàng có từ ống riêng biệt."
+    if len(tokens) >= 2 and is_decimal_token(tokens[0]):
+        return "pipe", "Không có chữ ống/hộp rõ, nhưng đường kính/cạnh đầu là số thập phân nên ưu tiên xác định là ống tròn."
+    if len(tokens) >= 3:
+        return "box", "Có đủ 2 cạnh và độ dày nên xác định là thép hộp."
+    if part_count >= 2 and len(tokens) >= 2 and not is_decimal_token(tokens[0]) and (number(tokens[0]) or 0) >= 8:
+        return "box", "Không có chữ ống/hộp rõ, nhưng cạnh đầu là số nguyên nên ưu tiên xác định là thép hộp."
+    return "unknown", "Không có dấu hiệu đủ rõ để xếp vào ống/hộp."
+
+
+def steel_kind(product_name="", variant_code=""):
+    return steel_kind_detail(product_name, variant_code)[0]
+
+
+def generic_steel_sale_type(product_name):
+    normalized = normalize_match_text(product_name)
+    compact = re.sub(r"\s+", "", normalized)
+    if "CAC LOAI" not in normalized or "THEP" not in normalized:
+        return None
+    if "ONG HOP" in normalized or "ONGHOP" in compact:
+        return "pipe_box"
+    if "HOP" in normalized:
+        return "box"
+    if re.search(r"\bONG\b", normalized):
+        return "pipe"
+    return None
+
+
+def generic_allowed_kinds(generic_type):
+    return {
+        "pipe_box": {"pipe", "box"},
+        "box": {"box"},
+        "pipe": {"pipe"},
+    }.get(generic_type, set())
+
+
+def normalize_header(value):
+    value = text(value).replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn").lower()
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def valid_inventory_code(value):
+    return normalize_code(value) not in {"", "0", "0.0"}
+
+
+def rm_accents_for_code(value):
+    value = text(value).replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
+    for char in DIAMETER_CHARS:
+        value = value.replace(char, "F")
+    value = unicodedata.normalize("NFD", value)
+    return "".join(char for char in value if unicodedata.category(char) != "Mn")
+
+
+def normalize_code_token(value, keep_slash=False):
+    pattern = r"[^A-Z0-9./]+" if keep_slash else r"[^A-Z0-9.]+"
+    return re.sub(pattern, "", rm_accents_for_code(value).upper())
+
+
+def normalize_sep(value):
+    return re.sub(r"(?<=\d)\s*([xX*])\s*(?=\d)", "x", text(value))
+
+
+def code_words(value):
+    return [word for word in re.split(r"\s+", normalize_sep(value).strip()) if word]
+
+
+def remove_duplicate_phrases(words, phrases):
+    seen = set()
+    result = []
+    normalized_phrases = {rm_accents_for_code(phrase).casefold().strip() for phrase in phrases}
+    for word in words:
+        key = rm_accents_for_code(word).casefold().strip()
+        if key in normalized_phrases:
+            if key in seen:
+                continue
+            seen.add(key)
+        result.append(word)
+    return result
+
+
+def normalize_cao_thanh_inox_grade_words(words):
+    result = []
+    for word in words:
+        current = normalize_code_token(word)
+        previous = normalize_code_token(result[-1]) if result else ""
+        if current == "304" and previous == "INOX":
+            continue
+        result.append(word)
+    return result
+
+
+def normalize_cao_thanh_con_reducer_words(words):
+    if not words:
+        return words
+    first = normalize_code_token(words[0])
+    last = normalize_code_token(words[-1], keep_slash=True)
+    if first != "CON" or not re.search(r"\d+(?:[.,]\d+)?/\d+", last):
+        return words
+    if any(normalize_code_token(word) == "THU" for word in words):
+        return words
+    return [words[0], "thu", *words[1:]]
+
+
+def generated_code_from_product(product_name):
+    words = remove_duplicate_phrases(code_words(product_name), ["inox"])
+    words = normalize_cao_thanh_inox_grade_words(words)
+    words = normalize_cao_thanh_con_reducer_words(words)
+    first = [normalize_code_token(word, keep_slash=True) for word in words[:2]]
+    rest = []
+    for word in words[2:]:
+        compact = normalize_code_token(word, keep_slash=True)
+        rest.append(compact if re.search(r"\d", word) else compact[:1])
+    return re.sub(r"\.+", ".", "".join(first + rest)).strip(". ")
+
+
+def code_parts(value):
+    code = normalize_code(value)
+    match = VARIANT_SUFFIX.match(code)
+    if not match:
+        return code, code, None
+    return code, match.group(1), int(match.group(2))
+
+
+def clean_mapping(raw, key):
+    source = raw.get(key) if isinstance(raw, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    result = dict(DEFAULT_MAPPING[key])
+    result.update({field: value for field, value in source.items() if value is not None})
+    result["header_row"] = max(1, int(result.get("header_row") or 1))
+    result["data_start_row"] = max(result["header_row"] + 1, int(result.get("data_start_row") or result["header_row"] + 1))
+    for field in ("code_col", "qty_col"):
+        column_index(result[field])
+    for field in ("invoice_col", "date_col", "product_col", "price_col"):
+        if text(result.get(field)):
+            column_index(result[field])
+    return result
+
+
+def optional_percent(value):
+    if value is None or text(value) == "":
+        return None
+    result = number(value)
+    if result is None or result < 0:
+        raise ValueError("Khoảng lãi/lỗ phải là số không âm.")
+    return result
+
+
+def optional_quantity(value, field_name):
+    if value is None or text(value) == "":
+        return None
+    result = number(value)
+    if result is None or result < 0:
+        raise ValueError(f"{field_name} phai la so khong am.")
+    return result
+
+
+def clean_policy(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    ignore_sale_suffix = str(raw.get("ignore_sale_suffix", "")).lower() in {"1", "true", "yes", "on"}
+    allow_negative_export = str(raw.get("allow_negative_export", DEFAULT_POLICY["allow_negative_export"])).lower() in {"1", "true", "yes", "on"}
+    allow_future_purchase_reorder = str(raw.get("allow_future_purchase_reorder", "")).lower() in {"1", "true", "yes", "on"}
+    company_profile = text(raw.get("company_profile") or DEFAULT_POLICY["company_profile"]).lower()
+    if company_profile not in {"yen_thanh", "son_phuong"}:
+        company_profile = "yen_thanh"
+    max_loss_percent = optional_percent(raw.get("max_loss_percent"))
+    max_profit_percent = optional_percent(raw.get("max_profit_percent"))
+    split_counts_raw = raw.get("son_phuong_split_counts") if isinstance(raw.get("son_phuong_split_counts"), dict) else {}
+    split_counts = {}
+    for key, default_value in DEFAULT_POLICY["son_phuong_split_counts"].items():
+        try:
+            split_counts[key] = max(1, int(number(split_counts_raw.get(key, default_value)) or default_value))
+        except (TypeError, ValueError):
+            split_counts[key] = default_value
+    variance = optional_percent(raw.get("generic_split_variance_percent"))
+    if variance is None:
+        variance = DEFAULT_POLICY["generic_split_variance_percent"]
+    barem_tolerance = optional_percent(raw.get("barem_tolerance_percent"))
+    if barem_tolerance is None:
+        barem_tolerance = DEFAULT_POLICY["barem_tolerance_percent"]
+    min_take_quantity = optional_quantity(raw.get("generic_min_take_quantity"), "Khoi luong nho nhat")
+    max_take_quantity = optional_quantity(raw.get("generic_max_take_quantity"), "Khoi luong lon nhat")
+    if min_take_quantity is not None and max_take_quantity is not None and min_take_quantity > max_take_quantity:
+        raise ValueError("Khoi luong nho nhat khong duoc lon hon khoi luong lon nhat.")
+    try:
+        future_purchase_window_days = int(number(raw.get("future_purchase_window_days", DEFAULT_POLICY["future_purchase_window_days"])) or DEFAULT_POLICY["future_purchase_window_days"])
+    except (TypeError, ValueError):
+        future_purchase_window_days = DEFAULT_POLICY["future_purchase_window_days"]
+    future_purchase_window_days = max(1, min(future_purchase_window_days, 366))
+    if company_profile == "son_phuong":
+        ignore_sale_suffix = False
+        allow_negative_export = False
+        allow_future_purchase_reorder = False
+    if ignore_sale_suffix or company_profile == "son_phuong":
+        max_loss_percent = None
+        max_profit_percent = None
+    return {
+        "max_loss_percent": max_loss_percent,
+        "max_profit_percent": max_profit_percent,
+        "ignore_sale_suffix": ignore_sale_suffix,
+        "allow_negative_export": allow_negative_export,
+        "company_profile": company_profile,
+        "son_phuong_split_counts": split_counts,
+        "generic_split_variance_percent": variance,
+        "barem_tolerance_percent": barem_tolerance,
+        "generic_min_take_quantity": min_take_quantity,
+        "generic_max_take_quantity": max_take_quantity,
+        "allow_future_purchase_reorder": allow_future_purchase_reorder,
+        "future_purchase_window_days": future_purchase_window_days,
+    }
+
+
+def policy_active(policy):
+    return policy["max_loss_percent"] is not None or policy["max_profit_percent"] is not None
+
+
+def normalize_sales_codes_to_base(sales_lines):
+    normalized = []
+    for line in sales_lines:
+        item = dict(line)
+        item["variant_code"] = item.get("base_code") or item.get("variant_code", "")
+        item["suffix"] = None
+        normalized.append(item)
+    return normalized
+
+
+def sheet_for_mapping(workbook, mapping):
+    name = text(mapping.get("sheet"))
+    if name and name in workbook.sheetnames:
+        return workbook[name]
+    return workbook[workbook.sheetnames[0]]
+
+
+def header_column(sheet, header_row, labels, fallback=None):
+    targets = {normalize_header(label) for label in labels}
+    for column in range(1, sheet.max_column + 1):
+        if normalize_header(sheet.cell(header_row, column).value) in targets:
+            return column
+    return column_index(fallback) if fallback else None
+
+
+def header_column_contains(sheet, header_row, labels):
+    targets = [normalize_header(label) for label in labels]
+    for column in range(1, sheet.max_column + 1):
+        header = normalize_header(sheet.cell(header_row, column).value)
+        if header and any(target and target in header for target in targets):
+            return column
+    return None
+
+
+def detect_sales_mapping(sheet, mapping):
+    current_header = normalize_header(sheet.cell(mapping["header_row"], column_index(mapping["code_col"])).value)
+    if current_header in {"ma vt", "ma vat tu"}:
+        return mapping
+    for header_row in range(1, min(sheet.max_row, 5) + 1):
+        code_col = header_column_contains(sheet, header_row, ["Mã vật tư", "Mã VT", "ma_vt"])
+        qty_col = header_column_contains(sheet, header_row, ["Số lượng", "so_luong"])
+        if not code_col or not qty_col:
+            continue
+        result = dict(mapping)
+        result["header_row"] = header_row
+        result["data_start_row"] = header_row + 1
+        result["code_col"] = get_column_letter(code_col)
+        result["qty_col"] = get_column_letter(qty_col)
+        invoice_col = header_column_contains(sheet, header_row, ["Số hóa đơn", "Số chứng từ", "so_ct"])
+        date_col = header_column_contains(sheet, header_row, ["Ngày hóa đơn", "Ngày chứng từ", "ngay_ct"])
+        product_col = header_column_contains(sheet, header_row, ["Tên hàng hóa", "Tên hàng", "Diễn giải", "dien_giai"])
+        price_col = header_column_contains(sheet, header_row, ["Đơn giá", "Giá bán", "gia2"])
+        if invoice_col:
+            result["invoice_col"] = get_column_letter(invoice_col)
+        if date_col:
+            result["date_col"] = get_column_letter(date_col)
+        if product_col:
+            result["product_col"] = get_column_letter(product_col)
+        if price_col:
+            result["price_col"] = get_column_letter(price_col)
+        return result
+    return mapping
+
+
+def cell_value(values, column):
+    if not column:
+        return None
+    index = column - 1
+    return values[index] if index < len(values) else None
+
+
+def tax_rate_percent(value):
+    result = number(value)
+    if result is None:
+        return None
+    return result * 100 if abs(result) <= 1 else result
+
+
+def parse_excel_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = text(value)
+    if not raw:
+        return None
+    raw = raw.split()[0]
+    for date_format in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, date_format).date()
+        except ValueError:
+            pass
+    return None
+
+
+def date_iso(value):
+    parsed = parse_excel_date(value)
+    return parsed.isoformat() if parsed else ""
+
+
+def date_display(value):
+    parsed = parse_excel_date(value)
+    return parsed.strftime("%d/%m/%Y") if parsed else text(value)
+
+
+def read_lines(content, mapping, kind, company_profile="yen_thanh"):
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    sheet = sheet_for_mapping(workbook, mapping)
+    if kind == "sales":
+        mapping = detect_sales_mapping(sheet, mapping)
+    code_col = column_index(mapping["code_col"])
+    qty_col = column_index(mapping["qty_col"])
+    invoice_col = column_index(mapping["invoice_col"]) if text(mapping.get("invoice_col")) else None
+    date_col = column_index(mapping["date_col"]) if text(mapping.get("date_col")) else None
+    product_col = column_index(mapping["product_col"]) if text(mapping.get("product_col")) else None
+    price_col = column_index(mapping["price_col"]) if text(mapping.get("price_col")) else None
+    header_row = mapping["header_row"]
+    if kind == "purchase":
+        party_name_col = header_column(sheet, header_row, ["Tên người bán", "Tên công ty", "Người bán"], "F")
+        party_tax_col = header_column(sheet, header_row, ["MST người bán", "MST", "Mã số thuế người bán"], "G")
+    elif kind == "sales":
+        party_name_col = header_column(sheet, header_row, ["Tên người mua", "Người mua hàng", "Người mua hàng (ong_ba)", "Tên khách hàng"], "I")
+        party_tax_col = header_column(sheet, header_row, ["MST người mua", "Mã ST", "Mã số thuế người mua"], "J")
+    else:
+        party_name_col = None
+        party_tax_col = None
+    amount_col = header_column(sheet, header_row, ["Tiền chưa thuế nguyên tệ", "Thành tiền mua", "Tiền bán", "Tiền bán:N0 (tien2)", "Thành tiền"], "S") if kind in {"purchase", "sales"} else None
+    unit_col = header_column(sheet, header_row, ["Đơn vị tính", "ĐVT", "DVT"], "N") if kind in {"purchase", "sales"} else None
+    tax_rate_col = header_column(sheet, header_row, ["Thuế suất", "Thuế suất GTGT", "Thuế suất (thue_suat)"], "R") if kind == "sales" else None
+    tax_amount_col = header_column(sheet, header_row, ["Tiền thuế nguyên tệ", "Tiền thuế", "Tiền thuế:N0 (tien_thue)"], "T") if kind == "sales" else None
+    last_col = max(
+        column for column in (
+            code_col, qty_col, invoice_col, date_col, product_col, price_col,
+            party_name_col, party_tax_col, amount_col, unit_col, tax_rate_col, tax_amount_col,
+        ) if column is not None
+    )
+    lines = []
+    row_values = sheet.iter_rows(
+        min_row=mapping["data_start_row"],
+        max_col=last_col,
+        values_only=True,
+    )
+    for row_number, values in enumerate(row_values, start=mapping["data_start_row"]):
+        raw_code = cell_value(values, code_col)
+        product_name = text(cell_value(values, product_col)) if product_col else ""
+        if (kind == "sales" or company_profile == "son_phuong") and not valid_inventory_code(raw_code) and product_name:
+            raw_code = generated_code_from_product(product_name)
+        quantity = number(cell_value(values, qty_col))
+        if not valid_inventory_code(raw_code) or quantity is None or quantity <= 0:
+            continue
+        original_code = normalize_code(raw_code)
+        source_code = original_code
+        steel_profile = {"profile_key": "", "profile_code": "", "kind": "", "coating": "", "dimension": ""}
+        if company_profile == "son_phuong":
+            company_prefix = son_phuong_company_prefix(raw_code)
+            raw_code = strip_son_phuong_company_prefix(raw_code)
+            source_code = normalize_code(raw_code)
+            steel_profile = steel_profile_summary(product_name, source_code)
+            if steel_profile["profile_code"] and not (kind == "sales" and generic_steel_sale_type(product_name)):
+                raw_code = apply_company_prefix(company_prefix, steel_profile["profile_code"])
+            else:
+                raw_code = original_code
+        variant_code, base_code, suffix = code_parts(raw_code)
+        unit_price = number(cell_value(values, price_col)) if price_col else None
+        line_amount = number(cell_value(values, amount_col)) if amount_col else None
+        if line_amount is None and unit_price is not None:
+            line_amount = unit_price * quantity
+        rate_percent = tax_rate_percent(cell_value(values, tax_rate_col)) if tax_rate_col else None
+        tax_amount = number(cell_value(values, tax_amount_col)) if tax_amount_col else None
+        if tax_amount is None and line_amount is not None and rate_percent is not None:
+            tax_amount = line_amount * rate_percent / 100
+        raw_invoice_date = cell_value(values, date_col) if date_col else None
+        lines.append({
+            "kind": kind,
+            "row_number": row_number,
+            "original_variant_code": original_code,
+            "source_variant_code": source_code,
+            "steel_profile_key": steel_profile.get("profile_key", ""),
+            "steel_profile_code": steel_profile.get("profile_code", ""),
+            "steel_kind": steel_profile.get("kind", ""),
+            "steel_coating": steel_profile.get("coating", ""),
+            "steel_dimension": steel_profile.get("dimension", ""),
+            "variant_code": variant_code,
+            "base_code": base_code,
+            "suffix": suffix,
+            "invoice_no": text(cell_value(values, invoice_col)) if invoice_col else "",
+            "invoice_date": date_display(raw_invoice_date) if date_col else "",
+            "invoice_date_iso": date_iso(raw_invoice_date) if date_col else "",
+            "party_tax_code": text(cell_value(values, party_tax_col)) if party_tax_col else "",
+            "party_name": text(cell_value(values, party_name_col)) if party_name_col else "",
+            "product_name": product_name,
+            "unit_name": text(cell_value(values, unit_col)) if unit_col else "",
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "line_amount": line_amount,
+            "tax_rate_percent": rate_percent,
+            "tax_amount": tax_amount,
+        })
+    workbook.close()
+    return sheet.title, lines
+
+
+def summarize_purchase_lines(purchase_lines):
+    grouped = {}
+    order = []
+    for line in purchase_lines:
+        key = (line["variant_code"], line.get("invoice_date_iso") or "")
+        if key not in grouped:
+            grouped[key] = {
+                **line,
+                "quantity": 0.0,
+                "unit_price": None,
+                "weighted_cost_total": 0.0,
+                "weighted_cost_quantity": 0.0,
+                "invoice_numbers": [],
+                "invoice_dates": [],
+                "row_numbers": [],
+                "summary_count": 0,
+            }
+            order.append(key)
+        item = grouped[key]
+        item["quantity"] = clean_quantity(item["quantity"] + line["quantity"])
+        item["summary_count"] += 1
+        item["row_numbers"].append(line["row_number"])
+        if line.get("invoice_no"):
+            item["invoice_numbers"].append(line["invoice_no"])
+        if line.get("invoice_date"):
+            item["invoice_dates"].append(line["invoice_date"])
+        if line.get("unit_price") is not None:
+            item["weighted_cost_total"] += line["unit_price"] * line["quantity"]
+            item["weighted_cost_quantity"] += line["quantity"]
+        if not item.get("product_name") and line.get("product_name"):
+            item["product_name"] = line["product_name"]
+    result = []
+    for key in order:
+        item = grouped[key]
+        if item["weighted_cost_quantity"] > QUANTITY_EPSILON:
+            item["unit_price"] = item["weighted_cost_total"] / item["weighted_cost_quantity"]
+        item["row_number"] = item["row_numbers"][0]
+        invoices = list(dict.fromkeys(item["invoice_numbers"]))
+        invoice_dates = list(dict.fromkeys(item["invoice_dates"]))
+        item["invoice_no"] = ", ".join(str(value) for value in invoices[:3])
+        if len(invoices) > 3:
+            item["invoice_no"] += f" +{len(invoices) - 3}"
+        item["invoice_date"] = ", ".join(str(value) for value in invoice_dates[:3])
+        if len(invoice_dates) > 3:
+            item["invoice_date"] += f" +{len(invoice_dates) - 3}"
+        item.pop("weighted_cost_total")
+        item.pop("weighted_cost_quantity")
+        result.append(item)
+    return result
+
+
+def make_lots(opening_lines, purchase_lines):
+    lots = []
+    for sequence, line in enumerate(opening_lines + purchase_lines):
+        lot = dict(line)
+        lot.update({
+            "source": "Tồn đầu kỳ" if line["kind"] == "opening" else "Mua vào",
+            "sequence": sequence,
+            "initial_quantity": line["quantity"],
+            "remaining_quantity": line["quantity"],
+            "allocated_quantity": 0.0,
+        })
+        lots.append(lot)
+    return lots
+
+
+def sale_sort_key(sale):
+    return (sale.get("invoice_date_iso") or "9999-12-31", sale.get("row_number", 0))
+
+
+def lot_available_for_sale(lot, sale):
+    if lot.get("kind") == "opening":
+        return True
+    lot_date = lot.get("invoice_date_iso")
+    sale_date = sale.get("invoice_date_iso")
+    if not lot_date or not sale_date:
+        return True
+    return lot_date <= sale_date
+
+
+def parse_iso_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def future_purchase_days(lot, sale):
+    lot_date = parse_iso_date(lot.get("invoice_date_iso"))
+    sale_date = parse_iso_date(sale.get("invoice_date_iso"))
+    if not lot_date or not sale_date or lot_date <= sale_date:
+        return None
+    return (lot_date - sale_date).days
+
+
+def future_lot_allowed_for_sale(lot, sale, policy):
+    if not policy.get("allow_future_purchase_reorder") or lot.get("kind") == "opening":
+        return False
+    days = future_purchase_days(lot, sale)
+    if days is None:
+        return False
+    return days <= int(policy.get("future_purchase_window_days") or DEFAULT_POLICY["future_purchase_window_days"])
+
+
+def lot_priority(lot, sale_price):
+    suffix = lot["suffix"] if lot["suffix"] is not None else 999999
+    if lot["unit_price"] is None or sale_price is None:
+        return (2, suffix, lot["sequence"])
+    profit_per_unit = sale_price - lot["unit_price"]
+    if profit_per_unit < 0:
+        return (0, abs(profit_per_unit), suffix, lot["sequence"])
+    return (1, profit_per_unit, suffix, lot["sequence"])
+
+
+def generic_lot_priority(lot, sale_price):
+    suffix = lot["suffix"] if lot["suffix"] is not None else 999999
+    stock_priority = -clean_quantity(lot.get("remaining_quantity", 0))
+    if lot["unit_price"] is None or sale_price is None:
+        return (2, stock_priority, suffix, lot["sequence"])
+    profit_per_unit = sale_price - lot["unit_price"]
+    if profit_per_unit >= 0:
+        return (0, profit_per_unit, stock_priority, suffix, lot["sequence"])
+    return (1, abs(profit_per_unit), stock_priority, suffix, lot["sequence"])
+
+
+def generic_lot_quality_rank(lot, sale_price):
+    if lot.get("unit_price") is None or sale_price is None:
+        return 2
+    return 0 if sale_price - lot["unit_price"] >= 0 else 1
+
+
+def lot_margin_percent(lot, sale_price):
+    if lot["unit_price"] is None or sale_price is None or sale_price <= 0:
+        return None
+    return (sale_price - lot["unit_price"]) / sale_price * 100
+
+
+def lot_acceptance(lot, sale_price, policy):
+    if not policy_active(policy):
+        return True, ""
+    margin_percent = lot_margin_percent(lot, sale_price)
+    if margin_percent is None:
+        return False, "không có đủ đơn giá để kiểm tra khoảng lãi/lỗ"
+    if policy["max_loss_percent"] is not None and margin_percent < -policy["max_loss_percent"]:
+        return False, f"lỗ {format_number(abs(margin_percent))}% vượt mức {format_number(policy['max_loss_percent'])}%"
+    if policy["max_profit_percent"] is not None and margin_percent > policy["max_profit_percent"]:
+        return False, f"lãi {format_number(margin_percent)}% vượt mức {format_number(policy['max_profit_percent'])}%"
+    return True, ""
+
+
+def lot_within_generic_variance(lot, selected_lots, variance_percent):
+    if not variance_percent or not selected_lots:
+        return True
+    unit_price = lot.get("unit_price")
+    if unit_price is None or unit_price <= 0:
+        return True
+    prices = [item.get("unit_price") for item in selected_lots if item.get("unit_price")]
+    if not prices:
+        return True
+    low = min(prices + [unit_price])
+    high = max(prices + [unit_price])
+    if low <= 0:
+        return True
+    return (high - low) / low * 100 <= variance_percent
+
+
+def son_phuong_lot_pool(lots, sale):
+    generic_type = generic_steel_sale_type(sale.get("product_name", ""))
+    if not generic_type:
+        return None, []
+    allowed = generic_allowed_kinds(generic_type)
+    sale_coating = steel_coating(sale.get("product_name", ""), sale.get("variant_code", ""))
+    return generic_type, [
+        lot for lot in lots
+        if (lot.get("steel_kind") or steel_kind(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))) in allowed
+        and (lot.get("steel_coating") or steel_coating(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))) == sale_coating
+    ]
+
+
+BUILTIN_BAREM_TABLE = """
+box black 12x12 0.8:1.66 0.9:1.85
+box black 14x14 0.9:2.19 1:2.41 1.1:2.63 1.2:2.84 1.4:3.25
+box black 16x16 0.9:2.53 1.2:3.29 1.4:3.78 1.5:4.01
+box black 20x20 0.9:3.21 1.2:4.20 1.4:4.83 1.8:6.05 2:6.63
+box black 25x25 0.8:3.62 0.9:4.06 1:4.48 1.1:4.91 1.2:5.33 1.4:6.15 1.8:7.75 2:8.52
+box black 30x30 1:5.43 1.1:5.94 1.2:6.46 1.4:7.47 1.8:9.44 2:10.40 2.5:12.72 3:14.92
+box black 40x40 1.1:8.02 1.4:10.11 1.5:10.80 1.8:12.83 2:14.17 2.5:17.43 2.8:19.33 3:20.57
+box black 50x50 1.4:12.74 1.5:13.62 1.8:16.22 2:17.94 2.3:20.47 2.5:22.14 2.8:24.60 3:26.23 4:34.06
+box black 60x60 2:21.70 2.5:26.85 2.8:29.88 3:31.88
+box black 75x75 1.8:24.70 2:27.36 2.5:33.91 3:40.36 4:52.90
+box black 90x90 2:33.01 2.5:40.98 3:48.83 4:64.21
+box black 100x100 2.5:45.69 3:54.49 4:71.74 4.5:80.20 5:88.55
+box black 200x200 4:147.10 4.5:164.98 5:182.75 6:217.94 8:286.97
+box black 13x26 0.8:2.79 0.9:3.12 1.1:3.77 1.2:4.08 1.4:4.70
+box black 20x40 1.2:6.46 1.4:7.47 1.8:9.44 2:10.40 2.5:12.72
+box black 25x50 1.1:7.50 1.2:8.15 1.4:9.45 1.5:10.09 1.8:11.98 2:13.23 2.5:16.25
+box black 30x60 1.4:11.43 1.5:12.21 1.8:14.53 2:16.05 2.3:18.30 2.5:19.78 3:23.40
+box black 40x80 1.2:13.24 1.4:15.38 1.8:19.61 2:21.70 2.3:24.80 2.5:26.85 2.8:29.88 3:31.88 4:41.56
+box black 50x100 1.4:19.34 1.8:24.70 2:27.36 2.3:31.30 2.5:33.91 2.8:37.79 3:40.36 4:52.90
+box black 60x120 1.8:29.79 2:33.01 2.3:37.80 2.5:40.98 2.8:45.70 3:48.83 4:64.21
+box black 150x150 2.5:69.24 2.8:77.36 3:82.75 3.5:96.14 4:109.42 4.5:122.59
+box black 100x150 2.5:57.46 2.8:64.17 3:68.62 3.5:79.66 4:90.58 4.5:101.40
+box black 100x200 2.5:69.24 2.8:77.36 3:82.75 3.5:96.14 4:109.42 4.5:122.59
+box black 250x250 4:184.78 5:229.85 6:274.46 8:362.33 10:448.39
+box black 200x300 5:229.85 6:274.46
+box galvanized 12x12 0.8:1.66
+box galvanized 14x14 1:2.41 1.1:2.63 1.2:2.84 1.4:3.25
+box galvanized 16x16 0.9:2.53 1.2:3.29 1.4:3.78
+box galvanized 20x20 1:3.54 1.1:3.87 1.2:4.20 1.4:4.83 1.8:6.05 2:6.63
+box galvanized 25x25 1:4.48 1.1:4.91 1.2:5.33 1.4:6.15 1.8:7.75 2:8.52
+box galvanized 30x30 1:5.43 1.1:5.94 1.2:6.46 1.4:7.47 1.8:9.44 2:10.40
+box galvanized 40x40 1.1:8.02 1.2:8.72 1.4:10.11 1.5:10.80 1.8:12.83 2:14.17
+box galvanized 50x50 1.2:10.98 1.4:12.74 1.5:13.62 1.8:16.22 2:17.94
+box galvanized 60x60 1.4:15.38 1.8:19.61 2:21.70
+box galvanized 75x75 1.4:19.34 1.8:24.70 2:27.36
+box galvanized 90x90 1.4:23.30 1.8:29.79 2:33.01
+box galvanized 100x100 1.8:33.18 2:36.78 2.3:42.14
+box galvanized 13x26 0.8:2.79 0.9:3.12 1:3.45 1.1:3.77 1.2:4.08 1.4:4.70
+box galvanized 20x40 0.9:4.90 1:5.43 1.1:5.94 1.2:6.46 1.4:7.47 1.5:7.97 1.8:9.44 2:10.40
+box galvanized 25x50 1:6.84 1.2:8.15 1.4:9.45 1.5:10.09 1.8:11.98 2:13.23
+box galvanized 30x60 0.9:7.45 1:8.25 1.1:9.05 1.2:9.85 1.4:11.43 1.5:12.21 1.8:14.53 2:16.05 2.3:18.30
+box galvanized 30x90 1.2:13.24 1.4:15.38 1.8:19.61
+box galvanized 40x80 1.1:12.16 1.2:13.24 1.4:15.38 1.5:16.45 1.8:19.61 2:21.70 2.3:24.80
+box galvanized 50x100 1.2:16.63 1.4:19.34 1.5:20.69 1.8:24.70 2:27.36 2.3:31.30
+box galvanized 60x120 1.4:23.30 1.8:29.79 2:33.01 2.3:37.80 2.5:40.98
+pipe black 21.2 1:2.99 1.2:3.55 1.4:4.10 1.5:4.37 2:5.68 2.2:6.19 2.5:6.92 2.6:7.16
+pipe black 26.65 1.2:4.52 1.5:5.58 1.8:6.62 2:7.29 2.5:8.93 2.6:9.25
+pipe black 33.5 1.5:7.10 1.8:8.44 2:9.32 2.5:11.47 2.6:11.89 2.9:13.13 3:13.54 3.2:14.35 3.5:15.54
+pipe black 42.2 1.4:8.45 1.5:9.03 1.8:10.76 2:11.90 2.3:13.58 2.5:14.69 2.6:15.24 2.8:16.32 2.9:16.86 3:17.40 3.2:18.47 3.5:20.04
+pipe black 48.1 1.5:10.34 2:13.64 2.3:15.59 2.5:16.87 2.6:17.50 2.9:19.40 3:20.02 3.2:21.26 3.5:23.10 3.8:24.91 4:26.10 4.5:29.03 5:31.89
+pipe black 59.9 1.4:12.12 1.5:12.96 1.8:15.47 2:17.13 2.3:19.60 2.5:21.23 2.6:22.04 2.9:24.46 3:25.26 3.2:26.85 3.5:29.21 3.6:29.99 3.8:31.54 4:33.09 4.5:36.89 5:40.62
+pipe black 75.6 1.8:19.66 2:21.78 2.3:24.95 2.5:27.04 3:32.23 3.2:34.28 3.5:37.34 3.6:38.35 3.8:40.37 4:42.38 4.5:47.34 5:52.23
+pipe black 88.3 2:25.54 2.3:29.27 2.5:31.74 3:37.87 3.2:40.30 3.5:43.92 3.6:45.12 4:49.90 4.5:55.80 5:61.63 5.5:67.39 6:73.07
+pipe black 113.5 1.8:29.75 2:33.00 2.3:37.84 2.5:41.06 3:49.05 3.2:52.23 3.5:56.97 3.6:58.54 4:64.81 4.5:72.58 5:80.27 5.5:87.89 6:95.44
+pipe black 141.3 2.5:51.35 3:61.39 3.96:80.46 4.78:96.54 5:100.84 5.16:103.95 5.56:111.66 6.35:126.79 6.55:130.62
+pipe black 168.3 2.5:61.33 3:73.38 3.96:96.30 4.78:115.62 5:120.82 5.16:124.56 5.56:133.86 6.35:152.16
+pipe black 219.1 3.96:126.06 4.78:151.56 5.16:163.32 5.56:175.68 6.35:199.86 8.18:255.30
+pipe black 273 4.78:189.72 5.16:204.48 5.56:220.02 6.35:250.50 9.27:361.74 10.31:478.20 11.13:514.92
+pipe black 323.8 5.16:243.30 5.56:261.78 6.35:298.26 7.92:370.14
+pipe galvanized 21.2 1:2.99 1.1:3.27 1.2:3.55 1.4:4.10 1.5:4.37 1.9:5.43 2.1:5.94 2.5:6.92
+pipe galvanized 26.65 1:3.80 1.1:4.16 1.2:4.52 1.4:5.23 1.5:5.58 1.9:6.96 2.1:7.63
+pipe galvanized 33.5 0.9:13.56 1:4.81 1.1:5.27 1.2:5.74 1.4:6.65 1.5:7.10 1.9:8.88 2.1:9.76 2.3:10.62
+pipe galvanized 42.2 1.2:7.28 1.4:8.45 1.5:9.03 1.8:10.76 2:11.90 2.3:13.58 2.5:14.69
+pipe galvanized 48.1 1.4:9.67 1.5:10.34 1.8:12.33 2:13.64 2.3:15.59
+pipe galvanized 59.9 1.4:12.12 1.5:12.96 1.8:15.47 2:17.14 2.3:19.60
+pipe galvanized 75.6 1.4:15.37 1.5:16.45 1.8:19.66 2:21.78 2.3:24.95
+pipe galvanized 88.3 1.4:18.00 1.5:19.27 1.8:23.04 2:25.54 2.3:29.27
+pipe galvanized 113.5 1.8:29.75 2:33.00 2.3:37.84
+"""
+
+
+def profile_key_from_parts(kind, coating, dimension, thickness):
+    dimension_tokens = [canonical_dimension_token(part) for part in str(dimension).split("x")]
+    dimension_tokens.append(canonical_dimension_token(thickness))
+    return f"{kind}|{coating}|{'x'.join(token for token in dimension_tokens if token)}"
+
+
+def builtin_barem_map():
+    by_profile = {}
+    for raw_line in BUILTIN_BAREM_TABLE.strip().splitlines():
+        parts = raw_line.split()
+        if len(parts) < 4:
+            continue
+        kind, coating, dimension, *pairs = parts
+        for pair in pairs:
+            if ":" not in pair:
+                continue
+            thickness, weight = pair.split(":", 1)
+            key = profile_key_from_parts(kind, coating, dimension, thickness)
+            by_profile[key] = float(weight)
+    return {"by_code": {}, "by_profile": by_profile}
+
+
+def builtin_barem_rows():
+    rows = []
+    for raw_line in BUILTIN_BAREM_TABLE.strip().splitlines():
+        parts = raw_line.split()
+        if len(parts) < 4:
+            continue
+        kind, coating, dimension, *pairs = parts
+        for pair in pairs:
+            if ":" not in pair:
+                continue
+            thickness, weight = pair.split(":", 1)
+            rows.append({
+                "kind": kind,
+                "coating": coating,
+                "dimension": dimension,
+                "thickness": canonical_dimension_token(thickness),
+                "weight": float(weight),
+            })
+    return rows
+
+
+def merge_barem_maps(base_map, override_map=None):
+    result = {
+        "by_code": dict((base_map or {}).get("by_code") or {}),
+        "by_profile": dict((base_map or {}).get("by_profile") or {}),
+    }
+    if override_map:
+        result["by_code"].update(override_map.get("by_code") or {})
+        result["by_profile"].update(override_map.get("by_profile") or {})
+    return result
+
+
+DEFAULT_BAREM_MAP = builtin_barem_map()
+
+
+def parse_barem_file(content):
+    if not content:
+        return {"by_code": {}, "by_profile": {}}
+
+    def barem_number_cell(value):
+        if isinstance(value, (int, float)):
+            return float(value)
+        raw = text(value)
+        if not raw or not re.fullmatch(r"[-+]?\d[\d.,\s]*", raw):
+            return None
+        return number(raw)
+
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    result = {"by_code": {}, "by_profile": {}}
+    try:
+        for row in sheet.iter_rows(values_only=True):
+            if not row:
+                continue
+            values = [cell for cell in row if cell is not None and text(cell) != ""]
+            if not values:
+                continue
+            text_values = [text(cell) for cell in values if text(cell)]
+            numeric_values = [(index, barem_number_cell(cell)) for index, cell in enumerate(row) if barem_number_cell(cell) is not None and barem_number_cell(cell) > 0]
+            weight = None
+            if len(row) > 1 and barem_number_cell(row[1]) is not None and barem_number_cell(row[1]) > 0:
+                weight = barem_number_cell(row[1])
+            elif numeric_values:
+                weight = numeric_values[-1][1]
+            if weight is None or weight <= 0:
+                continue
+            code = normalize_code(text_values[0] if text_values else "")
+            product_name = max(text_values, key=len, default="")
+            if code and code not in {"0", "0.0"}:
+                result["by_code"][code] = weight
+            profile_key = steel_profile_key(product_name, code)
+            if profile_key:
+                result["by_profile"][profile_key] = weight
+    finally:
+        workbook.close()
+    return result
+
+
+def resolve_barem_weight(barem_map, lot):
+    if not barem_map:
+        return None
+    code = normalize_code(lot.get("variant_code", ""))
+    if isinstance(barem_map, dict) and ("by_code" in barem_map or "by_profile" in barem_map):
+        by_code = barem_map.get("by_code") or {}
+        by_profile = barem_map.get("by_profile") or {}
+        direct = by_code.get(code)
+        if direct is not None:
+            return direct
+        profile_key = lot.get("steel_profile_key") or steel_profile_key(
+            lot.get("product_name", ""),
+            lot.get("source_variant_code") or lot.get("variant_code", ""),
+        )
+        return by_profile.get(profile_key)
+    return barem_map.get(code) if hasattr(barem_map, "get") else None
+
+
+def steel_barem_ambiguity(line):
+    product_name = line.get("product_name", "")
+    variant_code = line.get("source_variant_code") or line.get("variant_code", "")
+    kind, kind_reason = steel_kind_detail(product_name, variant_code)
+    tokens = extract_dimension_tokens(product_name) or extract_dimension_tokens(variant_code)
+    normalized = normalize_match_text(product_name)
+    has_relevant_hint = (
+        bool(re.search(r"\bONG\b", normalized))
+        or bool(re.search(r"\bHOP\b", normalized))
+        or "VUONG" in normalized
+        or bool(re.search(r"\bCN\b", normalized))
+    )
+    has_dimension_pattern = bool(re.search(r"\d+(?:[.,]\d+)?\s*[Xx\*]\s*\d+", normalized))
+    if kind == "unknown" and (has_relevant_hint or has_dimension_pattern):
+        return {
+            "kind": "unknown",
+            "dimension": "x".join(tokens),
+            "reason": "Không xác định rõ là ống tròn hay hộp/CN/vuông.",
+            "kind_reason": kind_reason,
+        }
+    return None
+
+
+def build_ambiguous_steel_rows(purchase_lines):
+    rows = []
+    for line in purchase_lines:
+        ambiguity = steel_barem_ambiguity(line)
+        if not ambiguity:
+            continue
+        rows.append({
+            "company": line.get("party_name") or "(Không có tên công ty)",
+            "tax_code": line.get("party_tax_code", ""),
+            "variant_code": line.get("source_variant_code") or line.get("variant_code", ""),
+            "profile_code": line.get("steel_profile_code", ""),
+            "product_name": line.get("product_name", ""),
+            "quantity": line.get("quantity", 0),
+            "unit_price": line.get("unit_price"),
+            "invoice_no": line.get("invoice_no", ""),
+            "invoice_date": line.get("invoice_date", ""),
+            "row_number": line.get("row_number", ""),
+            "detected_kind": ambiguity["kind"],
+            "dimension": ambiguity["dimension"],
+            "reason": ambiguity["reason"],
+            "kind_reason": ambiguity["kind_reason"],
+        })
+    rows.sort(key=lambda row: (normalize_match_text(row["company"]), row.get("row_number") or 0, row.get("variant_code", "")))
+    return rows
+
+
+def build_company_detection_rules(purchase_lines):
+    companies = {}
+    for line in purchase_lines:
+        company = line.get("party_name") or "(Không có tên công ty)"
+        item = companies.setdefault(company, {
+            "company": company,
+            "tax_code": line.get("party_tax_code", ""),
+            "total": 0,
+            "pipe": 0,
+            "box": 0,
+            "unknown": 0,
+            "profiles": {},
+            "examples": [],
+        })
+        kind = line.get("steel_kind") or steel_kind(line.get("product_name", ""), line.get("source_variant_code") or line.get("variant_code", ""))
+        item["total"] += 1
+        item[kind if kind in {"pipe", "box"} else "unknown"] += 1
+        profile_code = line.get("steel_profile_code") or ""
+        if profile_code:
+            profile = item["profiles"].setdefault(profile_code, {
+                "profile_code": profile_code,
+                "profile_key": line.get("steel_profile_key", ""),
+                "kind": kind,
+                "coating": line.get("steel_coating", ""),
+                "dimension": line.get("steel_dimension", ""),
+                "count": 0,
+                "quantity": 0,
+                "examples": [],
+            })
+            profile["count"] += 1
+            profile["quantity"] = clean_quantity(profile["quantity"] + clean_quantity(line.get("quantity", 0)))
+            if len(profile["examples"]) < 3:
+                profile["examples"].append({
+                    "row_number": line.get("row_number", ""),
+                    "source_variant_code": line.get("source_variant_code") or line.get("variant_code", ""),
+                    "product_name": line.get("product_name", ""),
+                })
+        if len(item["examples"]) < 8:
+            item["examples"].append({
+                "row_number": line.get("row_number", ""),
+                "source_variant_code": line.get("source_variant_code") or line.get("variant_code", ""),
+                "profile_code": profile_code,
+                "product_name": line.get("product_name", ""),
+                "kind": kind,
+                "reason": steel_kind_detail(line.get("product_name", ""), line.get("source_variant_code") or line.get("variant_code", ""))[1],
+            })
+    result = []
+    for item in companies.values():
+        profiles = sorted(
+            item.pop("profiles").values(),
+            key=lambda row: (-row["quantity"], row["profile_code"]),
+        )
+        item["profile_count"] = len(profiles)
+        item["top_profiles"] = profiles[:12]
+        result.append(item)
+    result.sort(key=lambda row: (-row["total"], normalize_match_text(row["company"])))
+    return result
+
+
+def save_company_detection_rules(profile, rules):
+    if profile != "son_phuong":
+        return
+    try:
+        cache = {}
+        if DETECTION_RULE_CACHE_PATH.exists():
+            cache = json.loads(DETECTION_RULE_CACHE_PATH.read_text(encoding="utf-8"))
+        cache[profile] = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "rules": rules,
+        }
+        DETECTION_RULE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def missing_barem_item(lot, reason="Thiếu khối lượng 1 barem"):
+    return {
+        "variant_code": lot.get("variant_code", ""),
+        "product_name": lot.get("product_name", ""),
+        "quantity": clean_quantity(lot.get("remaining_quantity", 0)),
+        "invoice_no": lot.get("invoice_no", ""),
+        "invoice_date": lot.get("invoice_date", ""),
+        "row_number": lot.get("row_number", ""),
+        "reason": reason,
+    }
+
+
+def deterministic_random(seed_parts):
+    seed = "|".join(text(part) for part in seed_parts)
+    return random.Random(seed)
+
+
+def random_percent_options(option_count, split_count, seed_parts):
+    rng = deterministic_random(seed_parts)
+    options = []
+    for _ in range(option_count):
+        weights = [rng.random() + 0.05 for _ in range(split_count)]
+        total = sum(weights) or 1
+        options.append([weight / total for weight in weights])
+    return options
+
+
+def barem_multiple_quantity(target, available, barem, min_quantity=None, max_quantity=None):
+    if barem is None or barem <= QUANTITY_EPSILON:
+        return 0
+    limit = min(target, available)
+    if max_quantity is not None:
+        limit = min(limit, max_quantity)
+    amount = clean_quantity(int(limit / barem) * barem)
+    if min_quantity is not None and amount + QUANTITY_EPSILON < min_quantity:
+        return 0
+    return amount
+
+
+def choose_barem_generic_plan(sale, candidates, policy, barem_map):
+    if not candidates:
+        return [], [], [], "Không có mã ứng viên."
+    missing_barem = []
+    usable = []
+    seen_missing = set()
+    for lot in candidates:
+        code = normalize_code(lot.get("variant_code", ""))
+        barem = resolve_barem_weight(barem_map, lot)
+        if barem is None or barem <= 0:
+            if code not in seen_missing:
+                profile_key = lot.get("steel_profile_key") or steel_profile_key(
+                    lot.get("product_name", ""),
+                    lot.get("source_variant_code") or lot.get("variant_code", ""),
+                )
+                reason = "Thiếu khối lượng 1 barem"
+                if profile_key:
+                    reason += f" cho {profile_key.replace('|', ' ')}"
+                else:
+                    reason += "; không nhận diện được dimension để dò theo barem chung"
+                missing_barem.append(missing_barem_item(lot, reason))
+                seen_missing.add(code)
+            continue
+        lot["barem_weight"] = barem
+        usable.append(lot)
+    if not usable:
+        return [], missing_barem, [], "Không có mã nào có barem hợp lệ."
+
+    required = clean_quantity(sale.get("quantity", 0))
+    if required <= QUANTITY_EPSILON:
+        return [], missing_barem, [], "Số lượng bán ra bằng 0."
+    min_take_quantity = policy.get("generic_min_take_quantity")
+    max_take_quantity = policy.get("generic_max_take_quantity")
+
+    def lot_capacity(lot):
+        capacity = clean_quantity(lot.get("remaining_quantity", 0))
+        if max_take_quantity is not None:
+            capacity = min(capacity, max_take_quantity)
+        return clean_quantity(capacity)
+
+    usable = [
+        lot for lot in usable
+        if lot_capacity(lot) > QUANTITY_EPSILON
+        and (min_take_quantity is None or lot_capacity(lot) + QUANTITY_EPSILON >= min_take_quantity)
+    ]
+    if not usable:
+        return [], missing_barem, [], "Khong co ma nao dat gioi han khoi luong min/max."
+
+    has_profitable_lots = any(generic_lot_quality_rank(lot, sale.get("unit_price")) == 0 for lot in usable)
+    source_lots = usable
+    best_plan = []
+    planned_amounts = defaultdict(float)
+    total = 0.0
+    base_target = required / max(1, len(source_lots))
+    for lot in source_lots:
+        amount = barem_multiple_quantity(
+            base_target,
+            clean_quantity(lot_capacity(lot) - planned_amounts.get(id(lot), 0)),
+            lot.get("barem_weight"),
+            min_take_quantity,
+            max_take_quantity,
+        )
+        if amount <= QUANTITY_EPSILON:
+            continue
+        best_plan.append((lot, amount, 0, False))
+        planned_amounts[id(lot)] = clean_quantity(planned_amounts[id(lot)] + amount)
+        total = clean_quantity(total + amount)
+    for lot in source_lots:
+        shortage = clean_quantity(required - total)
+        if shortage <= QUANTITY_EPSILON:
+            break
+        amount = barem_multiple_quantity(
+            shortage,
+            clean_quantity(lot_capacity(lot) - planned_amounts.get(id(lot), 0)),
+            lot.get("barem_weight"),
+            min_take_quantity,
+            max_take_quantity,
+        )
+        if amount <= QUANTITY_EPSILON:
+            continue
+        best_plan.append((lot, amount, 0, False))
+        planned_amounts[id(lot)] = clean_quantity(planned_amounts[id(lot)] + amount)
+        total = clean_quantity(total + amount)
+    rounded_shortage = clean_quantity(max(0, required - total))
+    if rounded_shortage > QUANTITY_EPSILON:
+        def spare_capacity(lot):
+            return clean_quantity(lot_capacity(lot) - planned_amounts.get(id(lot), 0))
+
+        remainder_lot = None
+        for lot in source_lots:
+            if spare_capacity(lot) + QUANTITY_EPSILON >= rounded_shortage:
+                remainder_lot = lot
+                break
+        if remainder_lot is not None:
+            best_plan.append((remainder_lot, rounded_shortage, 0, True))
+            rounded_shortage = 0
+    selected_codes = [lot.get("variant_code", "") for lot, _amount, _ratio, _is_remainder in best_plan]
+    split_count = len(dict.fromkeys(selected_codes))
+    remainder_quantity = clean_quantity(sum(
+        amount for _lot, amount, _ratio, is_remainder in best_plan if is_remainder
+    ))
+    if remainder_quantity > QUANTITY_EPSILON:
+        note = f"Chon {split_count} ma khong gioi han so loai; {format_number(remainder_quantity)} kg du cuoi duoc gop vao ma phu hop nhat."
+    elif rounded_shortage == 0:
+        note = f"Chon {split_count} ma khong gioi han so loai; toan bo khoi luong dung boi so barem."
+    else:
+        note = f"Chon {split_count} ma khong gioi han so loai, thieu {format_number(rounded_shortage)} kg sau khi lam tron theo barem."
+    if not has_profitable_lots:
+        note = "Khong co ma lai hop le; buoc phai chon ma lo thap nhat. " + note
+    return best_plan, missing_barem, selected_codes, note
+    top_lot = source_lots[0]
+    split_count = 4 if lot_capacity(top_lot) >= required * 0.25 else 6
+    selected_lots = source_lots[:split_count]
+    if not selected_lots:
+        return [], missing_barem, [], "Không đủ mã ứng viên có barem."
+    if len(selected_lots) < split_count:
+        split_count = len(selected_lots)
+    tolerance = required * (policy.get("barem_tolerance_percent") or 0) / 100
+    best_plan = None
+    best_score = None
+    for option in random_percent_options(50, split_count, [
+        sale.get("invoice_no", ""),
+        sale.get("row_number", ""),
+        sale.get("variant_code", ""),
+        split_count,
+    ]):
+        plan = []
+        total = 0.0
+        for lot, ratio in zip(selected_lots, option):
+            amount = barem_multiple_quantity(
+                required * ratio,
+                lot.get("remaining_quantity", 0),
+                lot.get("barem_weight"),
+                min_take_quantity,
+                max_take_quantity,
+            )
+            if amount <= QUANTITY_EPSILON:
+                continue
+            plan.append((lot, amount, ratio, False))
+            total = clean_quantity(total + amount)
+        shortage = clean_quantity(max(0, required - total))
+        accepted_penalty = 0 if shortage <= tolerance + QUANTITY_EPSILON else 1
+        score = (accepted_penalty, -len(plan), shortage)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_plan = plan
+    if best_plan and best_score and best_score[2] > QUANTITY_EPSILON:
+        shortage = clean_quantity(best_score[2])
+        planned_amounts = defaultdict(float)
+        for lot, amount, _ratio, _is_remainder in best_plan:
+            planned_amounts[id(lot)] += amount
+        plan_lots = set(planned_amounts)
+
+        def spare_capacity(lot):
+            return clean_quantity(lot_capacity(lot) - planned_amounts.get(id(lot), 0))
+
+        remainder_lot = None
+        for lot in selected_lots:
+            if id(lot) not in plan_lots and spare_capacity(lot) + QUANTITY_EPSILON >= shortage:
+                remainder_lot = lot
+                break
+        if remainder_lot is None:
+            for lot, amount, _ratio, _is_remainder in best_plan:
+                if spare_capacity(lot) + QUANTITY_EPSILON >= shortage:
+                    remainder_lot = lot
+                    break
+        if remainder_lot is not None:
+            best_plan.append((remainder_lot, shortage, 0, True))
+            best_score = (0, best_score[1], 0)
+    selected_codes = [lot.get("variant_code", "") for lot, _amount, _ratio, _is_remainder in (best_plan or [])]
+    rounded_shortage = best_score[2] if best_score else required
+    remainder_quantity = clean_quantity(sum(
+        amount for _lot, amount, _ratio, is_remainder in (best_plan or []) if is_remainder
+    ))
+    if remainder_quantity > QUANTITY_EPSILON:
+        note = f"Chon {split_count} ma; {format_number(remainder_quantity)} kg du cuoi duoc gop vao ma phu hop nhat."
+    elif best_score and best_score[2] == 0:
+        note = f"Chọn {split_count} mã; phần dư nhỏ cuối cùng được gộp vào mã phù hợp nhất."
+    else:
+        note = f"Chọn {split_count} mã, thiếu {format_number(rounded_shortage)} kg sau khi làm tròn theo barem."
+    if remainder_quantity <= QUANTITY_EPSILON and best_score and best_score[2] == 0:
+        note = f"Chon {split_count} ma; toan bo khoi luong dung boi so barem."
+    if not has_profitable_lots:
+        note = "Khong co ma lai hop le; buoc phai chon ma lo thap nhat. " + note
+    return best_plan or [], missing_barem, selected_codes, note
+
+
+def inventory_snapshot(lots, sale_price):
+    return [{
+        "variant_code": lot["variant_code"],
+        "source": lot["source"],
+        "invoice_no": lot.get("invoice_no", ""),
+        "invoice_date": lot.get("invoice_date", ""),
+        "row_number": lot["row_number"],
+        "quantity": clean_quantity(lot["remaining_quantity"]),
+        "unit_cost": lot["unit_price"],
+        "profit_percent": lot_margin_percent(lot, sale_price),
+        "summary_count": lot.get("summary_count", 1),
+    } for lot in lots if lot["remaining_quantity"] > QUANTITY_EPSILON]
+
+
+def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, progress_callback=None, barem_map=None):
+    policy = clean_policy(policy or DEFAULT_POLICY)
+    is_son_phuong = policy.get("company_profile") == "son_phuong"
+    allow_negative_export = is_son_phuong
+    purchase_lines = summarize_purchase_lines(purchase_lines)
+    lots = make_lots(opening_lines, purchase_lines)
+    by_code = defaultdict(list)
+    by_variant = defaultdict(list)
+    by_steel_profile = defaultdict(list)
+    by_son_phuong_match_key = defaultdict(list)
+    for lot in lots:
+        by_code[lot["base_code"]].append(lot)
+        by_variant[lot["variant_code"]].append(lot)
+        if is_son_phuong and lot.get("steel_profile_key"):
+            by_steel_profile[lot["steel_profile_key"]].append(lot)
+        if is_son_phuong:
+            for key in son_phuong_line_match_keys(lot):
+                by_son_phuong_match_key[key].append(lot)
+
+    allocations = []
+    warnings = []
+    missing_barem_report = []
+    total_sales = len(sales_lines)
+    ordered_sales = sorted(sales_lines, key=sale_sort_key)
+    for sale_index, sale in enumerate(ordered_sales, start=1):
+        if progress_callback and (sale_index == 1 or sale_index == total_sales or sale_index % 250 == 0):
+            progress_callback(sale_index, total_sales)
+        required = sale["quantity"]
+        remaining = required
+        used = []
+        # A sales row can be split back to any accepted purchase suffix under the same
+        # base code (.001/.002/.003). If none passes date and margin checks, the
+        # remainder is pushed to KTP.
+        generic_type, generic_pool = son_phuong_lot_pool(lots, sale) if is_son_phuong else (None, [])
+        is_generic_sale = bool(generic_type)
+        if is_generic_sale:
+            lot_pool = generic_pool
+        elif is_son_phuong and sale.get("steel_profile_key"):
+            lot_pool = by_steel_profile.get(sale["steel_profile_key"], [])
+        elif is_son_phuong:
+            lot_pool = []
+            seen_lots = set()
+            for key in son_phuong_line_match_keys(sale):
+                for lot in by_son_phuong_match_key.get(key, []):
+                    lot_id = id(lot)
+                    if lot_id in seen_lots:
+                        continue
+                    seen_lots.add(lot_id)
+                    lot_pool.append(lot)
+        else:
+            lot_pool = by_code.get(sale["base_code"], [])
+        available_lots = [
+            lot for lot in lot_pool
+            if lot["remaining_quantity"] > 0 and lot_available_for_sale(lot, sale)
+        ]
+        future_reorder_lots = [
+            lot for lot in lot_pool
+            if lot["remaining_quantity"] > 0 and future_lot_allowed_for_sale(lot, sale, policy)
+        ] if not is_son_phuong else []
+        priority_fn = generic_lot_priority if is_generic_sale else lot_priority
+        available_lots.sort(key=lambda lot: priority_fn(lot, sale["unit_price"]))
+        future_reorder_lots.sort(key=lambda lot: priority_fn(lot, sale["unit_price"]))
+        future_reorder_ids = {id(lot) for lot in future_reorder_lots}
+        candidate_pool = available_lots + future_reorder_lots
+        inventory_before = inventory_snapshot(candidate_pool, sale["unit_price"])
+        candidates = []
+        rejected = []
+        for lot in candidate_pool:
+            accepted, reason = lot_acceptance(lot, sale["unit_price"], policy)
+            if accepted:
+                candidates.append(lot)
+            else:
+                rejected.append({
+                    "variant_code": lot["variant_code"],
+                    "sale_variant_code": sale["variant_code"],
+                "invoice_no": lot.get("invoice_no", ""),
+                "invoice_date": lot.get("invoice_date", ""),
+                "invoice_date_iso": lot.get("invoice_date_iso", ""),
+                "quantity": lot["remaining_quantity"],
+                "reason": reason,
+                "margin_percent": lot_margin_percent(lot, sale["unit_price"]),
+                "summary_count": lot.get("summary_count", 1),
+                "future_purchase_reordered": id(lot) in future_reorder_ids,
+                "future_reorder_days": future_purchase_days(lot, sale),
+            })
+        selected_generic_codes = None
+        generic_first_pass_targets = {}
+        generic_barem_plan = None
+        generic_plan_note = ""
+        if is_generic_sale:
+            if is_son_phuong and barem_map is not None:
+                generic_barem_plan, missing_barem, selected_codes, generic_plan_note = choose_barem_generic_plan(
+                    sale,
+                    candidates,
+                    policy,
+                    barem_map,
+                )
+                missing_barem_report.extend(missing_barem)
+                selected_generic_codes = set(selected_codes)
+                candidates = [lot for lot in candidates if lot.get("variant_code") in selected_generic_codes]
+            else:
+                selected_lots = []
+                selected_codes = []
+                max_types = policy["son_phuong_split_counts"].get(generic_type, 1)
+                for lot in candidates:
+                    code = lot.get("variant_code", "")
+                    if code in selected_codes:
+                        continue
+                    if not lot_within_generic_variance(lot, selected_lots, policy.get("generic_split_variance_percent")):
+                        rejected.append({
+                            "variant_code": lot["variant_code"],
+                            "sale_variant_code": sale["variant_code"],
+                            "invoice_no": lot.get("invoice_no", ""),
+                            "invoice_date": lot.get("invoice_date", ""),
+                            "quantity": lot["remaining_quantity"],
+                            "reason": f"đơn giá chênh hơn {format_number(policy.get('generic_split_variance_percent'))}% so với nhóm đã chọn",
+                            "margin_percent": lot_margin_percent(lot, sale["unit_price"]),
+                            "summary_count": lot.get("summary_count", 1),
+                        })
+                        continue
+                    selected_lots.append(lot)
+                    selected_codes.append(code)
+                    if len(selected_codes) >= max_types:
+                        break
+                selected_generic_codes = set(selected_codes)
+                if selected_generic_codes:
+                    quota = required / len(selected_generic_codes)
+                    generic_first_pass_targets = {code: quota for code in selected_generic_codes}
+                    candidates = [lot for lot in candidates if lot.get("variant_code") in selected_generic_codes]
+
+        def consume_lot(lot, amount, barem_remainder=False):
+            nonlocal remaining
+            if amount <= QUANTITY_EPSILON:
+                return
+            lot["remaining_quantity"] = clean_quantity(lot["remaining_quantity"] - amount)
+            lot["allocated_quantity"] = clean_quantity(lot["allocated_quantity"] + amount)
+            remaining = clean_quantity(remaining - amount)
+            margin = None
+            if sale["unit_price"] is not None and lot["unit_price"] is not None:
+                margin = sale["unit_price"] - lot["unit_price"]
+            used.append({
+                "variant_code": lot["variant_code"],
+                "purchase_variant_code": lot["variant_code"],
+                "purchase_source_variant_code": lot.get("source_variant_code", lot["variant_code"]),
+                "sale_variant_code": sale["variant_code"],
+                "sale_source_variant_code": sale.get("source_variant_code", sale["variant_code"]),
+                "ledger_variant_code": lot["variant_code"] if is_son_phuong else (sale["variant_code"] if allow_negative_export else lot["variant_code"]),
+                "steel_profile_key": lot.get("steel_profile_key", ""),
+                "source": lot["source"],
+                "invoice_no": lot.get("invoice_no", ""),
+                "invoice_date": lot.get("invoice_date", ""),
+                "invoice_date_iso": lot.get("invoice_date_iso", ""),
+                "row_number": lot["row_number"],
+                "quantity": amount,
+                "unit_cost": lot["unit_price"],
+                "profit_per_unit": margin,
+                "profit_percent": lot_margin_percent(lot, sale["unit_price"]),
+                "summary_count": lot.get("summary_count", 1),
+                "barem_weight": lot.get("barem_weight"),
+                "barem_remainder": barem_remainder,
+                "future_purchase_reordered": id(lot) in future_reorder_ids,
+                "future_reorder_days": future_purchase_days(lot, sale) if id(lot) in future_reorder_ids else None,
+                "original_purchase_date": lot.get("invoice_date", "") if id(lot) in future_reorder_ids else "",
+                "original_purchase_date_iso": lot.get("invoice_date_iso", "") if id(lot) in future_reorder_ids else "",
+                "effective_purchase_date": sale.get("invoice_date", "") if id(lot) in future_reorder_ids else "",
+                "effective_purchase_date_iso": sale.get("invoice_date_iso", "") if id(lot) in future_reorder_ids else "",
+                "future_reorder_sale_invoice_no": sale.get("invoice_no", "") if id(lot) in future_reorder_ids else "",
+                "future_reorder_sale_row": sale.get("row_number", "") if id(lot) in future_reorder_ids else "",
+                "logic_note": (
+                    f"Phan du cuoi {format_number(amount)} kg khong tron boi so barem."
+                    if barem_remainder else ""
+                ),
+            })
+            if id(lot) in future_reorder_ids:
+                note = (
+                    f"HD mua vao ngay {lot.get('invoice_date', '')} duoc dua len truoc "
+                    f"HD ban ra ngay {sale.get('invoice_date', '')} trong {future_purchase_days(lot, sale)} ngay."
+                )
+                used[-1]["logic_note"] = f"{used[-1].get('logic_note', '')} {note}".strip()
+        if is_generic_sale and generic_barem_plan is not None:
+            for lot, planned_amount, _ratio, is_remainder in generic_barem_plan:
+                if remaining <= QUANTITY_EPSILON:
+                    break
+                consume_lot(lot, min(remaining, planned_amount, lot["remaining_quantity"]), barem_remainder=is_remainder)
+        elif is_generic_sale and generic_first_pass_targets:
+            for lot in candidates:
+                if remaining <= QUANTITY_EPSILON:
+                    break
+                code = lot.get("variant_code", "")
+                target = generic_first_pass_targets.get(code, 0)
+                already_used = sum(item["quantity"] for item in used if item.get("variant_code") == code)
+                amount = min(remaining, lot["remaining_quantity"], max(0, target - already_used))
+                consume_lot(lot, amount)
+        if generic_barem_plan is None:
+            for lot in candidates:
+                if remaining <= QUANTITY_EPSILON:
+                    break
+                if selected_generic_codes is not None and lot.get("variant_code") not in selected_generic_codes:
+                    continue
+                amount = min(remaining, lot["remaining_quantity"])
+                consume_lot(lot, amount)
+        if is_son_phuong and remaining > QUANTITY_EPSILON:
+            if not lot_pool:
+                shortage_reason = "Khong co ma mua vao dung nhom ong/hop va den/ma kem."
+            elif not available_lots:
+                shortage_reason = "Co ma mua vao dung nhom, nhung khong co ton hop le tai ngay ban."
+            elif is_generic_sale and generic_barem_plan is not None:
+                shortage_reason = generic_plan_note or "Khong ghep du theo barem/min-max."
+            else:
+                shortage_reason = "Khong ghep du so luong tu cac ma ung vien."
+            warnings.append(f"{sale['variant_code']}: chua ghep du {format_number(remaining)} kg; {shortage_reason}")
+        else:
+            shortage_reason = ""
+        if is_son_phuong and allow_negative_export and remaining > QUANTITY_EPSILON:
+            fallback_lots = sorted(lot_pool, key=lambda lot: priority_fn(lot, sale["unit_price"]))
+            fallback_lot = fallback_lots[0] if fallback_lots else {}
+            unit_cost = fallback_lot.get("unit_price")
+            used.append({
+                "variant_code": fallback_lot.get("variant_code", sale["variant_code"]),
+                "purchase_variant_code": fallback_lot.get("variant_code", sale["variant_code"]),
+                "purchase_source_variant_code": fallback_lot.get("source_variant_code", fallback_lot.get("variant_code", sale["variant_code"])),
+                "sale_variant_code": sale["variant_code"],
+                "sale_source_variant_code": sale.get("source_variant_code", sale["variant_code"]),
+                "ledger_variant_code": fallback_lot.get("variant_code", sale["variant_code"]) if is_son_phuong else sale["variant_code"],
+                "steel_profile_key": fallback_lot.get("steel_profile_key", ""),
+                "source": "Chua ghep du KHH" if is_son_phuong else "Xuất âm",
+                "invoice_no": fallback_lot.get("invoice_no", ""),
+                "invoice_date": fallback_lot.get("invoice_date", ""),
+                "row_number": fallback_lot.get("row_number", sale.get("row_number", 0)),
+                "quantity": remaining,
+                "unit_cost": unit_cost,
+                "profit_per_unit": (sale["unit_price"] - unit_cost) if sale["unit_price"] is not None and unit_cost is not None else None,
+                "profit_percent": lot_margin_percent(fallback_lot, sale["unit_price"]) if fallback_lot else None,
+                "summary_count": fallback_lot.get("summary_count", 1),
+                "negative_export": True,
+                "logic_note": shortage_reason if is_son_phuong else "",
+            })
+            remaining = 0
+        material_quantity = clean_quantity(required - remaining)
+        if candidates and any(lot["unit_price"] is None for lot in candidates):
+            warnings.append(f"{sale['variant_code']}: có tồn kho thiếu đơn giá vốn; ưu tiên lãi chỉ áp dụng được cho phần có đơn giá.")
+        if rejected:
+            warnings.append(f"{sale['variant_code']}: có {len(rejected)} lô kho không đạt khoảng lãi/lỗ chấp nhận.")
+        if generic_plan_note:
+            warnings.append(f"{sale['variant_code']}: {generic_plan_note}")
+        finished_variant_code = sale["variant_code"]
+        if remaining > QUANTITY_EPSILON:
+            fallback_lots = sorted(lot_pool, key=lambda lot: priority_fn(lot, sale["unit_price"]))
+            if fallback_lots:
+                finished_variant_code = fallback_lots[0].get("variant_code") or finished_variant_code
+        allocations.append({
+            **sale,
+            "material_quantity": material_quantity,
+            "finished_quantity": clean_quantity(remaining),
+            "finished_variant_code": finished_variant_code,
+            "sale_split_codes": ", ".join(dict.fromkeys(
+                item.get("ledger_variant_code") or item.get("purchase_variant_code") or item.get("variant_code", "")
+                for item in used
+            )),
+            "used": used,
+            "rejected": rejected,
+            "generic_plan_note": generic_plan_note,
+            "inventory_before": inventory_before,
+                "inventory_after": inventory_snapshot(
+                sorted(
+                    [lot for lot in lot_pool if lot_available_for_sale(lot, sale)],
+                    # Snapshot after sale must include any future invoice that was treated as
+                    # effective stock for this sale; otherwise the UI shows an artificial KTP/negative gap.
+                    key=lambda lot: priority_fn(lot, sale["unit_price"]),
+                ) + sorted(
+                    [lot for lot in lot_pool if future_lot_allowed_for_sale(lot, sale, policy)],
+                    key=lambda lot: priority_fn(lot, sale["unit_price"]),
+                ),
+                sale["unit_price"],
+            ),
+        })
+
+    stock_rows = []
+    grouped = defaultdict(lambda: {
+        "opening_quantity": 0.0,
+        "purchase_quantity": 0.0,
+        "allocated_quantity": 0.0,
+        "ending_quantity": 0.0,
+        "costs": set(),
+    })
+    for lot in lots:
+        item = grouped[lot["variant_code"]]
+        item["base_code"] = lot["base_code"]
+        item["variant_code"] = lot["variant_code"]
+        item["product_name"] = item.get("product_name") or lot["product_name"]
+        target = "opening_quantity" if lot["kind"] == "opening" else "purchase_quantity"
+        item[target] = clean_quantity(item[target] + lot["initial_quantity"])
+        item["allocated_quantity"] = clean_quantity(item["allocated_quantity"] + lot["allocated_quantity"])
+        item["ending_quantity"] = clean_quantity(item["ending_quantity"] + lot["remaining_quantity"])
+        if lot["unit_price"] is not None:
+            item["costs"].add(lot["unit_price"])
+    stocked_base_codes = set(by_code.keys())
+    stocked_variant_codes = set(by_variant.keys())
+    for sale in sales_lines:
+        if sale["suffix"] is not None:
+            has_stock = sale["variant_code"] in stocked_variant_codes
+        else:
+            has_stock = sale["base_code"] in stocked_base_codes
+        if has_stock:
+            continue
+        item = grouped[sale["variant_code"]]
+        item["base_code"] = sale["base_code"]
+        item["variant_code"] = sale["variant_code"]
+        item["product_name"] = item.get("product_name") or sale["product_name"]
+    for item in grouped.values():
+        item["unit_costs"] = ", ".join(format_number(value) for value in sorted(item.pop("costs")))
+        stock_rows.append(item)
+    stock_rows.sort(key=lambda item: (item["base_code"], item["variant_code"]))
+
+    summary = {
+        "opening_quantity": clean_quantity(sum(line["quantity"] for line in opening_lines)),
+        "purchase_quantity": clean_quantity(sum(line["quantity"] for line in purchase_lines)),
+        "sales_quantity": clean_quantity(sum(line["quantity"] for line in sales_lines)),
+        "material_quantity": clean_quantity(sum(line["material_quantity"] for line in allocations)),
+        "finished_quantity": clean_quantity(sum(line["finished_quantity"] for line in allocations)),
+        "negative_export_quantity": clean_quantity(sum(
+            used.get("quantity", 0)
+            for line in allocations
+            for used in line.get("used", [])
+            if used.get("negative_export")
+        )),
+    }
+    summary["material_percent"] = (
+        summary["material_quantity"] / summary["sales_quantity"] * 100
+        if summary["sales_quantity"] else 0
+    )
+    summary["range_rejected_lines"] = sum(1 for line in allocations if line["rejected"])
+    unique_missing_barem = list({item["variant_code"]: item for item in missing_barem_report}.values())
+    summary["missing_barem_count"] = len(unique_missing_barem)
+    summary["missing_barem_report"] = unique_missing_barem
+    future_purchase_reorder_report = build_future_purchase_reorder_report(allocations)
+    summary["future_purchase_reorder_count"] = len(future_purchase_reorder_report)
+    summary["future_purchase_reorder_quantity"] = clean_quantity(sum(
+        row.get("quantity", 0) or 0 for row in future_purchase_reorder_report
+    ))
+    summary["future_purchase_reorder_report"] = future_purchase_reorder_report
+    return allocations, stock_rows, summary, list(dict.fromkeys(warnings))
+
+
+def find_sale_only_codes(opening_lines, purchase_lines, sales_lines):
+    stocked_base_codes = {
+        line["base_code"]
+        for line in opening_lines + purchase_lines
+        if line["base_code"]
+    }
+    stocked_variant_codes = {
+        line["variant_code"]
+        for line in opening_lines + purchase_lines
+        if line["variant_code"]
+    }
+    grouped = {}
+    for line in sales_lines:
+        if line["suffix"] is not None:
+            has_stock = line["variant_code"] in stocked_variant_codes
+        else:
+            has_stock = line["base_code"] in stocked_base_codes
+        if has_stock:
+            continue
+        key = line["variant_code"]
+        item = grouped.setdefault(key, {
+            "variant_code": line["variant_code"],
+            "base_code": line["base_code"],
+            "product_name": line["product_name"],
+            "row_count": 0,
+            "quantity": 0.0,
+            "opening_quantity": 0.0,
+            "purchase_quantity": 0.0,
+            "rows": [],
+        })
+        item["row_count"] += 1
+        item["quantity"] = clean_quantity(item["quantity"] + line["quantity"])
+        item["rows"].append(line["row_number"])
+        if not item["product_name"]:
+            item["product_name"] = line["product_name"]
+    result = list(grouped.values())
+    result.sort(key=lambda item: (item["base_code"], item["variant_code"]))
+    return result
+
+
+def format_number(value):
+    if value is None:
+        return ""
+    if abs(value - round(value)) < 0.0000001:
+        return f"{int(round(value)):,}"
+    return f"{value:,.4f}".rstrip("0").rstrip(".")
+
+
+def clean_quantity(value):
+    if abs(value) < QUANTITY_EPSILON:
+        return 0.0
+    return round(value, 10)
+
+
+def detail_text(items):
+    result = []
+    for item in items:
+        detail = f"{item['variant_code']}: {format_number(item['quantity'])}"
+        source = item.get("source", "")
+        invoice_no = item.get("invoice_no", "")
+        if source:
+            detail += f" từ {source}"
+            if item.get("summary_count", 1) > 1:
+                detail += f" ({item['summary_count']} dòng mua, giá vốn TB)"
+            elif invoice_no:
+                detail += f" HD {invoice_no}"
+            else:
+                detail += f" dòng {item.get('row_number', '')}"
+        if item.get("profit_percent") is not None:
+            detail += f" ({format_number(item['profit_percent'])}% lãi/lỗ)"
+        result.append(detail)
+    return "; ".join(result)
+
+
+def inventory_text(items):
+    if not items:
+        return "Không có tồn kho liên quan"
+    result = []
+    for item in items:
+        detail = f"{item['variant_code']}: {format_number(item['quantity'])}"
+        detail += f" [{item['source']}"
+        if item.get("summary_count", 1) > 1:
+            detail += f" tổng hợp {item['summary_count']} dòng mua"
+        elif item.get("invoice_no"):
+            detail += f" HD {item['invoice_no']}"
+        else:
+            detail += f" dòng {item['row_number']}"
+        detail += "]"
+        if item.get("unit_cost") is not None:
+            detail += f", vốn {format_number(item['unit_cost'])}"
+        if item.get("profit_percent") is not None:
+            detail += f", lãi/lỗ {format_number(item['profit_percent'])}%"
+        result.append(detail)
+    return "; ".join(result)
+
+
+def rejected_text(items):
+    return "; ".join(f"{item['variant_code']}: {item['reason']}" for item in items)
+
+
+def build_future_purchase_reorder_report(allocations):
+    grouped = {}
+    for allocation in allocations or []:
+        for used in allocation.get("used", []):
+            if not used.get("future_purchase_reordered"):
+                continue
+            key = (
+                used.get("purchase_variant_code", ""),
+                used.get("invoice_no", ""),
+                used.get("original_purchase_date_iso") or used.get("invoice_date_iso", ""),
+                used.get("row_number", ""),
+                allocation.get("invoice_no", ""),
+                allocation.get("row_number", ""),
+            )
+            item = grouped.setdefault(key, {
+                "purchase_variant_code": used.get("purchase_variant_code", ""),
+                "sale_variant_code": allocation.get("variant_code", ""),
+                "product_name": allocation.get("product_name", ""),
+                "purchase_invoice_no": used.get("invoice_no", ""),
+                "purchase_original_date": used.get("original_purchase_date") or used.get("invoice_date", ""),
+                "purchase_original_date_iso": used.get("original_purchase_date_iso") or used.get("invoice_date_iso", ""),
+                "effective_date": used.get("effective_purchase_date") or allocation.get("invoice_date", ""),
+                "effective_date_iso": used.get("effective_purchase_date_iso") or allocation.get("invoice_date_iso", ""),
+                "sale_invoice_no": allocation.get("invoice_no", ""),
+                "sale_date": allocation.get("invoice_date", ""),
+                "sale_date_iso": allocation.get("invoice_date_iso", ""),
+                "sale_row_number": allocation.get("row_number", ""),
+                "purchase_row_number": used.get("row_number", ""),
+                "quantity": 0.0,
+                "unit_cost": used.get("unit_cost"),
+                "future_reorder_days": used.get("future_reorder_days"),
+                "logic_note": used.get("logic_note", ""),
+            })
+            item["quantity"] = clean_quantity(item["quantity"] + clean_quantity(used.get("quantity", 0)))
+    rows = list(grouped.values())
+    rows.sort(key=lambda row: (
+        row.get("effective_date_iso") or "",
+        row.get("sale_invoice_no") or "",
+        row.get("purchase_original_date_iso") or "",
+        row.get("purchase_variant_code") or "",
+    ))
+    return rows
+
+
+def replace_sheet(workbook, name):
+    if name in workbook.sheetnames:
+        del workbook[name]
+    return workbook.create_sheet(name)
+
+
+def style_report_sheet(sheet):
+    header_fill = PatternFill("solid", fgColor="E7F2FF")
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="12304B")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for idx, column in enumerate(sheet.columns, start=1):
+        values = [len(str(cell.value or "")) for cell in list(column)[:80]]
+        sheet.column_dimensions[get_column_letter(idx)].width = min(max(max(values, default=8) + 2, 12), 38)
+
+
+def write_table(sheet, headers, rows, progress_callback=None):
+    sheet.append(headers)
+    total = len(rows) if hasattr(rows, "__len__") else 0
+    for index, row in enumerate(rows, start=1):
+        sheet.append(row)
+        if progress_callback and (index == 1 or index == total or index % 250 == 0):
+            progress_callback(index, total)
+    style_report_sheet(sheet)
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '#,##0.####'
+                cell.alignment = Alignment(horizontal="right")
+
+
+PURCHASE_EXPORT_HEADERS = [
+    "MST",
+    "Tên công ty",
+    "Số HĐ",
+    "Ngày HĐ",
+    "Mã kho",
+    "Mã VT",
+    "Số lượng",
+    "Đơn giá mua",
+    "Thành tiền mua",
+]
+
+SALES_EXPORT_HEADERS = [
+    "Mã ST",
+    "Người mua hàng\n(ong_ba)",
+    "Số HD\n(so_ct)",
+    "Ngày HD",
+    "Số lượng:Q\n(so_luong)",
+    "Giá bán:P0\n(gia2)",
+    "Tiền bán:N0\n(tien2)",
+    "Giá vốn:P0\n(gia)",
+    "Tiền vốn:N0\n(tien)",
+    "Thuế suất\n(thue_suat)",
+    "Tiền thuế:N0\n(tien_thue)",
+    "Mã kho\n(ma_kho)",
+    "Mã vật tư\n(ma_vt)",
+]
+
+
+def line_total_amount(line):
+    amount = line.get("line_amount")
+    if amount is not None:
+        return amount
+    unit_price = line.get("unit_price")
+    quantity = line.get("quantity")
+    if unit_price is not None and quantity is not None:
+        return unit_price * quantity
+    return None
+
+
+def line_unit_price(line):
+    if line.get("unit_price") is not None:
+        return line["unit_price"]
+    amount = line_total_amount(line)
+    quantity = line.get("quantity")
+    if amount is not None and quantity:
+        return amount / quantity
+    return None
+
+
+def amount_for_quantity(line, quantity):
+    unit_price = line_unit_price(line)
+    if unit_price is not None:
+        return unit_price * quantity
+    total_amount = line_total_amount(line)
+    total_quantity = line.get("quantity")
+    if total_amount is not None and total_quantity:
+        return total_amount * quantity / total_quantity
+    return None
+
+
+def iso_in_sales_range(lines):
+    values = sorted({line.get("invoice_date_iso", "") for line in lines if line.get("invoice_date_iso")})
+    if not values:
+        return {"from": "", "to": "", "from_display": "", "to_display": ""}
+    return {
+        "from": values[0],
+        "to": values[-1],
+        "from_display": date_display(values[0]),
+        "to_display": date_display(values[-1]),
+    }
+
+
+def ledger_sort_key(row):
+    row_date = row.get("date_iso") or "0000-00-00"
+    type_order = {"opening": 0, "purchase": 1, "purchase_future_reorder": 1, "finished_receipt": 1, "sale": 2}
+    return (row_date, type_order.get(row.get("type"), 9), row.get("sequence", 0))
+
+
+def combined_ledger_sort_key(row):
+    row_date = row.get("date_iso") or "0000-00-00"
+    type_order = {"opening": 0, "purchase": 1, "purchase_future_reorder": 1, "finished_receipt": 1, "sale": 2}
+    warehouse_order = {"KHH": 0, "KTP": 1}
+    return (
+        row_date,
+        row.get("doc_no", ""),
+        type_order.get(row.get("type"), 9),
+        warehouse_order.get(row.get("warehouse_code"), 9),
+        row.get("sequence", 0),
+    )
+
+
+def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lines=None, company_profile="yen_thanh"):
+    warehouses = {
+        "KHH": {
+            "warehouse_code": "KHH",
+            "warehouse_name": "KHO VẬT TƯ, HÀNG HÓA",
+            "account": "156",
+            "groups": {},
+        },
+        "KTP": {
+            "warehouse_code": "KTP",
+            "warehouse_name": "KHO THÀNH PHẨM",
+            "account": "155",
+            "groups": {},
+        },
+    }
+    if company_profile == "son_phuong":
+        warehouses.pop("KTP", None)
+    def group_for(warehouse_code, code, product_name="", unit_name=""):
+        groups = warehouses[warehouse_code]["groups"]
+        item = groups.setdefault(code, {
+            "variant_code": code,
+            "product_name": product_name,
+            "unit_name": unit_name,
+            "account": warehouses[warehouse_code]["account"],
+            "rows": [],
+        })
+        if not item.get("product_name") and product_name:
+            item["product_name"] = product_name
+        if not item.get("unit_name") and unit_name:
+            item["unit_name"] = unit_name
+        return item
+
+    def ktp_logic_note(allocation):
+        quantity = clean_quantity(allocation.get("quantity", 0))
+        material_quantity = clean_quantity(allocation.get("material_quantity", 0))
+        finished_quantity = clean_quantity(allocation.get("finished_quantity", 0))
+        parts = [
+            f"KHH chi lay {format_number(material_quantity)}/{format_number(quantity)}; KTP lay {format_number(finished_quantity)}."
+        ]
+        rejected = allocation.get("rejected", [])
+        if rejected:
+            details = []
+            for item in rejected[:5]:
+                margin = item.get("margin_percent")
+                margin_text = f", lai/lo {format_number(margin)}%" if margin is not None else ""
+                details.append(f"{item.get('variant_code', '')}: {item.get('reason', '')}{margin_text}")
+            if len(rejected) > 5:
+                details.append(f"+{len(rejected) - 5} lo khac")
+            parts.append("Lo KHH bi loai: " + "; ".join(details))
+        elif material_quantity <= QUANTITY_EPSILON:
+            parts.append("Khong co ton KHH kha dung theo ngay hoa don.")
+        else:
+            parts.append("KHH khong du so luong theo ngay hoa don.")
+        return " ".join(parts)
+
+    def ktp_margin_percent(allocation):
+        rejected = [
+            item.get("margin_percent")
+            for item in allocation.get("rejected", [])
+            if item.get("margin_percent") is not None
+        ]
+        if not rejected:
+            return ""
+        return max(rejected, key=lambda value: abs(value))
+
+    future_reorder_by_purchase = {}
+    for allocation in allocations or []:
+        for used in allocation.get("used", []):
+            if not used.get("future_purchase_reordered"):
+                continue
+            key = (used.get("purchase_variant_code", ""), used.get("original_purchase_date_iso") or used.get("invoice_date_iso", ""))
+            sale_sequence = allocation.get("row_number", 0) * 1000 - 1
+            candidate = {
+                "effective_date": used.get("effective_purchase_date") or allocation.get("invoice_date", ""),
+                "effective_date_iso": used.get("effective_purchase_date_iso") or allocation.get("invoice_date_iso", ""),
+                "original_date": used.get("original_purchase_date") or used.get("invoice_date", ""),
+                "original_date_iso": used.get("original_purchase_date_iso") or used.get("invoice_date_iso", ""),
+                "sale_invoice_no": allocation.get("invoice_no", ""),
+                "sale_date": allocation.get("invoice_date", ""),
+                "sale_row_number": allocation.get("row_number", ""),
+                "days": used.get("future_reorder_days"),
+                "sequence": sale_sequence,
+            }
+            current = future_reorder_by_purchase.get(key)
+            if not current or (candidate["effective_date_iso"], candidate["sequence"]) < (current["effective_date_iso"], current["sequence"]):
+                future_reorder_by_purchase[key] = candidate
+
+    for line in opening_lines or []:
+        unit_price = line_unit_price(line)
+        quantity = clean_quantity(line.get("quantity", 0))
+        if quantity <= QUANTITY_EPSILON:
+            continue
+        amount = unit_price * quantity if unit_price is not None else 0
+        group_for("KHH", line["variant_code"], line.get("product_name", ""), line.get("unit_name", ""))["rows"].append({
+            "type": "opening",
+            "date_iso": "",
+            "date": "",
+            "doc_no": line.get("invoice_no", ""),
+            "variant_code": line.get("variant_code", ""),
+            "customer": line.get("party_name", ""),
+            "description": "Tồn đầu kỳ",
+            "account": "",
+            "unit_price": unit_price,
+            "sale_unit_price": "",
+            "sale_amount": "",
+            "qty_in": quantity,
+            "amount_in": amount,
+            "qty_out": 0,
+            "amount_out": 0,
+            "sequence": line.get("row_number", 0),
+        })
+
+    for line in purchase_lines or []:
+        quantity = clean_quantity(line.get("quantity", 0))
+        if quantity <= QUANTITY_EPSILON:
+            continue
+        amount = line_total_amount(line)
+        unit_price = line_unit_price(line)
+        if amount is None and unit_price is not None:
+            amount = unit_price * quantity
+        future_reorder = future_reorder_by_purchase.get((line.get("variant_code", ""), line.get("invoice_date_iso", "")))
+        row_type = "purchase_future_reorder" if future_reorder else "purchase"
+        row_date_iso = future_reorder.get("effective_date_iso") if future_reorder else line.get("invoice_date_iso", "")
+        row_date = future_reorder.get("effective_date") if future_reorder else line.get("invoice_date", "")
+        sequence = future_reorder.get("sequence") if future_reorder else line.get("row_number", 0)
+        logic_note = ""
+        if future_reorder:
+            logic_note = (
+                f"HD mua vao goc ngay {future_reorder.get('original_date', '')} duoc dua len truoc "
+                f"HD ban ra {future_reorder.get('sale_invoice_no', '')} ngay {future_reorder.get('sale_date', '')} "
+                f"trong {future_reorder.get('days', '')} ngay."
+            )
+        purchase_description = f"Mua hang nhap kho HD{line.get('invoice_no', '')}".strip()
+        if future_reorder:
+            purchase_description = f"{purchase_description} (dua len truoc, ngay goc {future_reorder.get('original_date', '')})"
+        group_for("KHH", line["variant_code"], line.get("product_name", ""), line.get("unit_name", ""))["rows"].append({
+            "type": row_type,
+            "date_iso": row_date_iso,
+            "date": row_date,
+            "doc_no": line.get("invoice_no", ""),
+            "variant_code": line.get("variant_code", ""),
+            "customer": line.get("party_name", ""),
+            "description": f"Mua hàng nhập kho HD{line.get('invoice_no', '')}".strip(),
+            "account": "331",
+            "unit_price": unit_price,
+            "sale_unit_price": "",
+            "sale_amount": "",
+            "qty_in": quantity,
+            "amount_in": amount or 0,
+            "qty_out": 0,
+            "amount_out": 0,
+            "future_purchase_reordered": bool(future_reorder),
+            "original_date": future_reorder.get("original_date", "") if future_reorder else "",
+            "original_date_iso": future_reorder.get("original_date_iso", "") if future_reorder else "",
+            "logic_note": logic_note,
+            "sequence": sequence,
+        })
+
+    ktp_balances = defaultdict(float)
+    for allocation in allocations or []:
+        for index, used in enumerate(allocation.get("used", [])):
+            quantity = clean_quantity(used.get("quantity", 0))
+            if quantity <= QUANTITY_EPSILON:
+                continue
+            code = used.get("ledger_variant_code") or used.get("sale_variant_code") or allocation.get("variant_code", "")
+            detail_code = used.get("purchase_variant_code") or used.get("variant_code") or code
+            unit_price = used.get("unit_cost")
+            amount = unit_price * quantity if unit_price is not None else 0
+            sale_amount = amount_for_quantity(allocation, quantity) or 0
+            group_for("KHH", code, allocation.get("product_name", ""), allocation.get("unit_name", ""))["rows"].append({
+                "type": "sale",
+                "date_iso": allocation.get("invoice_date_iso", ""),
+                "date": allocation.get("invoice_date", ""),
+                "doc_no": allocation.get("invoice_no", ""),
+                "variant_code": detail_code,
+                "customer": allocation.get("party_name", ""),
+                "description": "Xuất bán cho Khách (phần kho hàng hóa)",
+                "account": "6321",
+                "unit_price": unit_price,
+                "sale_unit_price": line_unit_price(allocation),
+                "sale_amount": sale_amount,
+                "qty_in": 0,
+                "amount_in": 0,
+                "qty_out": quantity,
+                "amount_out": amount,
+                "logic_note": used.get("logic_note", ""),
+                "future_purchase_reordered": bool(used.get("future_purchase_reordered")),
+                "sequence": allocation.get("row_number", 0) * 1000 + index,
+            })
+        finished_quantity = clean_quantity(allocation.get("finished_quantity", 0))
+        if finished_quantity > QUANTITY_EPSILON and "KTP" in warehouses:
+            code = allocation.get("finished_variant_code") or allocation.get("variant_code", "")
+            unit_price = 0
+            logic_note = ktp_logic_note(allocation)
+            group = group_for("KTP", code, allocation.get("product_name", ""), allocation.get("unit_name", ""))
+            if False and ktp_balances[code] + QUANTITY_EPSILON < finished_quantity:
+                missing_quantity = clean_quantity(finished_quantity - ktp_balances[code])
+                missing_amount = 0
+                group["rows"].append({
+                    "type": "finished_receipt",
+                    "date_iso": allocation.get("invoice_date_iso", ""),
+                    "date": allocation.get("invoice_date", ""),
+                    "doc_no": allocation.get("invoice_no", ""),
+                    "variant_code": code,
+                    "customer": "",
+                    "description": f"Nhập kho thành phẩm đủ xuất HD{allocation.get('invoice_no', '')}".strip(),
+                    "account": "154",
+                    "unit_price": unit_price,
+                    "sale_unit_price": "",
+                    "sale_amount": "",
+                    "qty_in": missing_quantity,
+                    "amount_in": missing_amount,
+                    "qty_out": 0,
+                    "amount_out": 0,
+                    "logic_note": logic_note,
+                    "sequence": allocation.get("row_number", 0) * 1000 + 998,
+                })
+                ktp_balances[code] = clean_quantity(ktp_balances[code] + missing_quantity)
+            amount = 0
+            sale_amount = amount_for_quantity(allocation, finished_quantity) or 0
+            group["rows"].append({
+                "type": "sale",
+                "date_iso": allocation.get("invoice_date_iso", ""),
+                "date": allocation.get("invoice_date", ""),
+                "doc_no": allocation.get("invoice_no", ""),
+                "variant_code": code,
+                "customer": allocation.get("party_name", ""),
+                "description": "Xuất bán cho Khách (phần kho thành phẩm)",
+                "account": "6321",
+                "unit_price": unit_price,
+                "sale_unit_price": line_unit_price(allocation),
+                "sale_amount": sale_amount,
+                "qty_in": 0,
+                "amount_in": 0,
+                "qty_out": finished_quantity,
+                "amount_out": amount,
+                "logic_note": logic_note,
+                "margin_percent": ktp_margin_percent(allocation),
+                "sequence": allocation.get("row_number", 0) * 1000 + 999,
+            })
+            ktp_balances[code] = clean_quantity(ktp_balances[code] - finished_quantity)
+
+    result = []
+    for warehouse in warehouses.values():
+        groups = []
+        for group in warehouse["groups"].values():
+            group["rows"].sort(key=ledger_sort_key)
+            if not group["unit_name"]:
+                group["unit_name"] = "-"
+            groups.append(group)
+        groups.sort(key=lambda item: (item["variant_code"], item.get("product_name", "")))
+        result.append({
+            "warehouse_code": warehouse["warehouse_code"],
+            "warehouse_name": warehouse["warehouse_name"],
+            "account": warehouse["account"],
+            "groups": groups,
+        })
+    return {
+        "warehouses": result,
+        "warehouse_code": "KHH",
+        "warehouse_name": "KHO VẬT TƯ, HÀNG HÓA",
+        "account": "156",
+        "groups": result[0]["groups"],
+    }
+
+
+def average_costs_by_variant(purchase_lines, sales_lines):
+    totals = defaultdict(lambda: {"amount": 0.0, "quantity": 0.0})
+    for line in (purchase_lines or []) + (sales_lines or []):
+        quantity = line.get("quantity")
+        amount = line_total_amount(line)
+        if not line.get("variant_code") or quantity is None or quantity <= QUANTITY_EPSILON or amount is None:
+            continue
+        item = totals[line["variant_code"]]
+        item["amount"] += amount
+        item["quantity"] += quantity
+    return {
+        code: item["amount"] / item["quantity"]
+        for code, item in totals.items()
+        if item["quantity"] > QUANTITY_EPSILON
+    }
+
+
+def average_cost_by_variant_until(lines, variant_code, date_iso):
+    total_amount = 0.0
+    total_quantity = 0.0
+    for line in lines or []:
+        if line.get("variant_code") != variant_code:
+            continue
+        line_date = line.get("invoice_date_iso")
+        if date_iso and line_date and line_date > date_iso:
+            continue
+        quantity = line.get("quantity")
+        amount = line_total_amount(line)
+        if quantity is None or quantity <= QUANTITY_EPSILON or amount is None:
+            continue
+        total_amount += amount
+        total_quantity += quantity
+    if total_quantity > QUANTITY_EPSILON:
+        return total_amount / total_quantity
+    return None
+
+
+def build_purchase_export_rows(purchase_lines):
+    rows = []
+    for line in purchase_lines or []:
+        quantity = line.get("quantity")
+        if quantity is None or quantity <= QUANTITY_EPSILON:
+            continue
+        unit_price = line_unit_price(line)
+        amount = line_total_amount(line)
+        rows.append([
+            line.get("party_tax_code", ""),
+            line.get("party_name", ""),
+            line.get("invoice_no", ""),
+            line.get("invoice_date", ""),
+            "KHH",
+            line.get("variant_code", ""),
+            clean_quantity(quantity),
+            unit_price,
+            amount,
+        ])
+    return rows
+
+
+def sale_tax_rate(line):
+    rate = line.get("tax_rate_percent")
+    if rate is not None:
+        return rate
+    amount = line_total_amount(line)
+    tax_amount = line.get("tax_amount")
+    if amount:
+        return tax_amount / amount * 100 if tax_amount is not None else 0
+    return 0
+
+
+def build_sales_export_row(line, quantity, warehouse_code, variant_code, average_costs, fallback_cost=None):
+    quantity = clean_quantity(quantity)
+    sale_price = line_unit_price(line)
+    sale_amount = amount_for_quantity(line, quantity)
+    cost = first_present(fallback_cost, average_costs.get(variant_code), average_costs.get(line.get("variant_code")))
+    cost_amount = cost * quantity if cost is not None else None
+    rate = sale_tax_rate(line)
+    tax_amount = sale_amount * rate / 100 if sale_amount is not None else None
+    return [
+        line.get("party_tax_code", ""),
+        line.get("party_name", ""),
+        line.get("invoice_no", ""),
+        line.get("invoice_date", ""),
+        quantity,
+        sale_price,
+        sale_amount,
+        cost,
+        cost_amount,
+        rate,
+        tax_amount,
+        warehouse_code,
+        variant_code,
+    ]
+
+
+def build_sales_export_rows(allocations, purchase_lines=None, sales_lines=None):
+    average_costs = average_costs_by_variant(purchase_lines, [])
+    rows = []
+    for line in allocations:
+        for used in line.get("used", []):
+            quantity = used.get("quantity", 0)
+            if quantity <= QUANTITY_EPSILON:
+                continue
+            rows.append(build_sales_export_row(
+                line,
+                quantity,
+                "KHH",
+                used.get("ledger_variant_code") or used.get("purchase_variant_code") or used.get("variant_code") or line.get("variant_code", ""),
+                average_costs,
+                used.get("unit_cost"),
+            ))
+        finished_quantity = line.get("finished_quantity", 0)
+        if finished_quantity > QUANTITY_EPSILON:
+            rows.append(build_sales_export_row(
+                line,
+                finished_quantity,
+                "KTP",
+                line.get("finished_variant_code") or line.get("variant_code", ""),
+                average_costs,
+                0,
+            ))
+    return rows
+
+
+def build_sales_report_row(line, quantity, warehouse_code, variant_code, average_costs, fallback_cost=None):
+    quantity = clean_quantity(quantity)
+    sale_price = line_unit_price(line)
+    sale_amount = amount_for_quantity(line, quantity) or 0
+    cost = first_present(fallback_cost, average_costs.get(variant_code), average_costs.get(line.get("variant_code")))
+    cost_amount = cost * quantity if cost is not None else 0
+    profit_amount = sale_amount - cost_amount
+    rate = sale_tax_rate(line)
+    tax_amount = sale_amount * rate / 100
+    return {
+        "tax_code": line.get("party_tax_code", ""),
+        "customer": line.get("party_name", ""),
+        "invoice_no": line.get("invoice_no", ""),
+        "invoice_date": line.get("invoice_date", ""),
+        "invoice_date_iso": line.get("invoice_date_iso", ""),
+        "warehouse_code": warehouse_code,
+        "variant_code": variant_code,
+        "product_name": line.get("product_name", ""),
+        "unit_name": line.get("unit_name", ""),
+        "quantity": quantity,
+        "sale_price": sale_price or 0,
+        "sale_amount": sale_amount,
+        "cost_price": cost or 0,
+        "cost_amount": cost_amount,
+        "profit_amount": profit_amount,
+        "tax_rate": rate,
+        "tax_amount": tax_amount,
+        "total_amount": sale_amount + tax_amount,
+        "row_number": line.get("row_number", 0),
+    }
+
+
+def build_sales_report_rows(allocations, purchase_lines=None, sales_lines=None):
+    average_costs = average_costs_by_variant(purchase_lines, [])
+    rows = []
+    for line in allocations:
+        for used in line.get("used", []):
+            quantity = used.get("quantity", 0)
+            if quantity <= QUANTITY_EPSILON:
+                continue
+            rows.append(build_sales_report_row(
+                line,
+                quantity,
+                "KHH",
+                used.get("ledger_variant_code") or used.get("purchase_variant_code") or used.get("variant_code") or line.get("variant_code", ""),
+                average_costs,
+                used.get("unit_cost"),
+            ))
+        finished_quantity = line.get("finished_quantity", 0)
+        if finished_quantity > QUANTITY_EPSILON:
+            rows.append(build_sales_report_row(
+                line,
+                finished_quantity,
+                "KTP",
+                line.get("finished_variant_code") or line.get("variant_code", ""),
+                average_costs,
+                0,
+            ))
+    rows.sort(key=lambda row: (row.get("invoice_date_iso") or "", text(row.get("invoice_no")), row.get("row_number", 0), row.get("variant_code", "")))
+    return rows
+
+
+def format_export_sheet(sheet, quantity_columns, money_columns, percent_columns=()):
+    for row in sheet.iter_rows(min_row=2):
+        for column in quantity_columns:
+            row[column - 1].number_format = '#,##0.####'
+        for column in money_columns:
+            row[column - 1].number_format = '#,##0'
+        for column in percent_columns:
+            row[column - 1].number_format = '+0.####;-0.####;0'
+
+
+def fill_ledger_activity_rows(sheet, in_qty_column, out_qty_column, warehouse_column=None, default_warehouse=""):
+    fills = {
+        ("KHH", "in"): PatternFill("solid", fgColor="E6F1FF"),
+        ("KHH", "out"): PatternFill("solid", fgColor="FFF0D7"),
+        ("KTP", "in"): PatternFill("solid", fgColor="E9FBFF"),
+        ("KTP", "out"): PatternFill("solid", fgColor="FFE7E1"),
+        ("", "in"): PatternFill("solid", fgColor="EAF3FF"),
+        ("", "out"): PatternFill("solid", fgColor="FFF1DF"),
+        ("", "mixed"): PatternFill("solid", fgColor="F3ECFF"),
+    }
+    for row in sheet.iter_rows(min_row=2):
+        in_qty = row[in_qty_column - 1].value or 0
+        out_qty = row[out_qty_column - 1].value or 0
+        if not isinstance(in_qty, (int, float)) and not isinstance(out_qty, (int, float)):
+            continue
+        warehouse_code = default_warehouse
+        if warehouse_column:
+            warehouse_code = text(row[warehouse_column - 1].value).upper() or warehouse_code
+        warehouse_code = warehouse_code if warehouse_code in {"KHH", "KTP"} else ""
+        fill = None
+        if isinstance(in_qty, (int, float)) and abs(in_qty) > QUANTITY_EPSILON:
+            fill = fills.get((warehouse_code, "in"), fills[("", "in")])
+        if isinstance(out_qty, (int, float)) and abs(out_qty) > QUANTITY_EPSILON:
+            fill = fills[("", "mixed")] if fill else fills.get((warehouse_code, "out"), fills[("", "out")])
+        if fill:
+            for cell in row:
+                cell.fill = fill
+
+
+def fill_future_reorder_rows(sheet):
+    future_fill = PatternFill("solid", fgColor="F3E8FF")
+    for row in sheet.iter_rows(min_row=2):
+        row_text = " ".join(text(cell.value).lower() for cell in row)
+        if "dua len truoc" in row_text or "đưa lên trước" in row_text:
+            for cell in row:
+                cell.fill = future_fill
+
+
+LEDGER_EXPORT_HEADERS = [
+    "Ngày",
+    "Số",
+    "Khách hàng",
+    "Diễn giải",
+    "TK đối ứng",
+    "Đơn giá",
+    "Nhập số lượng",
+    "Nhập thành tiền",
+    "Xuất số lượng",
+    "Xuất thành tiền",
+    "Ton so luong",
+    "Ton thanh tien",
+]
+
+
+def ledger_export_rows(warehouse):
+    rows = []
+    for group in warehouse.get("groups", []):
+        rows.append([
+            f"KHO: {warehouse.get('warehouse_code', '')} - {warehouse.get('warehouse_name', '')}",
+            "", "", "", "", "", "", "", "", "", "", "",
+        ])
+        rows.append([
+            f"Vật tư: {group.get('variant_code', '')} - {group.get('product_name', '')}, Đvt: {group.get('unit_name', '-')}, TK: {group.get('account') or warehouse.get('account') or ''}",
+            "", "", "", "", "", "", "", "", "", "", "",
+        ])
+        opening_rows = [row for row in group.get("rows", []) if row.get("type") == "opening"]
+        period_rows = [row for row in group.get("rows", []) if row.get("type") != "opening"]
+        opening_qty = sum(row.get("qty_in", 0) or 0 for row in opening_rows) - sum(row.get("qty_out", 0) or 0 for row in opening_rows)
+        opening_amount = sum(row.get("amount_in", 0) or 0 for row in opening_rows) - sum(row.get("amount_out", 0) or 0 for row in opening_rows)
+        in_qty = sum(row.get("qty_in", 0) or 0 for row in period_rows)
+        in_amount = sum(row.get("amount_in", 0) or 0 for row in period_rows)
+        out_qty = sum(row.get("qty_out", 0) or 0 for row in period_rows)
+        out_amount = sum(row.get("amount_out", 0) or 0 for row in period_rows)
+        running_qty = opening_qty
+        running_amount = opening_amount
+        summary_rows = [
+            ["", "", "", "Tồn đầu kỳ", "", "", opening_qty, opening_amount, "", "", opening_qty, opening_amount],
+            ["", "", "", "Nhập trong kỳ", "", "", in_qty, in_amount, "", "", "", ""],
+            ["", "", "", "Xuất trong kỳ", "", "", "", "", out_qty, out_amount, "", ""],
+            ["", "", "", "Tồn cuối kỳ", "", "", opening_qty + in_qty - out_qty, opening_amount + in_amount - out_amount, "", "", opening_qty + in_qty - out_qty, opening_amount + in_amount - out_amount],
+        ]
+        rows.extend(summary_rows)
+        for row in period_rows:
+            running_qty += (row.get("qty_in", 0) or 0) - (row.get("qty_out", 0) or 0)
+            running_amount += (row.get("amount_in", 0) or 0) - (row.get("amount_out", 0) or 0)
+            description = row.get("description", "")
+            if row.get("future_purchase_reordered") and row.get("logic_note"):
+                description = f"{description} - {row.get('logic_note')}"
+            rows.append([
+                row.get("date", "") or date_display(row.get("date_iso", "")),
+                row.get("doc_no", ""),
+                row.get("customer", ""),
+                description,
+                row.get("account", ""),
+                row.get("unit_price", ""),
+                row.get("qty_in", 0),
+                row.get("amount_in", 0),
+                row.get("qty_out", 0),
+                row.get("amount_out", 0),
+                running_qty,
+                running_amount,
+            ])
+    return rows
+
+
+def write_ledger_export_sheet(workbook, warehouse, progress_callback=None):
+    sheet_name = f"SoChiTiet{warehouse.get('warehouse_code', '')}"[:31]
+    sheet = replace_sheet(workbook, sheet_name)
+    rows = ledger_export_rows(warehouse)
+    write_table(sheet, LEDGER_EXPORT_HEADERS, rows, progress_callback=progress_callback)
+    for row in sheet.iter_rows(min_row=2):
+        first_value = text(row[0].value)
+        if first_value.startswith("KHO:") or first_value.startswith("Vật tư:"):
+            for cell in row:
+                cell.font = Font(bold=True)
+            row[0].alignment = Alignment(wrap_text=True)
+        if text(row[3].value) in {"Tồn đầu kỳ", "Nhập trong kỳ", "Xuất trong kỳ", "Tồn cuối kỳ"}:
+            for cell in row:
+                cell.font = Font(bold=True)
+    format_export_sheet(sheet, quantity_columns=(7, 9, 11), money_columns=(8, 10, 12))
+    fill_ledger_activity_rows(sheet, 7, 9, default_warehouse=warehouse.get("warehouse_code", ""))
+    fill_future_reorder_rows(sheet)
+    sheet.column_dimensions["A"].width = 16
+    sheet.column_dimensions["B"].width = 16
+    sheet.column_dimensions["C"].width = 34
+    sheet.column_dimensions["D"].width = 44
+    sheet.column_dimensions["E"].width = 12
+    sheet.column_dimensions["F"].width = 14
+    sheet.column_dimensions["K"].width = 14
+    sheet.column_dimensions["L"].width = 16
+    return len(rows)
+
+
+COMBINED_LEDGER_HEADERS = [
+    "Ngày",
+    "Số",
+    "Khách hàng",
+    "Diễn giải",
+    "TK đối ứng",
+    "Mã kho",
+    "Mã VT chi tiết",
+    "Đơn giá",
+    "Nhập số lượng",
+    "Nhập thành tiền",
+    "Xuất số lượng",
+    "Xuất thành tiền",
+    "Đơn Giá bán",
+    "TT bán",
+    "Tỉ lệ lãi/lỗ",
+    "Ton so luong",
+    "Ton thanh tien",
+    "Giai thich logic",
+]
+
+
+def combined_ledger_sections(ledger):
+    sections = []
+    grouped = {}
+    order = []
+    for warehouse in (ledger or {}).get("warehouses", []):
+        for group in warehouse.get("groups", []):
+            _, base_code, _ = code_parts(group.get("variant_code", ""))
+            key = base_code
+            if key not in grouped:
+                grouped[key] = {
+                    "warehouse": {"warehouse_code": "KHH+KTP", "warehouse_name": "KHO HANG HOA + KHO THANH PHAM", "account": ""},
+                    "base_code": base_code,
+                    "product_name": group.get("product_name", ""),
+                    "unit_name": group.get("unit_name", ""),
+                    "account": "",
+                    "detail_codes": [],
+                    "rows": [],
+                }
+                order.append(key)
+            section = grouped[key]
+            if not section.get("product_name") and group.get("product_name"):
+                section["product_name"] = group.get("product_name", "")
+            if not section.get("unit_name") and group.get("unit_name"):
+                section["unit_name"] = group.get("unit_name", "")
+            if group.get("variant_code") not in section["detail_codes"]:
+                section["detail_codes"].append(group.get("variant_code", ""))
+            for row in group.get("rows", []):
+                section["rows"].append({**row, "warehouse_code": warehouse.get("warehouse_code", "")})
+                detail_code = row.get("variant_code")
+                if detail_code and detail_code not in section["detail_codes"]:
+                    section["detail_codes"].append(detail_code)
+    for key in order:
+        section = grouped[key]
+        section["rows"].sort(key=combined_ledger_sort_key)
+        section["detail_codes"].sort()
+        sections.append(section)
+    return sections
+
+
+def combined_ledger_export_rows(ledger):
+    rows = []
+    for section in combined_ledger_sections(ledger):
+        warehouse = section["warehouse"]
+        opening_rows = [row for row in section["rows"] if row.get("type") == "opening"]
+        period_rows = [row for row in section["rows"] if row.get("type") != "opening"]
+        opening_qty = sum(row.get("qty_in", 0) or 0 for row in opening_rows) - sum(row.get("qty_out", 0) or 0 for row in opening_rows)
+        opening_amount = sum(row.get("amount_in", 0) or 0 for row in opening_rows) - sum(row.get("amount_out", 0) or 0 for row in opening_rows)
+        in_qty = sum(row.get("qty_in", 0) or 0 for row in period_rows)
+        in_amount = sum(row.get("amount_in", 0) or 0 for row in period_rows)
+        out_qty = sum(row.get("qty_out", 0) or 0 for row in period_rows)
+        out_amount = sum(row.get("amount_out", 0) or 0 for row in period_rows)
+        running_balances = defaultdict(lambda: {"qty": 0.0, "amount": 0.0})
+        for row in opening_rows:
+            balance_key = row.get("warehouse_code") or ""
+            running_balances[balance_key]["qty"] += (row.get("qty_in", 0) or 0) - (row.get("qty_out", 0) or 0)
+            running_balances[balance_key]["amount"] += (row.get("amount_in", 0) or 0) - (row.get("amount_out", 0) or 0)
+        rows.append([
+            f"KHO: {warehouse.get('warehouse_code', '')} - {warehouse.get('warehouse_name', '')}",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        ])
+        rows.append([
+            f"Vật tư: {section['base_code']} - {section.get('product_name', '')}, Đvt: {section.get('unit_name') or '-'}, TK: {section.get('account') or warehouse.get('account') or ''}",
+            "Ghi chú lấy mã VT chung không tách .001/.002",
+            "", "", "", "", ", ".join(section["detail_codes"]), "", "", "", "", "", "", "", "",
+        ])
+        rows.extend([
+            ["", "", "", "Tồn đầu kỳ", "", "", "", "", opening_qty, opening_amount, "", "", "", "", "", opening_qty, opening_amount, ""],
+            ["", "", "", "Nhập trong kỳ", "", "", "", "", in_qty, in_amount, "", "", "", "", "", "", "", ""],
+            ["", "", "", "Xuất trong kỳ", "", "", "", "", "", "", out_qty, out_amount, "", "", "", "", "", ""],
+            ["", "", "", "Tồn cuối kỳ", "", "", "", "", opening_qty + in_qty - out_qty, opening_amount + in_amount - out_amount, "", "", "", "", "", opening_qty + in_qty - out_qty, opening_amount + in_amount - out_amount, ""],
+        ])
+        for row in period_rows:
+            sale_amount = row.get("sale_amount", "")
+            cost_amount = row.get("amount_out", 0) or 0
+            margin_percent = ""
+            if row.get("margin_percent") not in ("", None):
+                margin_percent = row.get("margin_percent")
+            elif row.get("type") == "sale" and row.get("warehouse_code") != "KTP" and sale_amount not in ("", None) and sale_amount:
+                margin_percent = (sale_amount - cost_amount) / sale_amount * 100
+            balance_key = row.get("warehouse_code") or ""
+            running_balances[balance_key]["qty"] += (row.get("qty_in", 0) or 0) - (row.get("qty_out", 0) or 0)
+            running_balances[balance_key]["amount"] += (row.get("amount_in", 0) or 0) - (row.get("amount_out", 0) or 0)
+            rows.append([
+                row.get("date", "") or date_display(row.get("date_iso", "")),
+                row.get("doc_no", ""),
+                row.get("customer", ""),
+                row.get("description", ""),
+                row.get("account", ""),
+                row.get("warehouse_code") or warehouse.get("warehouse_code", ""),
+                row.get("variant_code", ""),
+                row.get("unit_price", ""),
+                row.get("qty_in", 0),
+                row.get("amount_in", 0),
+                row.get("qty_out", 0),
+                row.get("amount_out", 0),
+                row.get("sale_unit_price", ""),
+                sale_amount,
+                margin_percent,
+                running_balances[balance_key]["qty"],
+                running_balances[balance_key]["amount"],
+                row.get("logic_note", ""),
+            ])
+    return rows
+
+
+def write_combined_ledger_sheet(workbook, ledger, progress_callback=None):
+    if len((ledger or {}).get("warehouses", [])) <= 1:
+        return
+    sheet = replace_sheet(workbook, "SoChiTietHH_TP")
+    rows = combined_ledger_export_rows(ledger)
+    write_table(sheet, COMBINED_LEDGER_HEADERS, rows, progress_callback=progress_callback)
+    sheet.auto_filter.ref = f"A1:R{max(1, sheet.max_row)}"
+    sheet.freeze_panes = "A2"
+    for row in sheet.iter_rows(min_row=2):
+        first_value = text(row[0].value)
+        if first_value.startswith("KHO:") or first_value.startswith("Vật tư:"):
+            for cell in row:
+                cell.font = Font(bold=True)
+            row[0].alignment = Alignment(wrap_text=True)
+            row[6].alignment = Alignment(wrap_text=True)
+        if text(row[3].value) in {"Tồn đầu kỳ", "Nhập trong kỳ", "Xuất trong kỳ", "Tồn cuối kỳ"}:
+            for cell in row:
+                cell.font = Font(bold=True)
+    for column in (8, 13):
+        for row in sheet.iter_rows(min_row=2):
+            row[column - 1].number_format = '#,##0.####'
+    for row in sheet.iter_rows(min_row=2):
+        row[14].number_format = '+0.####;-0.####;0'
+    for column in (9, 11, 16):
+        for row in sheet.iter_rows(min_row=2):
+            row[column - 1].number_format = '#,##0.####'
+    for column in (10, 12, 14, 17):
+        for row in sheet.iter_rows(min_row=2):
+            row[column - 1].number_format = '#,##0'
+    fill_ledger_activity_rows(sheet, 9, 11, warehouse_column=6)
+    fill_future_reorder_rows(sheet)
+    widths = {
+        "A": 14, "B": 14, "C": 32, "D": 42, "E": 11,
+        "F": 10, "G": 20, "H": 13, "I": 14, "J": 15,
+        "K": 14, "L": 15, "M": 13, "N": 14, "O": 12, "P": 14,
+        "Q": 15, "R": 46,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    return len(rows)
+
+
+def ledger_view_for_range(group, from_date="", to_date=""):
+    rows = group.get("rows", [])
+    opening_rows = [
+        row for row in rows
+        if row.get("type") == "opening" or (from_date and row.get("date_iso") and row.get("date_iso") < from_date)
+    ]
+    period_rows = [
+        row for row in rows
+        if row.get("type") != "opening"
+        and not (from_date and row.get("date_iso") and row.get("date_iso") < from_date)
+        and (not from_date or not row.get("date_iso") or row.get("date_iso") >= from_date)
+        and (not to_date or not row.get("date_iso") or row.get("date_iso") <= to_date)
+    ]
+    opening_qty = sum(row.get("qty_in", 0) or 0 for row in opening_rows) - sum(row.get("qty_out", 0) or 0 for row in opening_rows)
+    opening_amount = sum(row.get("amount_in", 0) or 0 for row in opening_rows) - sum(row.get("amount_out", 0) or 0 for row in opening_rows)
+    in_qty = sum(row.get("qty_in", 0) or 0 for row in period_rows)
+    in_amount = sum(row.get("amount_in", 0) or 0 for row in period_rows)
+    out_qty = sum(row.get("qty_out", 0) or 0 for row in period_rows)
+    out_amount = sum(row.get("amount_out", 0) or 0 for row in period_rows)
+    return {
+        "opening_qty": opening_qty,
+        "opening_amount": opening_amount,
+        "in_qty": in_qty,
+        "in_amount": in_amount,
+        "out_qty": out_qty,
+        "out_amount": out_amount,
+        "ending_qty": opening_qty + in_qty - out_qty,
+        "ending_amount": opening_amount + in_amount - out_amount,
+        "period_rows": period_rows,
+    }
+
+
+def has_ledger_activity(view):
+    return (
+        view["period_rows"]
+        or abs(view["opening_qty"]) > QUANTITY_EPSILON
+        or abs(view["opening_amount"]) > QUANTITY_EPSILON
+        or abs(view["ending_qty"]) > QUANTITY_EPSILON
+        or abs(view["ending_amount"]) > QUANTITY_EPSILON
+    )
+
+
+def inventory_summary_rows_for_warehouse(warehouse, from_date="", to_date=""):
+    rows = []
+    for group in warehouse.get("groups", []):
+        view = ledger_view_for_range(group, from_date, to_date)
+        if not has_ledger_activity(view):
+            continue
+        rows.append([
+            group.get("variant_code", ""),
+            group.get("product_name", ""),
+            group.get("unit_name", ""),
+            view["opening_qty"],
+            view["opening_amount"],
+            view["in_qty"],
+            view["in_amount"],
+            view["out_qty"],
+            view["out_amount"],
+            view["ending_qty"],
+            view["ending_amount"],
+        ])
+    return rows
+
+
+def inventory_summary_row_count(ledger):
+    if not ledger:
+        return 0
+    date_range = ledger.get("date_range", {})
+    from_date = date_range.get("from", "")
+    to_date = date_range.get("to", "")
+    return sum(
+        len(inventory_summary_rows_for_warehouse(warehouse, from_date, to_date))
+        for warehouse in ledger.get("warehouses", [])
+    )
+
+
+def write_inventory_summary_sheet(workbook, warehouse, from_date="", to_date="", progress_callback=None):
+    progress_callback = progress_callback or (lambda _done, _total: None)
+    warehouse_code = warehouse.get("warehouse_code", "")
+    sheet = replace_sheet(workbook, f"TongHopNXT_{warehouse_code}"[:31])
+    rows = inventory_summary_rows_for_warehouse(warehouse, from_date, to_date)
+    total_rows = max(1, len(rows))
+    done = 0
+    current_row = 1
+    header_fill = PatternFill("solid", fgColor="DFF0DF")
+    subheader_fill = PatternFill("solid", fgColor="E9F6E9")
+
+    def style_header(row_number):
+        for cell in sheet[row_number]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=12)
+    sheet.cell(current_row, 1, "TỔNG HỢP NHẬP XUẤT TỒN")
+    sheet.cell(current_row, 1).font = Font(bold=True, size=14)
+    sheet.cell(current_row, 1).alignment = Alignment(horizontal="center")
+    current_row += 1
+    sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=12)
+    sheet.cell(current_row, 1, f"KHO: {warehouse.get('warehouse_code', '')} - {warehouse.get('warehouse_name', '')}")
+    sheet.cell(current_row, 1).alignment = Alignment(horizontal="center")
+    current_row += 1
+    sheet.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=12)
+    sheet.cell(current_row, 1, f"TỪ NGÀY: {date_display(from_date)} ĐẾN NGÀY: {date_display(to_date)}")
+    sheet.cell(current_row, 1).alignment = Alignment(horizontal="center")
+    current_row += 2
+
+    header_row = current_row
+    subheader_row = current_row + 1
+    single_headers = [
+        ("STT", 1), ("MÃ VẬT TƯ", 2), ("TÊN VẬT TƯ", 3), ("ĐVT", 4),
+    ]
+    for label, column in single_headers:
+        sheet.merge_cells(start_row=header_row, start_column=column, end_row=subheader_row, end_column=column)
+        sheet.cell(header_row, column, label)
+    grouped_headers = [
+        ("TỒN ĐẦU KỲ", 5, 6),
+        ("NHẬP TRONG KỲ", 7, 8),
+        ("XUẤT TRONG KỲ", 9, 10),
+        ("TỒN CUỐI KỲ", 11, 12),
+    ]
+    for label, start_column, end_column in grouped_headers:
+        sheet.merge_cells(start_row=header_row, start_column=start_column, end_row=header_row, end_column=end_column)
+        sheet.cell(header_row, start_column, label)
+    for column, label in enumerate(["SỐ LƯỢNG", "TIỀN", "SỐ LƯỢNG", "TIỀN", "SỐ LƯỢNG", "TIỀN", "SỐ LƯỢNG", "TIỀN"], start=5):
+        sheet.cell(subheader_row, column, label)
+    style_header(header_row)
+    for cell in sheet[subheader_row]:
+        cell.font = Font(bold=True)
+        cell.fill = subheader_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    current_row += 2
+
+    for index, row in enumerate(rows, start=1):
+        values = [index, *row]
+        for column, value in enumerate(values, start=1):
+            sheet.cell(current_row, column, value)
+        for column in (5, 7, 9, 11):
+            sheet.cell(current_row, column).number_format = '#,##0.00'
+        for column in (6, 8, 10, 12):
+            sheet.cell(current_row, column).number_format = '#,##0'
+        done += 1
+        if done == 1 or done == total_rows or done % 250 == 0:
+            progress_callback(done, total_rows)
+        current_row += 1
+    if rows:
+        totals = [sum((row[column_index] or 0) for row in rows) for column_index in range(3, 11)]
+        values = ["", "Tổng cộng:", "", "", *totals]
+        for column, value in enumerate(values, start=1):
+            cell = sheet.cell(current_row, column, value)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="DDE8F6")
+        for column in (5, 7, 9, 11):
+            sheet.cell(current_row, column).number_format = '#,##0.00'
+        for column in (6, 8, 10, 12):
+            sheet.cell(current_row, column).number_format = '#,##0'
+        current_row += 1
+    if not rows:
+        sheet.cell(current_row, 1, "Không có phát sinh trong kho này theo khoảng ngày.")
+        progress_callback(1, total_rows)
+
+    widths = {
+        "A": 7, "B": 18, "C": 34, "D": 9,
+        "E": 13, "F": 15, "G": 13, "H": 15,
+        "I": 13, "J": 15, "K": 13, "L": 15,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(
+                horizontal="right" if cell.column >= 5 and cell.row > 4 else cell.alignment.horizontal,
+                vertical="center",
+                wrap_text=True,
+            )
+    return total_rows
+
+
+def style_sales_report_header(sheet, row_number, max_column):
+    for column in range(1, max_column + 1):
+        cell = sheet.cell(row_number, column)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="DFF0DF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def margin_percent_from_amounts(sale_amount, cost_amount):
+    if not sale_amount:
+        return None
+    return ((sale_amount or 0) - (cost_amount or 0)) / sale_amount * 100
+
+
+def report_margin_percent(warehouse_code, sale_amount, cost_amount):
+    if text(warehouse_code).upper() == "KTP":
+        return None
+    return margin_percent_from_amounts(sale_amount, cost_amount)
+
+
+def write_sales_summary_report_sheet(workbook, warehouse_code, rows, from_date="", to_date="", progress_callback=None):
+    progress_callback = progress_callback or (lambda _done, _total: None)
+    sheet = replace_sheet(workbook, f"BaoCaoBH_{warehouse_code}"[:31])
+    rows = [row for row in rows if row.get("warehouse_code") == warehouse_code]
+    grouped = {}
+    for row in rows:
+        key = (row.get("variant_code", ""), row.get("product_name", ""), row.get("unit_name", ""))
+        item = grouped.setdefault(key, {
+            "variant_code": row.get("variant_code", ""),
+            "product_name": row.get("product_name", ""),
+            "unit_name": row.get("unit_name", ""),
+            "quantity": 0.0,
+            "cost_amount": 0.0,
+            "sale_amount": 0.0,
+            "profit_amount": 0.0,
+            "tax_amount": 0.0,
+            "total_amount": 0.0,
+        })
+        item["quantity"] += row.get("quantity", 0) or 0
+        item["cost_amount"] += row.get("cost_amount", 0) or 0
+        item["sale_amount"] += row.get("sale_amount", 0) or 0
+        item["profit_amount"] += row.get("profit_amount", (row.get("sale_amount", 0) or 0) - (row.get("cost_amount", 0) or 0)) or 0
+        item["tax_amount"] += row.get("tax_amount", 0) or 0
+        item["total_amount"] += row.get("total_amount", 0) or 0
+    summary_rows = sorted(grouped.values(), key=lambda item: (item["variant_code"], item["product_name"]))
+
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
+    sheet.cell(1, 1, "BÁO CÁO TỔNG HỢP BÁN HÀNG")
+    sheet.cell(1, 1).font = Font(bold=True, size=14)
+    sheet.cell(1, 1).alignment = Alignment(horizontal="center")
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=11)
+    sheet.cell(2, 1, f"KHO: {warehouse_code}")
+    sheet.cell(2, 1).alignment = Alignment(horizontal="center")
+    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=11)
+    sheet.cell(3, 1, f"TỪ NGÀY: {date_display(from_date)} ĐẾN NGÀY: {date_display(to_date)}")
+    sheet.cell(3, 1).alignment = Alignment(horizontal="center")
+    headers = ["STT", "MÃ VẬT TƯ", "TÊN VẬT TƯ", "ĐVT", "SỐ LƯỢNG", "TIỀN VỐN", "TIỀN HÀNG", "TIỀN LÃI/LỖ", "% LÃI/LỖ", "TIỀN THUẾ", "TỔNG TIỀN TT"]
+    for column, header in enumerate(headers, start=1):
+        sheet.cell(5, column, header)
+    style_sales_report_header(sheet, 5, len(headers))
+    total_rows = max(1, len(summary_rows))
+    for index, row in enumerate(summary_rows, start=1):
+        excel_row = index + 5
+        values = [
+            index,
+            row["variant_code"],
+            row["product_name"],
+            row["unit_name"],
+            row["quantity"],
+            row["cost_amount"],
+            row["sale_amount"],
+            row["profit_amount"],
+            report_margin_percent(warehouse_code, row["sale_amount"], row["cost_amount"]),
+            row["tax_amount"],
+            row["total_amount"],
+        ]
+        for column, value in enumerate(values, start=1):
+            sheet.cell(excel_row, column, value)
+        sheet.cell(excel_row, 5).number_format = '#,##0.00'
+        for column in (6, 7, 8, 10, 11):
+            sheet.cell(excel_row, column).number_format = '#,##0'
+        sheet.cell(excel_row, 9).number_format = '+0.####;-0.####;0'
+        if index == 1 or index == total_rows or index % 250 == 0:
+            progress_callback(index, total_rows)
+    if not summary_rows:
+        sheet.cell(6, 1, "Không có dữ liệu bán hàng trong kho này.")
+        progress_callback(1, total_rows)
+    if summary_rows:
+        footer_row = len(summary_rows) + 6
+        totals = {
+            "quantity": sum(row["quantity"] for row in summary_rows),
+            "cost_amount": sum(row["cost_amount"] for row in summary_rows),
+            "sale_amount": sum(row["sale_amount"] for row in summary_rows),
+            "profit_amount": sum(row["profit_amount"] for row in summary_rows),
+            "tax_amount": sum(row["tax_amount"] for row in summary_rows),
+            "total_amount": sum(row["total_amount"] for row in summary_rows),
+        }
+        footer_values = [
+            "", "Tổng cộng:", "", "",
+            totals["quantity"],
+            totals["cost_amount"],
+            totals["sale_amount"],
+            totals["profit_amount"],
+            report_margin_percent(warehouse_code, totals["sale_amount"], totals["cost_amount"]),
+            totals["tax_amount"],
+            totals["total_amount"],
+        ]
+        for column, value in enumerate(footer_values, start=1):
+            cell = sheet.cell(footer_row, column, value)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="DDEBF7")
+        sheet.cell(footer_row, 5).number_format = '#,##0.00'
+        for column in (6, 7, 8, 10, 11):
+            sheet.cell(footer_row, column).number_format = '#,##0'
+        sheet.cell(footer_row, 9).number_format = '+0.####;-0.####;0'
+    for column, width in {"A": 7, "B": 18, "C": 38, "D": 9, "E": 13, "F": 15, "G": 15, "H": 16, "I": 12, "J": 15, "K": 16}.items():
+        sheet.column_dimensions[column].width = width
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(
+                horizontal="right" if cell.column >= 5 and cell.row >= 6 else cell.alignment.horizontal,
+                vertical="center",
+                wrap_text=True,
+            )
+    return total_rows
+
+
+def sales_invoice_groups(rows, warehouse_code):
+    groups = []
+    by_key = {}
+    for row in rows:
+        if row.get("warehouse_code") != warehouse_code:
+            continue
+        key = (row.get("invoice_date_iso", ""), row.get("invoice_date", ""), row.get("invoice_no", ""), row.get("customer", ""), row.get("tax_rate", 0))
+        if key not in by_key:
+            group = {
+                "invoice_date_iso": row.get("invoice_date_iso", ""),
+                "invoice_date": row.get("invoice_date", ""),
+                "invoice_no": row.get("invoice_no", ""),
+                "customer": row.get("customer", ""),
+                "tax_rate": row.get("tax_rate", 0),
+                "rows": [],
+            }
+            by_key[key] = group
+            groups.append(group)
+        by_key[key]["rows"].append(row)
+    groups.sort(key=lambda group: (group["invoice_date_iso"], text(group["invoice_no"])))
+    return groups
+
+
+def write_sales_invoice_report_sheet(workbook, warehouse_code, rows, from_date="", to_date="", progress_callback=None):
+    progress_callback = progress_callback or (lambda _done, _total: None)
+    sheet = replace_sheet(workbook, f"BangKeHDBH_{warehouse_code}"[:31])
+    groups = sales_invoice_groups(rows, warehouse_code)
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
+    sheet.cell(1, 1, "BẢNG KÊ HOÁ ĐƠN BÁN HÀNG")
+    sheet.cell(1, 1).font = Font(bold=True, size=14)
+    sheet.cell(1, 1).alignment = Alignment(horizontal="center")
+    sheet.merge_cells(start_row=2, start_column=1, end_row=2, end_column=9)
+    sheet.cell(2, 1, f"KHO: {warehouse_code}")
+    sheet.cell(2, 1).alignment = Alignment(horizontal="center")
+    sheet.merge_cells(start_row=3, start_column=1, end_row=3, end_column=9)
+    sheet.cell(3, 1, f"TỪ NGÀY: {date_display(from_date)} ĐẾN NGÀY: {date_display(to_date)}")
+    sheet.cell(3, 1).alignment = Alignment(horizontal="center")
+    headers = ["NGÀY", "SỐ", "DIỄN GIẢI", "MÃ BP\nĐVT", "MÃ KHO\nMÃ NX", "SỐ LƯỢNG", "GIÁ VỐN", "TIỀN VỐN", "GIÁ BÁN", "TIỀN HÀNG"]
+    for column, header in enumerate(headers, start=1):
+        sheet.cell(5, column, header)
+    style_sales_report_header(sheet, 5, len(headers))
+    current_row = 6
+    done = 0
+    total_rows = max(1, sum(len(group["rows"]) for group in groups))
+    for group in groups:
+        group_rows = group["rows"]
+        sale_total = sum(row.get("sale_amount", 0) or 0 for row in group_rows)
+        tax_total = sum(row.get("tax_amount", 0) or 0 for row in group_rows)
+        payment_total = sale_total + tax_total
+        sheet.cell(current_row, 1, date_display(group.get("invoice_date_iso")) if group.get("invoice_date_iso") else group.get("invoice_date", ""))
+        sheet.cell(current_row, 2, group.get("invoice_no", ""))
+        sheet.cell(current_row, 3, group.get("customer", ""))
+        sheet.cell(current_row + 1, 3, "Xuất bán cho khách")
+        sheet.cell(current_row, 5, warehouse_code)
+        sheet.cell(current_row + 1, 5, "131")
+        current_row += 2
+        for row in group_rows:
+            sheet.cell(current_row, 3, f"{row.get('variant_code', '')} - {row.get('product_name', '')}".strip(" -"))
+            sheet.cell(current_row, 4, row.get("unit_name", ""))
+            sheet.cell(current_row, 6, row.get("quantity", 0)).number_format = '#,##0.00'
+            sheet.cell(current_row, 7, row.get("cost_price", 0)).number_format = '#,##0.00'
+            sheet.cell(current_row, 8, row.get("cost_amount", 0)).number_format = '#,##0'
+            sheet.cell(current_row, 9, row.get("sale_price", 0)).number_format = '#,##0.00'
+            sheet.cell(current_row, 10, row.get("sale_amount", 0)).number_format = '#,##0'
+            done += 1
+            if done == 1 or done == total_rows or done % 250 == 0:
+                progress_callback(done, total_rows)
+            current_row += 1
+        for label, value in (("Tiền hàng:", sale_total), ("Tiền thuế:", tax_total), ("Tổng tiền thanh toán:", payment_total)):
+            sheet.cell(current_row, 9, label)
+            sheet.cell(current_row, 9).font = Font(bold=True)
+            sheet.cell(current_row, 10, value)
+            sheet.cell(current_row, 10).font = Font(bold=True)
+            sheet.cell(current_row, 10).number_format = '#,##0'
+            current_row += 1
+        current_row += 1
+    if not groups:
+        sheet.cell(6, 1, "Không có dữ liệu bán hàng trong kho này.")
+        progress_callback(1, total_rows)
+    for column, width in {"A": 10, "B": 10, "C": 42, "D": 12, "E": 12, "F": 13, "G": 14, "H": 15, "I": 14, "J": 15}.items():
+        sheet.column_dimensions[column].width = width
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(
+                horizontal="right" if cell.column >= 6 and cell.row >= 6 else cell.alignment.horizontal,
+                vertical="center",
+                wrap_text=True,
+            )
+    return total_rows
+
+
+def line_tax_amount(line):
+    if line.get("tax_amount") is not None:
+        return line.get("tax_amount") or 0
+    amount = line_total_amount(line)
+    rate = sale_tax_rate(line)
+    return (amount or 0) * rate / 100
+
+
+def sum_values(rows, field):
+    return sum(row.get(field, 0) or 0 for row in rows or [])
+
+
+def ledger_totals_for_type(ledger, warehouse_code, row_type):
+    totals = {"qty_in": 0.0, "amount_in": 0.0, "qty_out": 0.0, "amount_out": 0.0}
+    for warehouse in (ledger or {}).get("warehouses", []):
+        if warehouse.get("warehouse_code") != warehouse_code:
+            continue
+        for group in warehouse.get("groups", []):
+            for row in group.get("rows", []):
+                if row.get("type") != row_type:
+                    continue
+                for field in totals:
+                    totals[field] += row.get(field, 0) or 0
+    return totals
+
+
+def verification_status(original_value, processed_value, tolerance):
+    diff = (processed_value or 0) - (original_value or 0)
+    return diff, "OK" if abs(diff) <= tolerance else "Lệch"
+
+
+def build_verification_rows(purchase_lines, sales_lines, allocations, ledger, sales_report_rows, policy=None):
+    original_sales_qty = sum(line.get("quantity", 0) or 0 for line in sales_lines or [])
+    original_sales_amount = sum(line_total_amount(line) or 0 for line in sales_lines or [])
+    original_sales_tax = sum(line_tax_amount(line) for line in sales_lines or [])
+    original_purchase_qty = sum(line.get("quantity", 0) or 0 for line in purchase_lines or [])
+    original_purchase_amount = sum(line_total_amount(line) or 0 for line in purchase_lines or [])
+
+    processed_sales_qty = sum_values(sales_report_rows, "quantity")
+    processed_sales_amount = sum_values(sales_report_rows, "sale_amount")
+    processed_sales_tax = sum_values(sales_report_rows, "tax_amount")
+    allocated_qty = sum((row.get("material_quantity", 0) or 0) + (row.get("finished_quantity", 0) or 0) for row in allocations or [])
+
+    khh_report_rows = [row for row in sales_report_rows if row.get("warehouse_code") == "KHH"]
+    ktp_report_rows = [row for row in sales_report_rows if row.get("warehouse_code") == "KTP"]
+    khh_sale_ledger = ledger_totals_for_type(ledger, "KHH", "sale")
+    ktp_sale_ledger = ledger_totals_for_type(ledger, "KTP", "sale")
+    khh_purchase_ledger = ledger_totals_for_type(ledger, "KHH", "purchase")
+
+    checks = [
+        ("Bán ra", "SL gốc = SL đã tách KHH + KTP", original_sales_qty, processed_sales_qty, 0.0001, "Đảm bảo không mất hoặc nhân đôi số lượng bán ra khi tách kho."),
+        ("Bán ra", "Tiền hàng gốc = tiền hàng đã tách", original_sales_amount, processed_sales_amount, 1, "Đảm bảo doanh thu chưa thuế sau xử lý khớp file bán ra gốc."),
+        ("Bán ra", "Tiền thuế gốc = tiền thuế đã tách", original_sales_tax, processed_sales_tax, 1, "Đảm bảo thuế được phân bổ theo tiền hàng sau tách kho."),
+        ("Phân bổ", "SL gốc = SL phân bổ KHH + KTP", original_sales_qty, allocated_qty, 0.0001, "Đảm bảo mỗi dòng bán ra đều được phân bổ đủ sang KHH hoặc KTP."),
+        ("KHH", "SL bán hàng KHH = SL xuất sổ chi tiết KHH", sum_values(khh_report_rows, "quantity"), khh_sale_ledger["qty_out"], 0.0001, "Đối chiếu báo cáo bán hàng KHH với sổ chi tiết KHH."),
+        ("KHH", "Tiền vốn KHH = xuất thành tiền sổ chi tiết KHH", sum_values(khh_report_rows, "cost_amount"), khh_sale_ledger["amount_out"], 1, "Đối chiếu giá vốn bán hàng KHH với xuất kho KHH."),
+        ("KTP", "SL bán hàng KTP = SL xuất sổ chi tiết KTP", sum_values(ktp_report_rows, "quantity"), ktp_sale_ledger["qty_out"], 0.0001, "Đối chiếu báo cáo bán hàng KTP với sổ chi tiết KTP."),
+        ("KTP", "Tiền vốn KTP = xuất thành tiền sổ chi tiết KTP", sum_values(ktp_report_rows, "cost_amount"), ktp_sale_ledger["amount_out"], 1, "Đối chiếu giá vốn bán hàng KTP với xuất kho KTP."),
+        ("Mua vào", "SL mua gốc = SL nhập KHH", original_purchase_qty, khh_purchase_ledger["qty_in"], 0.0001, "Đảm bảo hóa đơn mua vào được đưa vào kho hàng hóa."),
+        ("Mua vào", "Tiền mua gốc = tiền nhập KHH", original_purchase_amount, khh_purchase_ledger["amount_in"], 1, "Đảm bảo giá trị mua vào khớp nhập kho hàng hóa."),
+    ]
+    policy = clean_policy(policy or DEFAULT_POLICY)
+    if policy_active(policy):
+        outside_range = 0
+        for row in khh_report_rows:
+            sale_amount = row.get("sale_amount", 0) or 0
+            if sale_amount <= QUANTITY_EPSILON:
+                continue
+            margin_percent = (sale_amount - (row.get("cost_amount", 0) or 0)) / sale_amount * 100
+            if policy["max_loss_percent"] is not None and margin_percent < -policy["max_loss_percent"]:
+                outside_range += 1
+            if policy["max_profit_percent"] is not None and margin_percent > policy["max_profit_percent"]:
+                outside_range += 1
+        checks.append((
+            "KHH",
+            "Dòng KHH ngoài khoảng lãi/lỗ",
+            0,
+            outside_range,
+            0,
+            "Chỉ kiểm tra KHH vì KTP có giá vốn 0 theo cấu hình xuất báo cáo.",
+        ))
+    rows = []
+    for group, check_name, original_value, processed_value, tolerance, explanation in checks:
+        diff, status = verification_status(original_value, processed_value, tolerance)
+        rows.append([
+            group,
+            check_name,
+            original_value,
+            processed_value,
+            diff,
+            tolerance,
+            status,
+            explanation,
+        ])
+    return rows
+
+
+def write_verification_sheet(workbook, verification_rows):
+    sheet = replace_sheet(workbook, "KiemTraDoiChieu")
+    headers = ["Nhóm", "Kiểm tra", "Giá trị file gốc", "Giá trị sau xử lý", "Chênh lệch", "Ngưỡng", "Kết quả", "Ý nghĩa"]
+    write_table(sheet, headers, verification_rows)
+    for row in sheet.iter_rows(min_row=2):
+        status = text(row[6].value)
+        row[6].font = Font(bold=True, color="0B774B" if status == "OK" else "AD2C2C")
+        for column in (3, 4, 5, 6):
+            row[column - 1].number_format = '#,##0.####'
+    sheet.column_dimensions["A"].width = 14
+    sheet.column_dimensions["B"].width = 34
+    sheet.column_dimensions["C"].width = 18
+    sheet.column_dimensions["D"].width = 18
+    sheet.column_dimensions["E"].width = 16
+    sheet.column_dimensions["F"].width = 12
+    sheet.column_dimensions["G"].width = 10
+    sheet.column_dimensions["H"].width = 58
+    return len(verification_rows)
+
+
+def result_column(sheet, header_row, header, fallback):
+    for column in range(1, sheet.max_column + 1):
+        if text(sheet.cell(header_row, column).value) == header:
+            return column
+    return fallback
+
+
+def create_output_workbook(
+    sales_content,
+    sales_mapping,
+    allocations,
+    stock_rows,
+    summary,
+    policy=None,
+    sale_only_codes=None,
+    purchase_lines=None,
+    sales_lines=None,
+    progress_callback=None,
+    ledger=None,
+    missing_barem_report=None,
+    ambiguous_steel_rows=None,
+):
+    policy = clean_policy(policy or DEFAULT_POLICY)
+    sale_only_codes = sale_only_codes or []
+    missing_barem_report = missing_barem_report or []
+    ambiguous_steel_rows = ambiguous_steel_rows or []
+    progress_callback = progress_callback or (lambda _done, _total, _label: None)
+    purchase_export_rows = build_purchase_export_rows(purchase_lines)
+    sales_export_rows = build_sales_export_rows(allocations, purchase_lines, sales_lines)
+    sales_report_rows = build_sales_report_rows(allocations, purchase_lines, sales_lines)
+    future_reorder_report = (summary or {}).get("future_purchase_reorder_report", [])
+    ledger_warehouses = (ledger or {}).get("warehouses", [])
+    verification_rows = build_verification_rows(purchase_lines, sales_lines, allocations, ledger, sales_report_rows, policy)
+    ledger_row_count = sum(len(ledger_export_rows(warehouse)) for warehouse in ledger_warehouses)
+    should_write_combined_ledger = bool(ledger and len(ledger_warehouses) > 1)
+    combined_ledger_row_count = len(combined_ledger_export_rows(ledger)) if should_write_combined_ledger else 0
+    nxt_row_count = inventory_summary_row_count(ledger)
+    output_total = max(
+        1,
+        len(allocations)
+        + len(sale_only_codes)
+        + len(missing_barem_report)
+        + len(ambiguous_steel_rows)
+        + len(future_reorder_report)
+        + len(purchase_export_rows)
+        + len(sales_export_rows)
+        + len(sales_report_rows) * 2
+        + len(verification_rows)
+        + ledger_row_count
+        + combined_ledger_row_count
+        + nxt_row_count
+        + 5,
+    )
+    output_done = 0
+
+    def report(delta, label):
+        nonlocal output_done
+        output_done = min(output_total, output_done + max(0, delta))
+        progress_callback(output_done, output_total, label)
+
+    def row_reporter(label):
+        last = 0
+
+        def callback(done, total):
+            nonlocal last
+            report(done - last, f"{label}: {done}/{total} dòng...")
+            last = done
+
+        return callback
+
+    workbook = load_workbook(BytesIO(sales_content))
+    generated_sheet_names = (
+        "PhanBoKho", "TonKhoHangHoa", "TongHopNhapXuatTon", "TongHopKho", "KiemTraDoiChieu",
+        "MaChiBanRaKhongTon", "MaThieuBarem", "MaThepKhongRo", "MauMuaVao", "MauBanRa",
+        "HDMuaVaoDuaLenTruoc",
+        "SoChiTietKHH", "SoChiTietKTP", "SoChiTietHH_TP",
+        "TongHopNXT_KHH", "TongHopNXT_KTP",
+        "BaoCaoBH_KHH", "BaoCaoBH_KTP",
+        "BangKeHDBH_KHH", "BangKeHDBH_KTP",
+    )
+    for removed_sheet in generated_sheet_names:
+        if removed_sheet in workbook.sheetnames:
+            del workbook[removed_sheet]
+    sales_sheet = sheet_for_mapping(workbook, sales_mapping)
+    header_row = sales_mapping["header_row"]
+    column_headers = [
+        "SL lấy từ kho hàng hóa",
+        "SL lấy từ kho thành phẩm",
+        "Tồn kho trước khi bán",
+        "Chi tiết lấy từ kho hàng hóa",
+        "Tồn kho sau khi bán",
+        "Lô không đạt khoảng lãi/lỗ",
+    ]
+    output_columns = {}
+    for header in column_headers:
+        output_columns[header] = result_column(sales_sheet, header_row, header, sales_sheet.max_column + 1)
+        sales_sheet.cell(header_row, output_columns[header], header)
+    for cell in (sales_sheet.cell(header_row, column) for column in output_columns.values()):
+        cell.font = Font(bold=True, color="12304B")
+        cell.fill = PatternFill("solid", fgColor="E7F2FF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    sales_sheet.column_dimensions[get_column_letter(output_columns["SL lấy từ kho hàng hóa"])].width = 22
+    sales_sheet.column_dimensions[get_column_letter(output_columns["SL lấy từ kho thành phẩm"])].width = 23
+    for header in column_headers[2:]:
+        sales_sheet.column_dimensions[get_column_letter(output_columns[header])].width = 44
+    total_allocations = len(allocations)
+    last_reported_allocation = 0
+    for index, line in enumerate(allocations, start=1):
+        sales_sheet.cell(line["row_number"], output_columns["SL lấy từ kho hàng hóa"], line["material_quantity"]).number_format = '#,##0.####'
+        sales_sheet.cell(line["row_number"], output_columns["SL lấy từ kho thành phẩm"], line["finished_quantity"]).number_format = '#,##0.####'
+        sales_sheet.cell(line["row_number"], output_columns["Tồn kho trước khi bán"], inventory_text(line.get("inventory_before", [])))
+        sales_sheet.cell(line["row_number"], output_columns["Chi tiết lấy từ kho hàng hóa"], detail_text(line["used"]))
+        sales_sheet.cell(line["row_number"], output_columns["Tồn kho sau khi bán"], inventory_text(line.get("inventory_after", [])))
+        sales_sheet.cell(line["row_number"], output_columns["Lô không đạt khoảng lãi/lỗ"], rejected_text(line.get("rejected", [])))
+        if index == 1 or index == total_allocations or index % 250 == 0:
+            report(index - last_reported_allocation, f"Đang ghi kết quả vào hóa đơn bán ra: {index}/{total_allocations} dòng...")
+            last_reported_allocation = index
+    if not allocations:
+        report(1, "Đang ghi kết quả vào hóa đơn bán ra...")
+
+    summary_sheet = replace_sheet(workbook, "TongHopKho")
+    write_table(summary_sheet, ["Chỉ tiêu", "Giá trị"], [
+        ["Tồn đầu kỳ", summary["opening_quantity"]],
+        ["Nhập mua vào", summary["purchase_quantity"]],
+        ["Số lượng bán ra", summary["sales_quantity"]],
+        ["Lấy từ kho hàng hóa", summary["material_quantity"]],
+        ["Lấy từ kho thành phẩm", summary["finished_quantity"]],
+        ["Tỷ lệ đáp ứng từ kho hàng hóa (%)", summary["material_percent"]],
+        ["Dòng có lô bị loại theo khoảng lãi/lỗ", summary.get("range_rejected_lines", 0)],
+        ["HD mua vào đưa lên trước", summary.get("future_purchase_reorder_count", 0)],
+        ["SL từ HD mua vào đưa lên trước", summary.get("future_purchase_reorder_quantity", 0)],
+        ["Mã VT chỉ bán ra mà không có tồn kho", summary.get("sale_only_code_count", len(sale_only_codes))],
+        ["Lỗ tối đa chấp nhận (%)", policy["max_loss_percent"] if policy["max_loss_percent"] is not None else "Không giới hạn"],
+        ["Lãi tối đa chấp nhận (%)", policy["max_profit_percent"] if policy["max_profit_percent"] is not None else "Không giới hạn"],
+    ])
+    report(1, "Đã ghi tổng hợp kho.")
+
+    write_verification_sheet(workbook, verification_rows)
+    report(len(verification_rows), "Đã ghi kiểm tra đối chiếu dữ liệu.")
+
+    sale_only_sheet = replace_sheet(workbook, "MaChiBanRaKhongTon")
+    write_table(sale_only_sheet, [
+        "Mã VT bán ra", "Mã gốc", "Tên hàng", "SL tồn đầu kỳ", "SL mua vào",
+        "Số dòng bán ra", "Tổng SL bán", "Các dòng trong hóa đơn bán ra",
+    ], [[
+        row["variant_code"], row["base_code"], row["product_name"], row["opening_quantity"],
+        row["purchase_quantity"], row["row_count"], row["quantity"],
+        ", ".join(str(row_number) for row_number in row["rows"]),
+    ] for row in sale_only_codes], progress_callback=row_reporter("Đang ghi mã chỉ bán ra"))
+
+    missing_barem_sheet = replace_sheet(workbook, "MaThieuBarem")
+    write_table(missing_barem_sheet, [
+        "Mã VT", "Tên hàng", "SL tồn còn lại", "Số HĐ", "Ngày HĐ", "Dòng Excel", "Lý do",
+    ], [[
+        row.get("variant_code", ""),
+        row.get("product_name", ""),
+        row.get("quantity", 0),
+        row.get("invoice_no", ""),
+        row.get("invoice_date", ""),
+        row.get("row_number", ""),
+        row.get("reason", ""),
+    ] for row in missing_barem_report], progress_callback=row_reporter("Đang ghi mã thiếu barem"))
+
+    ambiguous_sheet = replace_sheet(workbook, "MaThepKhongRo")
+    write_table(ambiguous_sheet, [
+        "Công ty", "MST", "Mã VT", "Tên hàng", "SL", "Đơn giá", "Số HĐ", "Ngày HĐ",
+        "Dòng Excel", "Loại nhận diện", "Dimension đọc được", "Lý do", "Ghi chú nhận diện",
+    ], [[
+        row.get("company", ""),
+        row.get("tax_code", ""),
+        row.get("variant_code", ""),
+        row.get("product_name", ""),
+        row.get("quantity", 0),
+        row.get("unit_price", ""),
+        row.get("invoice_no", ""),
+        row.get("invoice_date", ""),
+        row.get("row_number", ""),
+        row.get("detected_kind", ""),
+        row.get("dimension", ""),
+        row.get("reason", ""),
+        row.get("kind_reason", ""),
+    ] for row in ambiguous_steel_rows], progress_callback=row_reporter("Đang ghi mã thép không rõ"))
+
+    future_reorder_sheet = replace_sheet(workbook, "HDMuaVaoDuaLenTruoc")
+    write_table(future_reorder_sheet, [
+        "Ma VT mua vao", "Ma VT ban ra", "Ten hang", "So HD mua vao",
+        "Ngay mua goc", "Ngay hieu luc", "So HD ban ra", "Ngay ban ra",
+        "Dong ban ra", "Dong mua vao", "SL lay", "Don gia von", "So ngay keo len", "Ghi chu",
+    ], [[
+        row.get("purchase_variant_code", ""),
+        row.get("sale_variant_code", ""),
+        row.get("product_name", ""),
+        row.get("purchase_invoice_no", ""),
+        row.get("purchase_original_date", ""),
+        row.get("effective_date", ""),
+        row.get("sale_invoice_no", ""),
+        row.get("sale_date", ""),
+        row.get("sale_row_number", ""),
+        row.get("purchase_row_number", ""),
+        row.get("quantity", 0),
+        row.get("unit_cost", ""),
+        row.get("future_reorder_days", ""),
+        row.get("logic_note", ""),
+    ] for row in future_reorder_report], progress_callback=row_reporter("Dang ghi HD mua vao dua len truoc"))
+
+    purchase_export_sheet = replace_sheet(workbook, "MauMuaVao")
+    write_table(purchase_export_sheet, PURCHASE_EXPORT_HEADERS, purchase_export_rows, progress_callback=row_reporter("Đang ghi mẫu mua vào"))
+    format_export_sheet(purchase_export_sheet, quantity_columns=(7,), money_columns=(8, 9))
+    report(1, "Đã định dạng mẫu mua vào.")
+
+    sales_export_sheet = replace_sheet(workbook, "MauBanRa")
+    write_table(sales_export_sheet, SALES_EXPORT_HEADERS, sales_export_rows, progress_callback=row_reporter("Đang ghi mẫu bán ra"))
+    format_export_sheet(
+        sales_export_sheet,
+        quantity_columns=(5,),
+        money_columns=(6, 7, 8, 9, 11),
+        percent_columns=(10,),
+    )
+    report(1, "Đã định dạng mẫu bán ra.")
+
+    for warehouse in ledger_warehouses:
+        write_ledger_export_sheet(
+            workbook,
+            warehouse,
+            progress_callback=row_reporter(f"Đang ghi sổ chi tiết {warehouse.get('warehouse_code', '')}"),
+        )
+    if ledger and ledger_warehouses:
+        date_range = ledger.get("date_range", {})
+        from_date = date_range.get("from", "")
+        to_date = date_range.get("to", "")
+        write_combined_ledger_sheet(
+            workbook,
+            ledger,
+            progress_callback=row_reporter("Đang ghi sổ chi tiết HH và TP"),
+        )
+        for warehouse in ledger_warehouses:
+            write_inventory_summary_sheet(
+                workbook,
+                warehouse,
+                from_date,
+                to_date,
+                progress_callback=row_reporter(f"Đang ghi tổng hợp nhập xuất tồn {warehouse.get('warehouse_code', '')}"),
+            )
+            warehouse_code = warehouse.get("warehouse_code", "")
+            write_sales_summary_report_sheet(
+                workbook,
+                warehouse_code,
+                sales_report_rows,
+                from_date,
+                to_date,
+                progress_callback=row_reporter(f"Đang ghi báo cáo tổng hợp bán hàng {warehouse_code}"),
+            )
+            write_sales_invoice_report_sheet(
+                workbook,
+                warehouse_code,
+                sales_report_rows,
+                from_date,
+                to_date,
+                progress_callback=row_reporter(f"Đang ghi bảng kê hóa đơn bán hàng {warehouse_code}"),
+            )
+
+    stream = BytesIO()
+    workbook.save(stream)
+    report(1, "Đã lưu workbook vào bộ nhớ.")
+    stream.seek(0)
+    return stream
+
+
+def output_filename(original_name):
+    stem = Path(original_name or "hoa_don_ban_ra").stem
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .") or "hoa_don_ban_ra"
+    return f"{stem}_phan_bo_kho.xlsx"
+
+
+def save_output(stream, original_name):
+    job_id = uuid.uuid4().hex
+    filename = output_filename(original_name)
+    path = OUTPUT_DIR / f"{job_id}_{filename}"
+    path.write_bytes(stream.getvalue())
+    return job_id, filename, path
+
+
+def preview_workbook(content, header_row=1):
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    header_row = max(1, min(int(header_row or 1), sheet.max_row))
+    displayed_columns = min(sheet.max_column, 18)
+    rows = []
+    for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 8), values_only=True):
+        rows.append([text(value) for value in row[:displayed_columns]])
+    columns = [{
+        "letter": get_column_letter(column),
+        "header": text(sheet.cell(header_row, column).value),
+    } for column in range(1, sheet.max_column + 1)]
+    result = {
+        "sheets": workbook.sheetnames,
+        "active_sheet": sheet.title,
+        "max_column": get_column_letter(sheet.max_column),
+        "header_row": header_row,
+        "preview_letters": [get_column_letter(column) for column in range(1, displayed_columns + 1)],
+        "columns": columns,
+        "rows": rows,
+    }
+    workbook.close()
+    return result
+
+
+@app.post("/api/preview")
+def preview():
+    uploaded = request.files.get("file")
+    if not uploaded:
+        return jsonify({"error": "Chưa chọn file Excel."}), 400
+    try:
+        header_row = request.form.get("header_row") or 1
+        return jsonify(preview_workbook(uploaded.read(), header_row))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/purchase-classification-preview")
+def purchase_classification_preview():
+    uploaded = request.files.get("file")
+    if not uploaded:
+        return jsonify({"error": "Chưa chọn file mua vào."}), 400
+    try:
+        raw_mapping = json.loads(request.form.get("mapping") or "{}")
+        policy = clean_policy(json.loads(request.form.get("policy") or "{}"))
+        mapping = clean_mapping(raw_mapping, "purchase")
+        _, lines = read_lines(
+            uploaded.read(),
+            mapping,
+            "purchase",
+            company_profile=policy.get("company_profile", "yen_thanh"),
+        )
+        counts = {"pipe": 0, "box": 0, "unknown": 0}
+        rows = []
+        unknown_rows = []
+        company_rules = build_company_detection_rules(lines) if policy.get("company_profile") == "son_phuong" else []
+        save_company_detection_rules(policy.get("company_profile", "yen_thanh"), company_rules)
+        for line in lines:
+            kind, reason = steel_kind_detail(line.get("product_name", ""), line.get("source_variant_code") or line.get("variant_code", ""))
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind == "unknown":
+                unknown_rows.append({
+                    "row_number": line.get("row_number", ""),
+                    "source_variant_code": line.get("source_variant_code", ""),
+                    "profile_code": line.get("steel_profile_code", ""),
+                    "variant_code": line.get("variant_code", ""),
+                    "product_name": line.get("product_name", ""),
+                    "quantity": line.get("quantity", 0),
+                    "unit_price": line.get("unit_price"),
+                    "kind": kind,
+                    "kind_label": "Khong phan loai",
+                    "reason": reason,
+                })
+            if len(rows) < 250:
+                rows.append({
+                    "row_number": line.get("row_number", ""),
+                    "source_variant_code": line.get("source_variant_code", ""),
+                    "profile_code": line.get("steel_profile_code", ""),
+                    "profile_key": line.get("steel_profile_key", ""),
+                    "variant_code": line.get("variant_code", ""),
+                    "product_name": line.get("product_name", ""),
+                    "quantity": line.get("quantity", 0),
+                    "unit_price": line.get("unit_price"),
+                    "kind": kind,
+                    "kind_label": {"pipe": "Thép ống", "box": "Thép hộp", "unknown": "Không phân loại"}.get(kind, kind),
+                    "reason": reason,
+                })
+        return jsonify({
+            "profile": policy.get("company_profile", "yen_thanh"),
+            "total": len(lines),
+            "counts": counts,
+            "rows": rows,
+            "unknown_rows": unknown_rows,
+            "company_rules": company_rules,
+            "limited": len(lines) > len(rows),
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+def analysis_payload(purchase_content, sales_content, opening_content, raw_mapping, policy, sales_filename, progress=None, barem_content=None):
+    progress = progress or (lambda _percent, _label: None)
+    progress(5, "Đang đọc cấu hình cột...")
+    purchase_mapping = clean_mapping(raw_mapping, "purchase")
+    sales_mapping = clean_mapping(raw_mapping, "sales")
+    opening_mapping = clean_mapping(raw_mapping, "opening")
+
+    policy = clean_policy(policy or DEFAULT_POLICY)
+    company_profile = policy.get("company_profile", "yen_thanh")
+    progress(12, "Đang đọc hóa đơn mua vào...")
+    _, purchase_lines = read_lines(purchase_content, purchase_mapping, "purchase", company_profile=company_profile)
+    progress(18, "Đang đọc file barem...")
+    barem_map = merge_barem_maps(DEFAULT_BAREM_MAP, parse_barem_file(barem_content) if barem_content else None)
+    progress(24, "Đang đọc hóa đơn bán ra...")
+    _, sales_lines = read_lines(sales_content, sales_mapping, "sales", company_profile=company_profile)
+    if policy.get("ignore_sale_suffix"):
+        sales_lines = normalize_sales_codes_to_base(sales_lines)
+    progress(32, "Đang đọc tồn đầu kỳ...")
+    opening_lines = read_lines(opening_content, opening_mapping, "opening", company_profile=company_profile)[1] if opening_content else []
+    if not purchase_lines and not opening_lines:
+        raise ValueError("Không đọc được tồn kho từ hóa đơn mua vào hoặc file tồn đầu kỳ. Kiểm tra mapping cột.")
+    if not sales_lines:
+        raise ValueError("Không đọc được dòng bán ra. Kiểm tra mapping cột.")
+
+    progress(38, "Đang rà soát mã chỉ bán ra...")
+    sale_only_codes = find_sale_only_codes(opening_lines, purchase_lines, sales_lines)
+    ambiguous_steel_rows = build_ambiguous_steel_rows(purchase_lines) if company_profile == "son_phuong" else []
+    company_detection_rules = build_company_detection_rules(purchase_lines) if company_profile == "son_phuong" else []
+    save_company_detection_rules(company_profile, company_detection_rules)
+
+    def allocation_progress(done, total):
+        ratio = done / total if total else 1
+        progress(40 + ratio * 30, f"Đang phân bổ kho: {done}/{total} dòng bán ra...")
+
+    allocations, stock_rows, summary, warnings = allocate_stock(
+        opening_lines,
+        purchase_lines,
+        sales_lines,
+        policy,
+        progress_callback=allocation_progress,
+        barem_map=barem_map,
+    )
+    summary["sale_only_code_count"] = len(sale_only_codes)
+    missing_barem_report = summary.get("missing_barem_report", [])
+
+    progress(74, "Đang dựng sổ chi tiết hàng hóa KHH/KTP...")
+    ledger = build_inventory_ledger(
+        opening_lines,
+        purchase_lines,
+        allocations,
+        sales_lines=sales_lines,
+        company_profile=company_profile,
+    )
+    ledger["date_range"] = iso_in_sales_range(sales_lines)
+    sales_report_rows = build_sales_report_rows(allocations, purchase_lines, sales_lines)
+    verification_rows = build_verification_rows(
+        purchase_lines,
+        sales_lines,
+        allocations,
+        ledger,
+        sales_report_rows,
+        policy,
+    )
+
+    def output_progress(done, total, label):
+        ratio = done / total if total else 1
+        progress(78 + ratio * 16, label)
+
+    progress(78, "Đang tạo file Excel xuất...")
+    output = create_output_workbook(
+        sales_content,
+        sales_mapping,
+        allocations,
+        stock_rows,
+        summary,
+        policy,
+        sale_only_codes,
+        purchase_lines=purchase_lines,
+        sales_lines=sales_lines,
+        progress_callback=output_progress,
+        ledger=ledger,
+        missing_barem_report=missing_barem_report,
+        ambiguous_steel_rows=ambiguous_steel_rows,
+    )
+    progress(94, "Đang lưu file kết quả...")
+    job_id, filename, _ = save_output(output, sales_filename)
+    progress(99, "Đang chuẩn bị giao diện Stage 2...")
+    return {
+        "job_id": job_id,
+        "filename": filename,
+        "summary": summary,
+        "policy": policy,
+        "warnings": warnings[:30],
+        "missing_barem_report": missing_barem_report,
+        "future_purchase_reorder_report": summary.get("future_purchase_reorder_report", []),
+        "ambiguous_steel_rows": ambiguous_steel_rows,
+        "company_detection_rules": company_detection_rules,
+        "verification": [{
+            "group": row[0],
+            "check": row[1],
+            "original_value": row[2],
+            "processed_value": row[3],
+            "difference": row[4],
+            "tolerance": row[5],
+            "status": row[6],
+            "explanation": row[7],
+        } for row in verification_rows],
+        "sales_report_rows": sales_report_rows,
+        "allocation_count": len(allocations),
+        "stock_count": len(stock_rows),
+        "sale_only_codes": sale_only_codes,
+        "ledger": ledger,
+        "allocations": [{
+            "row_number": item["row_number"],
+            "variant_code": item["variant_code"],
+            "base_code": item["base_code"],
+            "product_name": item["product_name"],
+            "quantity": item["quantity"],
+            "invoice_no": item.get("invoice_no", ""),
+            "invoice_date": item.get("invoice_date", ""),
+            "invoice_date_iso": item.get("invoice_date_iso", ""),
+            "sale_split_codes": item.get("sale_split_codes", ""),
+            "material_quantity": item["material_quantity"],
+            "finished_quantity": item["finished_quantity"],
+            "finished_variant_code": item.get("finished_variant_code", item.get("variant_code", "")),
+            "inventory_before": item["inventory_before"],
+            "used": item["used"],
+            "inventory_after": item["inventory_after"],
+            "rejected": item["rejected"],
+            "inventory_before_detail": inventory_text(item["inventory_before"]),
+            "detail": detail_text(item["used"]),
+            "inventory_after_detail": inventory_text(item["inventory_after"]),
+            "rejected_detail": rejected_text(item["rejected"]),
+        } for item in allocations],
+        "stock_rows": stock_rows,
+    }
+
+
+def update_analysis_job(job_id, **fields):
+    with ANALYSIS_LOCK:
+        job = ANALYSIS_JOBS.setdefault(job_id, {})
+        job.update(fields)
+
+
+def get_analysis_job(job_id):
+    with ANALYSIS_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def run_analysis_job(job_id, purchase_content, sales_content, opening_content, raw_mapping, policy, sales_filename, barem_content=None):
+    def progress(percent, label):
+        update_analysis_job(job_id, status="running", progress=round(percent), label=label)
+
+    try:
+        result = analysis_payload(
+            purchase_content,
+            sales_content,
+            opening_content,
+            raw_mapping,
+            policy,
+            sales_filename,
+            progress=progress,
+            barem_content=barem_content,
+        )
+        update_analysis_job(job_id, status="complete", progress=100, label="Hoàn tất Stage 2.", result=result)
+    except Exception as exc:
+        update_analysis_job(job_id, status="error", progress=0, label=str(exc), error=str(exc))
+
+
+@app.post("/api/analyze")
+def analyze():
+    purchase_file = request.files.get("purchase_file")
+    sales_file = request.files.get("sales_file")
+    opening_file = request.files.get("opening_file")
+    barem_file = request.files.get("barem_file")
+    if not purchase_file or not sales_file:
+        return jsonify({"error": "Cần chọn hóa đơn mua vào và hóa đơn bán ra."}), 400
+    try:
+        raw_mapping = json.loads(request.form.get("mapping") or "{}")
+        policy = clean_policy(json.loads(request.form.get("policy") or "{}"))
+        purchase_content = purchase_file.read()
+        sales_content = sales_file.read()
+        opening_content = opening_file.read() if opening_file and opening_file.filename else None
+        barem_content = barem_file.read() if barem_file and barem_file.filename else None
+        return jsonify(analysis_payload(
+            purchase_content,
+            sales_content,
+            opening_content,
+            raw_mapping,
+            policy,
+            sales_file.filename,
+            barem_content=barem_content,
+        ))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/analyze-job")
+def analyze_job():
+    purchase_file = request.files.get("purchase_file")
+    sales_file = request.files.get("sales_file")
+    opening_file = request.files.get("opening_file")
+    barem_file = request.files.get("barem_file")
+    if not purchase_file or not sales_file:
+        return jsonify({"error": "Cần chọn hóa đơn mua vào và hóa đơn bán ra."}), 400
+    try:
+        raw_mapping = json.loads(request.form.get("mapping") or "{}")
+        policy = clean_policy(json.loads(request.form.get("policy") or "{}"))
+        purchase_content = purchase_file.read()
+        sales_content = sales_file.read()
+        opening_content = opening_file.read() if opening_file and opening_file.filename else None
+        barem_content = barem_file.read() if barem_file and barem_file.filename else None
+        job_id = uuid.uuid4().hex
+        update_analysis_job(job_id, status="queued", progress=0, label="Đã tải file lên server. Đang xếp hàng xử lý...")
+        worker = threading.Thread(
+            target=run_analysis_job,
+            args=(job_id, purchase_content, sales_content, opening_content, raw_mapping, policy, sales_file.filename, barem_content),
+            daemon=True,
+        )
+        worker.start()
+        return jsonify({"analysis_job_id": job_id})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/analyze-job/<job_id>")
+def analyze_job_status(job_id):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return jsonify({"error": "Mã xử lý không hợp lệ."}), 404
+    job = get_analysis_job(job_id)
+    if not job:
+        return jsonify({"error": "Không tìm thấy tiến trình xử lý."}), 404
+    return jsonify(job)
+
+
+@app.get("/api/download/<job_id>")
+def download(job_id):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return jsonify({"error": "Mã kết quả không hợp lệ."}), 404
+    matching = list(OUTPUT_DIR.glob(f"{job_id}_*.xlsx"))
+    if not matching:
+        return jsonify({"error": "Không tìm thấy file kết quả."}), 404
+    path = matching[0]
+    filename = path.name[len(job_id) + 1:]
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def installed_exe_path():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return (RESOURCE_DIR / "deploy" / "InventoryAllocator.exe").resolve()
+
+
+def write_update_script(update_exe, target_exe):
+    script_path = BASE_DIR / "update_inventory_allocator.ps1"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    desktop_shortcut = "Inventory Allocator.lnk"
+    current_pid = os.getpid()
+    script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$UpdateExe = {ps_quote(update_exe)}
+$TargetExe = {ps_quote(target_exe)}
+$CurrentPid = {current_pid}
+$ShortcutName = {ps_quote(desktop_shortcut)}
+Start-Sleep -Seconds 2
+
+Get-Process -Name 'InventoryAllocator' -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.Id -ne $PID }} |
+  Stop-Process -Force -ErrorAction SilentlyContinue
+for ($i = 0; $i -lt 40; $i++) {{
+  $stillRunning = Get-Process -Name 'InventoryAllocator' -ErrorAction SilentlyContinue
+  if (-not $stillRunning) {{ break }}
+  Start-Sleep -Milliseconds 250
+}}
+
+$desktopPaths = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory')
+) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
+
+$shell = New-Object -ComObject WScript.Shell
+foreach ($desktop in $desktopPaths) {{
+  Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {{
+    $remove = $false
+    try {{
+      $shortcut = $shell.CreateShortcut($_.FullName)
+      $target = [string]$shortcut.TargetPath
+      $icon = [string]$shortcut.IconLocation
+      if ($_.BaseName -like '*Inventory Allocator*' -or $_.BaseName -like '*InventoryAllocator*') {{ $remove = $true }}
+      if ($target -like '*InventoryAllocator.exe*' -or $icon -like '*InventoryAllocator.exe*') {{ $remove = $true }}
+    }} catch {{}}
+    if ($remove) {{ Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }}
+  }}
+}}
+
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetExe) | Out-Null
+for ($i = 0; $i -lt 40; $i++) {{
+  if (Test-Path $TargetExe) {{
+    Remove-Item -LiteralPath $TargetExe -Force -ErrorAction SilentlyContinue
+  }}
+  if (-not (Test-Path $TargetExe)) {{ break }}
+  Start-Sleep -Milliseconds 250
+}}
+if (Test-Path $TargetExe) {{
+  throw "Không xóa được exe cũ: $TargetExe"
+}}
+Copy-Item -LiteralPath $UpdateExe -Destination $TargetExe -Force
+
+$userDesktop = [Environment]::GetFolderPath('Desktop')
+if ($userDesktop -and (Test-Path $TargetExe)) {{
+  $shortcutPath = Join-Path $userDesktop $ShortcutName
+  $link = $shell.CreateShortcut($shortcutPath)
+  $link.TargetPath = $TargetExe
+  $link.WorkingDirectory = Split-Path -Parent $TargetExe
+  $link.IconLocation = $TargetExe + ',0'
+  $link.Description = 'Inventory Allocator version {APP_VERSION}'
+  $link.Save()
+}}
+
+Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $TargetExe)
+Start-Sleep -Seconds 2
+Remove-Item -LiteralPath $UpdateExe -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"""
+    script_path.write_text(script, encoding="utf-8")
+    return script_path
+
+
+@app.get("/api/version")
+def version():
+    return jsonify({
+        "version": APP_VERSION,
+        "pid": os.getpid(),
+        "exe": str(installed_exe_path()),
+    })
+
+
+@app.get("/api/default-barem")
+def default_barem():
+    return jsonify({
+        "rows": builtin_barem_rows(),
+        "count": len(DEFAULT_BAREM_MAP["by_profile"]),
+    })
+
+
+@app.post("/api/update-exe")
+def update_exe():
+    uploaded = request.files.get("exe_file")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"error": "Cần chọn file .exe để cập nhật."}), 400
+    if not uploaded.filename.lower().endswith(".exe"):
+        return jsonify({"error": "File cập nhật phải là .exe."}), 400
+    update_dir = BASE_DIR / "updates"
+    update_dir.mkdir(parents=True, exist_ok=True)
+    update_path = update_dir / f"InventoryAllocator_update_{uuid.uuid4().hex}.exe"
+    uploaded.save(update_path)
+    if update_path.stat().st_size <= 0:
+        update_path.unlink(missing_ok=True)
+        return jsonify({"error": "File .exe cập nhật bị rỗng."}), 400
+    target_exe = installed_exe_path()
+    script_path = write_update_script(update_path, target_exe)
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        cwd=str(target_exe.parent),
+    )
+    return jsonify({
+        "message": "Đã nhận file cập nhật. Ứng dụng sẽ tự dừng, thay exe mới, tạo lại shortcut và mở lại.",
+        "version": APP_VERSION,
+    })
+
+
+@app.get("/api/opening-template")
+def opening_template():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TonDauKy"
+    write_table(sheet, ["Mã VT", "Tên hàng", "Số lượng đầu kỳ", "Đơn giá vốn (tùy chọn)"], [
+        ["MAHANG.001", "Ví dụ hàng hóa", 0, ""],
+    ])
+    stream = BytesIO()
+    workbook.save(stream)
+    stream.seek(0)
+    return send_file(
+        stream,
+        as_attachment=True,
+        download_name="mau_ton_dau_ky.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def frontend(path):
+    candidate = STATIC_DIR / path
+    if path and candidate.exists() and candidate.is_file():
+        return send_from_directory(STATIC_DIR, path)
+    return send_from_directory(STATIC_DIR, "index.html")
+
+
+def open_browser():
+    webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
+
+
+def tray_icon_image():
+    if Image is None:
+        return None
+    if ICON_PATH.exists():
+        with Image.open(ICON_PATH) as image:
+            return image.convert("RGBA").copy()
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((8, 8, 56, 56), radius=13, fill=(7, 10, 14, 255))
+    draw.rounded_rectangle((17, 29, 42, 44), radius=5, fill=(248, 250, 252, 255))
+    draw.rounded_rectangle((41, 32, 52, 41), radius=5, fill=(248, 250, 252, 255))
+    draw.rounded_rectangle((44, 34, 49, 39), radius=3, fill=(7, 10, 14, 255))
+    draw.ellipse((14, 43, 47, 51), fill=(248, 250, 252, 255))
+    for x in (24, 31, 38):
+        draw.arc((x - 4, 14, x + 4, 29), 100, 260, fill=(248, 250, 252, 230), width=2)
+    return image
+
+
+def open_from_tray(icon=None, item=None):
+    open_browser()
+
+
+def quit_from_tray(icon=None, item=None):
+    if icon is not None:
+        icon.stop()
+    os._exit(0)
+
+
+def run_tray_icon():
+    if pystray is None:
+        return False
+    image = tray_icon_image()
+    if image is None:
+        return False
+    menu = pystray.Menu(
+        pystray.MenuItem("Mở Inventory Allocator", open_from_tray, default=True),
+        pystray.MenuItem("Dừng ứng dụng", quit_from_tray),
+    )
+    icon = pystray.Icon("InventoryAllocator", image, "Inventory Allocator", menu)
+    icon.run()
+    return True
+
+
+def write_startup_log(message):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    with (BASE_DIR / "startup.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+
+
+def run_server():
+    try:
+        write_startup_log(f"Starting Flask server on 127.0.0.1:{APP_PORT}")
+        app.run(host="127.0.0.1", port=APP_PORT, debug=False, use_reloader=False)
+    except BaseException:
+        write_startup_log(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
+    threading.Timer(0.8, open_browser).start()
+    if not run_tray_icon():
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass

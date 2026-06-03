@@ -16,3 +16,169 @@ body {
 button {
   font-family: 'Inter', sans-serif;
 }
+
+.price-report-scroll {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+}
+
+.price-report-body {
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
+.price-report-table {
+  min-width: 100% !important;
+  table-layout: fixed;
+}
+
+.summary-report-table {
+  width: 1815px !important;
+}
+
+.invoice-report-table {
+  width: 2375px !important;
+}
+
+.price-report-table td {
+  white-space: nowrap;
+}
+
+.price-report-table .report-text {
+  white-space: normal;
+}
+
+.price-report-table .report-number {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.price-report-total {
+  font-weight: 800;
+}
+
+.price-report-total td {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  border-top: 2px solid #cfe0f2;
+  background: #fff;
+}
+
+.price-report-table .report-action {
+  position: sticky;
+  right: 0;
+  z-index: 3;
+  white-space: nowrap;
+  background: #fff;
+}
+
+.price-report-table th.report-action {
+  z-index: 11;
+  background: #eef6ff;
+}
+
+.price-report-total .report-action {
+  z-index: 5;
+}
+
+.invoice-status-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-8);
+  padding: var(--space-4);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.invoice-status-header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  align-items: flex-start;
+}
+
+.invoice-status-header h3 {
+  margin: 0 0 var(--space-1);
+  color: var(--color-text);
+}
+
+.invoice-status-header p,
+.invoice-status-empty,
+.invoice-status-loading {
+  margin: 0;
+  color: var(--color-muted);
+}
+
+.invoice-status-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.invoice-status-list {
+  display: grid;
+  gap: var(--space-2);
+  max-height: 260px;
+  overflow: auto;
+  padding-right: var(--space-2);
+}
+
+.invoice-status-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  font-weight: 800;
+}
+
+.invoice-status-item input {
+  width: 18px;
+  height: 18px;
+}
+
+.invoice-status-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.invoice-status-count {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.invoice-status-mode {
+  padding: var(--space-1) var(--space-2);
+  border-radius: 999px;
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  white-space: nowrap;
+}
+
+.invoice-status-mode.process {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.skipped-item.blink-company-customization {
+  animation: companyCustomizationBlink 500ms ease-in-out 4;
+}
+
+@keyframes companyCustomizationBlink {
+  0%, 100% {
+    background: #fff;
+    box-shadow: none;
+  }
+
+  50% {
+    background: #fff3d9;
+    box-shadow: inset 0 0 0 2px rgba(154, 101, 28, 0.34);
+  }
+}

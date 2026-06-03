@@ -1,5 +1,5 @@
 {
-  "selected_profile": "son_phuong",
+  "selected_profile": "cao_thanh",
   "profiles": {
     "son_phuong": {
       "prefixes": {},
@@ -13,6 +13,7 @@
       "repeated_phrase_removals": [],
       "price_group_rules": {},
       "price_range_rules": {},
+      "price_adjust_all_percent": 0.0,
       "manual_code_overrides": {},
       "include_company_prefix": true,
       "output_path": ""
@@ -21,18 +22,18 @@
       "prefixes": {},
       "selected_products": {},
       "removed_companies": {},
-      "word_rules": {
-        "tôn": "TON",
-        "đen": "DEN"
-      },
+      "word_rules": {},
       "first_word_rules": {},
       "repeated_phrase_removals": [
         "inox"
       ],
       "price_group_rules": {},
       "price_range_rules": {},
-      "manual_code_overrides": {},
-      "include_company_prefix": true,
+      "price_adjust_all_percent": 0.0,
+      "manual_code_overrides": {
+        "111|||Keep": "KEEPCODE"
+      },
+      "include_company_prefix": false,
       "output_path": ""
     },
     "quang_thinh": {
@@ -47,6 +48,7 @@
       "repeated_phrase_removals": [],
       "price_group_rules": {},
       "price_range_rules": {},
+      "price_adjust_all_percent": 0.0,
       "manual_code_overrides": {},
       "include_company_prefix": true,
       "output_path": ""
@@ -58,7 +60,7 @@
     "address_col": "H",
     "product_col": "M",
     "qty_col": "O",
-    "price_col": "",
+    "price_col": "P",
     "output_col": "L"
   }
 }

@@ -23,6 +23,7 @@
           <button class="btn-danger btn-sm" (click)="deleteProfileCache()" [disabled]="isLoading">Xóa cache</button>
         </div>
       </div>
+      <div class="app-version">Version {{ appVersion }}</div>
       <div class="config-loading" *ngIf="showConfigOperationLoading" role="status" aria-live="polite">
         <span class="config-loading-spinner" aria-hidden="true"></span>
         <span>{{ configOperationLabel || 'Đang tải cấu hình...' }}</span>
@@ -97,9 +98,41 @@
             <option *ngFor="let c of columns" [value]="c.letter">{{ c.label }}</option>
           </select>
         </div>
+        <div class="form-group">
+          <label>Trạng thái hóa đơn <small>Chọn cột rồi tick trạng thái cần bỏ qua hoặc xử lý.</small></label>
+          <select class="form-control" [(ngModel)]="invoiceStatusCol" (ngModelChange)="onInvoiceStatusColumnChange()">
+            <option value="">Không dùng</option>
+            <option *ngFor="let c of columns" [value]="c.letter">{{ c.label }}</option>
+          </select>
+        </div>
         <div class="form-group output-path-group">
           <label>Thư mục hoặc file xuất <small>Bỏ trống để tải file kết quả về trình duyệt</small></label>
           <input class="form-control" [(ngModel)]="outputPath" placeholder="Bỏ trống để xuất vào thư mục outputs" />
+        </div>
+      </div>
+
+      <div class="invoice-status-panel" *ngIf="invoiceStatusCol">
+        <div class="invoice-status-header">
+          <div>
+            <h3>Trạng thái hóa đơn trong cột {{ invoiceStatusCol }}</h3>
+            <p>Tick là bỏ qua khi kiểm tra và xử lý file. Bỏ tick là vẫn xử lý dòng đó.</p>
+          </div>
+          <div class="invoice-status-actions">
+            <button class="btn-secondary" type="button" (click)="setAllInvoiceStatuses(true)" [disabled]="!invoiceStatusOptions.length">Bỏ qua tất cả</button>
+            <button class="btn-secondary" type="button" (click)="setAllInvoiceStatuses(false)" [disabled]="!invoiceStatusOptions.length">Xử lý tất cả</button>
+          </div>
+        </div>
+        <div class="invoice-status-loading" *ngIf="isLoadingInvoiceStatuses">Đang đọc trạng thái...</div>
+        <div class="invoice-status-empty" *ngIf="!isLoadingInvoiceStatuses && !invoiceStatusOptions.length">
+          Không tìm thấy trạng thái hóa đơn trong cột này.
+        </div>
+        <div class="invoice-status-list" *ngIf="!isLoadingInvoiceStatuses && invoiceStatusOptions.length">
+          <label class="invoice-status-item" *ngFor="let status of invoiceStatusOptions">
+            <input type="checkbox" [(ngModel)]="status.skip" (ngModelChange)="syncInvoiceStatusSkipValuesFromOptions()" />
+            <span class="invoice-status-name">{{ status.value }}</span>
+            <span class="invoice-status-count">{{ status.count }} dòng</span>
+            <span class="invoice-status-mode" [class.process]="!status.skip">{{ status.skip ? 'Bỏ qua' : 'Xử lý' }}</span>
+          </label>
         </div>
       </div>
 
@@ -119,6 +152,7 @@
 
       <div class="actions">
         <button class="btn-secondary" (click)="goBack()" [disabled]="isLoading">Quay lại</button>
+        <button class="btn-secondary" (click)="saveStage2Columns()" [disabled]="isLoading">Lưu cột cho {{ selectedProfileLabelText }}</button>
         <button class="btn-primary check-loading-button" (click)="checkCompanies()" [disabled]="isLoading">
           <ng-container *ngIf="isLoading; else checkReady">
             <span class="button-loading-icon" aria-hidden="true"></span>
@@ -174,6 +208,7 @@
               <span>{{ section.productCount }} hàng hóa</span>
               <span>{{ section.codeCount }} mã VT</span>
               <span>{{ section.rowCount }} dòng</span>
+              <button type="button" class="btn-secondary btn-sm" *ngIf="section.company" (click)="skipCompany(section.company)" [disabled]="stageActionLoading">Bỏ công ty</button>
               <button type="button" class="btn-secondary btn-sm" (click)="toggleProductCodeSection(section)" [disabled]="stageActionLoading">
                 {{ section.expanded ? 'Thu gọn công ty' : 'Mở công ty' }}
               </button>
@@ -220,10 +255,32 @@
           <span>Gộp theo Mã VT cuối cùng và tính giá bán trung bình theo đơn giá nhân số lượng.</span>
         </div>
         <button class="btn-secondary btn-sm" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceGroupModal()">Mở lại lọc đơn giá</button>
+        <button type="button" class="btn-secondary btn-sm" *ngIf="selectedProfile === 'cao_thanh'" (click)="openPriceReportModal()">Báo cáo bán hàng</button>
       </div>
 
+      <section class="code-group-card" *ngIf="stage3Phase === 'price'">
+        <div class="code-group-header">
+          <div>
+            <span class="code-group-label">Tổng hợp report lỗ</span>
+            <strong>Chỉ tính các dòng đang bị lỗ theo % lọc và % lãi hiện tại</strong>
+          </div>
+          <label class="prefix-toggle">
+            <input type="checkbox" [(ngModel)]="priceLossOnly" (ngModelChange)="refreshPriceCodeSections()" />
+            <span>Chỉ hiện mã VT có dòng lỗ</span>
+          </label>
+        </div>
+        <div class="stats-grid loss-report-stats">
+          <div class="stat-card"><strong>{{ priceLossReport.rowCount }}</strong><span>Tổng dòng lỗ</span></div>
+          <div class="stat-card"><strong>{{ priceLossReport.rowPercent | number:'1.2-2' }}%</strong><span>% dòng lỗ / tổng dòng</span></div>
+          <div class="stat-card"><strong>{{ formatPrice(priceLossReport.revenue) }}</strong><span>Tổng doanh thu dòng lỗ</span></div>
+          <div class="stat-card"><strong>{{ priceLossReport.revenuePercent | number:'1.2-2' }}%</strong><span>% doanh thu dòng lỗ / tổng doanh thu</span></div>
+          <div class="stat-card"><strong class="price-loss">{{ formatLossPrice(priceLossReport.lossAmount) }}</strong><span>Tổng tiền lỗ</span></div>
+          <div class="stat-card"><strong class="price-loss">{{ formatLossPercent(priceLossReport.lossPercent) }}</strong><span>Tỉ lệ lỗ / doanh thu</span></div>
+        </div>
+      </section>
+
       <div class="code-group-list price-code-group-list" *ngIf="stage3Phase === 'price' && !showPriceGroupModal" [class.loading]="stageActionLoading">
-        <div class="empty-state" *ngIf="!priceCodeSections.length">Chưa có mã VT nào cần lọc đơn giá.</div>
+        <div class="empty-state" *ngIf="!priceCodeSections.length">{{ priceLossOnly ? 'Không có mã VT nào có dòng lỗ.' : 'Chưa có mã VT nào cần lọc đơn giá.' }}</div>
         <section class="code-company-section" *ngFor="let section of priceCodeSections; trackBy: trackByKey">
           <div class="code-company-header">
             <div>
@@ -308,10 +365,10 @@
                               <th>Đơn vị tính</th>
                               <th>Đơn giá</th>
                               <th>Số lượng</th>
-                              <th>Thành tiền</th>
+                              <th>THÀNH TIỀN DOANH THU</th>
                               <th>Tiền vốn</th>
-                              <th>Chênh lệch thành tiền</th>
-                              <th>%</th>
+                              <th>Lãi/lỗ</th>
+                              <th>Tỉ lệ lãi/lỗ</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -325,7 +382,7 @@
                               <td>{{ formatPrice(detail.totalAmount) }}</td>
                               <td>{{ formatPrice(detail.costAmount) }}</td>
                               <td><span class="price-delta" [class.profit]="detail.deltaTotal > 0" [class.loss]="detail.deltaTotal < 0" [class.neutral]="detail.deltaTotal === 0">{{ formatSignedPrice(detail.deltaTotal) }}</span></td>
-                              <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ bucketDeltaLabel(detail) }} {{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
+                              <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
                             </tr>
                           </tbody>
                         </table>
@@ -349,7 +406,7 @@
         <button type="button" class="btn-secondary" *ngIf="selectedProfile === 'cao_thanh' && stage3Phase === 'customize'" (click)="openSuspectModal()" [disabled]="!companies.length || stageActionLoading">
           Danh sách tình nghi
         </button>
-        <button class="btn-secondary" *ngIf="stage3Phase === 'customize'" (click)="openSkippedModal()" [disabled]="stageActionLoading">Mục đã bỏ qua ({{ skippedCompanyList.length }})</button>
+        <button class="btn-secondary" *ngIf="stage3Phase === 'customize'" (click)="openSkippedModal()" [disabled]="stageActionLoading">Tùy chỉnh công ty ({{ skippedCompanyList.length }} bỏ qua)</button>
         <button class="btn-secondary" (click)="saveProfileConfig()" [disabled]="isLoading || stageActionLoading">Lưu cấu hình</button>
         <button class="btn-primary" *ngIf="selectedProfile !== 'cao_thanh' || stage3Phase === 'price'" (click)="processFile()" [disabled]="isLoading">
           {{ processingProgress !== null ? ('Đang xử lý ' + processingProgress + '%') : 'Xác nhận & Xử lý' }}
@@ -361,6 +418,178 @@
           <div class="processing-progress-text">{{ processingProgressLabel }} {{ processingProgress }}%</div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" *ngIf="showPriceReportModal">
+  <div class="modal-content" style="width: min(98vw, 1680px); max-height: 94vh;">
+    <div class="modal-header">Báo cáo bán hàng sau lọc đơn giá</div>
+    <div class="modal-body" style="display: grid; gap: 16px;">
+      <div class="config-loading" *ngIf="priceReportLoading" role="status" aria-live="polite">
+        <span class="config-loading-spinner" aria-hidden="true"></span>
+        <span>Đang kết xuất báo cáo...</span>
+      </div>
+      <ng-container *ngIf="!priceReportLoading">
+        <div class="suspect-tabs" role="tablist" aria-label="Loại báo cáo bán hàng" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+          <button type="button" class="suspect-tab" role="tab" [class.active]="activePriceReportTab === 'summary'" [attr.aria-selected]="activePriceReportTab === 'summary'" (click)="selectPriceReportTab('summary')" [disabled]="priceReportTransitionLoading">Báo cáo tổng hợp bán hàng</button>
+          <button type="button" class="suspect-tab" role="tab" [class.active]="activePriceReportTab === 'invoice'" [attr.aria-selected]="activePriceReportTab === 'invoice'" (click)="selectPriceReportTab('invoice')" [disabled]="priceReportTransitionLoading">Kết xuất hóa đơn</button>
+        </div>
+
+        <div class="config-loading" *ngIf="priceReportTransitionLoading" role="status" aria-live="polite">
+          <span class="config-loading-spinner" aria-hidden="true"></span>
+          <span>{{ priceReportTransitionLabel }}</span>
+        </div>
+
+        <section class="code-group-card" *ngIf="!priceReportTransitionLoading && activePriceReportTab === 'summary'">
+          <div class="code-group-header">
+            <div>
+              <span class="code-group-label">Báo cáo tổng hợp bán hàng</span>
+              <strong>{{ priceReportSummaryRows.length }} mã VT sau tách giá</strong>
+            </div>
+            <div class="code-group-meta">
+              <span>Mã tách .001/.002 ở trên</span>
+              <span>Bấm Xem hóa đơn để mở chi tiết liên quan</span>
+              <span>Tỷ lệ tổng = tổng lãi/lỗ / tổng doanh thu</span>
+            </div>
+          </div>
+          <div class="table-container price-report-scroll">
+            <div class="price-report-body">
+            <table class="data-table price-report-table summary-report-table">
+              <colgroup>
+                <col style="width: 60px;"><col style="width: 180px;"><col style="width: 270px;"><col style="width: 85px;"><col style="width: 125px;">
+                <col style="width: 145px;"><col style="width: 175px;"><col style="width: 145px;"><col style="width: 175px;"><col style="width: 175px;"><col style="width: 145px;"><col style="width: 135px;">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th class="report-number">STT</th>
+                  <th>Mã VT</th>
+                  <th>Tên hàng</th>
+                  <th>ĐVT</th>
+                  <th class="report-number">Tổng SL bán</th>
+                  <th class="report-number">Đơn giá bán</th>
+                  <th class="report-number">Tổng doanh thu</th>
+                  <th class="report-number">Đơn giá vốn</th>
+                  <th class="report-number">Tiền vốn</th>
+                  <th class="report-number">Lãi/lỗ</th>
+                  <th class="report-number">Tỷ lệ lãi/lỗ</th>
+                  <th class="report-action">Hóa đơn</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr *ngFor="let row of priceReportSummaryRows; trackBy: trackByKey" [attr.id]="'price-report-summary-row-' + row.stt" [class.target-product]="row.key === selectedPriceReportSummaryKey">
+                  <td class="report-number">{{ row.stt }}</td>
+                  <td><code>{{ row.finalCode }}</code></td>
+                  <td class="report-text">{{ row.productName }}</td>
+                  <td>{{ row.unit }}</td>
+                  <td class="report-number">{{ formatQuantity(row.quantity) }}</td>
+                  <td class="report-number">{{ formatPrice(row.salePrice) }}</td>
+                  <td class="report-number">{{ formatPrice(row.saleAmount) }}</td>
+                  <td class="report-number">{{ formatPrice(row.costUnitPrice) }}</td>
+                  <td class="report-number">{{ formatPrice(row.costAmount) }}</td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="row.netAmount > 0" [class.loss]="row.netAmount < 0" [class.neutral]="row.netAmount === 0">{{ formatSignedPrice(row.netAmount) }}</span></td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="row.profitRatio > 0" [class.loss]="row.profitRatio < 0" [class.neutral]="row.profitRatio === 0">{{ row.profitRatio | number:'1.2-2' }}%</span></td>
+                  <td class="report-action"><button type="button" class="btn-secondary btn-sm" (click)="selectPriceReportSummary(row)">Xem hóa đơn</button></td>
+                </tr>
+              </tbody>
+              <tfoot class="price-report-total" *ngIf="priceReportSummaryTotals() as totals">
+                <tr>
+                  <td colspan="4">TỔNG CỘNG</td>
+                  <td></td>
+                  <td class="report-number">{{ formatPrice(totals.salePrice) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.saleAmount) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.costUnitPrice) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.costAmount) }}</td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="totals.netAmount > 0" [class.loss]="totals.netAmount < 0" [class.neutral]="totals.netAmount === 0">{{ formatSignedPrice(totals.netAmount) }}</span></td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="totals.profitRatio > 0" [class.loss]="totals.profitRatio < 0" [class.neutral]="totals.profitRatio === 0">{{ totals.profitRatio | number:'1.2-2' }}%</span></td>
+                  <td class="report-action"></td>
+                </tr>
+              </tfoot>
+            </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="code-group-card" *ngIf="!priceReportTransitionLoading && activePriceReportTab === 'invoice'">
+          <div class="code-group-header">
+            <div>
+              <span class="code-group-label">{{ priceReportInvoiceTitle() }}</span>
+              <strong>{{ visiblePriceReportInvoiceRows().length }} dòng hóa đơn</strong>
+            </div>
+            <div class="code-group-meta">
+              <button type="button" class="btn-secondary btn-sm" (click)="selectPriceReportTab('summary')">Quay lại báo cáo tổng hợp</button>
+              <button type="button" class="btn-secondary btn-sm" *ngIf="selectedPriceReportSummaryKey" (click)="selectedPriceReportSummaryKey = ''">Hiện tất cả hóa đơn</button>
+            </div>
+          </div>
+          <div class="table-container price-report-scroll">
+            <div class="price-report-body">
+            <table class="data-table price-report-table invoice-report-table">
+              <colgroup>
+                <col style="width: 60px;"><col style="width: 105px;"><col style="width: 120px;"><col style="width: 150px;"><col style="width: 320px;">
+                <col style="width: 185px;"><col style="width: 260px;"><col style="width: 105px;"><col style="width: 110px;"><col style="width: 145px;">
+                <col style="width: 175px;"><col style="width: 145px;"><col style="width: 175px;"><col style="width: 180px;"><col style="width: 140px;">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th class="report-number">STT</th>
+                  <th>Số HD</th>
+                  <th>Ngày HD</th>
+                  <th>Mã khách hàng</th>
+                  <th>Tên công ty</th>
+                  <th>Mã VT</th>
+                  <th>Tên vật tư</th>
+                  <th>Đơn vị tính</th>
+                  <th class="report-number">Số lượng</th>
+                  <th class="report-number">Đơn giá bán</th>
+                  <th class="report-number">Thành tiền doanh thu</th>
+                  <th class="report-number">Đơn giá vốn</th>
+                  <th class="report-number">Thành tiền vốn</th>
+                  <th class="report-number">Lãi/lỗ</th>
+                  <th class="report-number">Tỉ lệ lãi/lỗ</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr *ngFor="let row of visiblePriceReportInvoiceRows(); let invoiceIndex = index; trackBy: trackByKey">
+                  <td class="report-number">{{ invoiceIndex + 1 }}</td>
+                  <td>{{ row.invoiceNo }}</td>
+                  <td>{{ row.invoiceDate }}</td>
+                  <td>{{ row.customerCode }}</td>
+                  <td class="report-text">{{ row.companyName }}</td>
+                  <td><code>{{ row.finalCode }}</code></td>
+                  <td class="report-text">{{ row.productName }}</td>
+                  <td>{{ row.unit }}</td>
+                  <td class="report-number">{{ formatQuantity(row.quantity) }}</td>
+                  <td class="report-number">{{ formatPrice(row.salePrice) }}</td>
+                  <td class="report-number">{{ formatPrice(row.saleAmount) }}</td>
+                  <td class="report-number">{{ formatPrice(row.costUnitPrice) }}</td>
+                  <td class="report-number">{{ formatPrice(row.costAmount) }}</td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="row.deltaTotal > 0" [class.loss]="row.deltaTotal < 0" [class.neutral]="row.deltaTotal === 0">{{ formatSignedPrice(row.deltaTotal) }}</span></td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="row.profitRatio > 0" [class.loss]="row.profitRatio < 0" [class.neutral]="row.profitRatio === 0">{{ row.profitRatio | number:'1.2-2' }}%</span></td>
+                </tr>
+              </tbody>
+              <tfoot class="price-report-total" *ngIf="priceReportInvoiceTotals() as totals">
+                <tr>
+                  <td colspan="8">TỔNG CỘNG</td>
+                  <td></td>
+                  <td class="report-number">{{ formatPrice(totals.salePrice) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.saleAmount) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.costUnitPrice) }}</td>
+                  <td class="report-number">{{ formatPrice(totals.costAmount) }}</td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="totals.netAmount > 0" [class.loss]="totals.netAmount < 0" [class.neutral]="totals.netAmount === 0">{{ formatSignedPrice(totals.netAmount) }}</span></td>
+                  <td class="report-number"><span class="price-delta" [class.profit]="totals.profitRatio > 0" [class.loss]="totals.profitRatio < 0" [class.neutral]="totals.profitRatio === 0">{{ totals.profitRatio | number:'1.2-2' }}%</span></td>
+                </tr>
+              </tfoot>
+            </table>
+            </div>
+          </div>
+        </section>
+      </ng-container>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn-primary btn-sm" (click)="exportPriceReportExcel()" [disabled]="priceReportLoading || priceReportExportLoading || !priceReportSummaryRows.length">
+        {{ priceReportExportLoading ? 'Đang xuất Excel...' : 'Xuất Excel' }}
+      </button>
+      <button type="button" class="btn-secondary btn-sm" (click)="closePriceReportModal()">Đóng</button>
     </div>
   </div>
 </div>
@@ -419,7 +648,7 @@
       <ng-template #prefixCompanyRow let-item>
         <td class="center">
           <label class="process-check">
-            <input type="checkbox" [(ngModel)]="item.process" (ngModelChange)="verifyPrefixesWithLoading('Đang cập nhật lựa chọn...')" />
+            <input type="checkbox" [(ngModel)]="item.process" (ngModelChange)="verifyPrefixesWithLoading('Đang cập nhật lựa chọn...', false, false)" />
             <span class="check-visual" aria-hidden="true"></span>
             <span class="sr-only">Chọn xử lý {{ item.company }}</span>
           </label>
@@ -559,24 +788,48 @@
 
 <div class="modal-overlay" *ngIf="showSkippedModal">
     <div class="modal-content skipped-modal">
-      <div class="modal-header">Mục đã bỏ qua</div>
-      <div class="modal-body">
-        <p class="modal-description">Danh sách này gồm các đơn vị bị bỏ qua và các hàng hóa bị bỏ chọn trong những đơn vị vẫn đang được xử lý của {{ selectedProfileLabelText }}.</p>
-        <div class="empty-state" *ngIf="!skippedCompanyList.length">Chưa có công ty nào bị bỏ qua.</div>
-        <div class="skipped-list" *ngIf="skippedCompanyList.length">
-          <div class="skipped-item" *ngFor="let company of skippedCompanyList; trackBy: trackByKey">
-            <div>
-              <strong>{{ company.mst }}</strong>
-              <span>{{ company.companyName }}</span>
-              <span>{{ company.label }}</span>
-              <span *ngIf="company.kind === 'product'">{{ company.productName }}</span>
+      <div class="modal-header">Tùy chỉnh công ty</div>
+      <div id="company-customization-modal-body" class="modal-body">
+        <p class="modal-description">Chọn các công ty hoặc hàng hóa cần bỏ/khôi phục của {{ selectedProfileLabelText }}. Thay đổi chỉ được tính lại một lần khi bấm <strong>Xác nhận &amp; áp dụng</strong>.</p>
+        <section class="rule-section">
+          <div class="rule-section-title"><strong>Công ty sẽ xử lý ({{ customizationActiveCompanies.length }})</strong></div>
+          <div class="empty-state" *ngIf="!customizationActiveCompanies.length">Không có công ty nào sẽ xử lý.</div>
+          <div id="company-customization-active-list" class="skipped-list" *ngIf="customizationActiveCompanies.length">
+            <div class="skipped-item" *ngFor="let company of customizationActiveCompanies; trackBy: trackByKey" [attr.id]="companyCustomizationRowId(activeCompanyCustomizationRowKey(company))" [class.blink-company-customization]="blinkingCompanyCustomizationKey === activeCompanyCustomizationRowKey(company)">
+              <div>
+                <strong>{{ company.mst }}</strong>
+                <span>{{ company.company }}</span>
+                <span>Sẽ xử lý</span>
+              </div>
+              <div class="code-group-meta">
+                <button class="btn-secondary btn-sm" (click)="openProductsFromCompanyCustomization(company, '', 'company-customization-active-list', activeCompanyCustomizationRowKey(company))" [disabled]="stageActionLoading">Xem hàng hóa</button>
+                <button class="btn-secondary btn-sm" (click)="stageSkipCompany(company)" [disabled]="stageActionLoading">Bỏ công ty</button>
+              </div>
             </div>
-            <button class="btn-secondary btn-sm" (click)="restoreSkippedCompany(company)">Khôi phục</button>
           </div>
-        </div>
+        </section>
+        <section class="rule-section">
+          <div class="rule-section-title"><strong>Mục sẽ bỏ qua ({{ customizationSkippedItems.length }})</strong></div>
+          <div class="empty-state" *ngIf="!customizationSkippedItems.length">Không có công ty hoặc hàng hóa nào sẽ bị bỏ qua.</div>
+          <div id="company-customization-skipped-list" class="skipped-list" *ngIf="customizationSkippedItems.length">
+            <div class="skipped-item" *ngFor="let company of customizationSkippedItems; trackBy: trackByKey" [attr.id]="companyCustomizationRowId(company.key)" [class.blink-company-customization]="blinkingCompanyCustomizationKey === company.key">
+              <div>
+                <strong>{{ company.mst }}</strong>
+                <span>{{ company.companyName }}</span>
+                <span>{{ company.label }}</span>
+                <span *ngIf="company.kind === 'product'">{{ company.productName }}</span>
+              </div>
+              <div class="code-group-meta">
+                <button class="btn-secondary btn-sm" (click)="openProductsFromCompanyCustomization(company.company, company.productName || '', 'company-customization-skipped-list', company.key)" [disabled]="stageActionLoading">Xem hàng hóa</button>
+                <button class="btn-secondary btn-sm" (click)="stageRestoreSkippedItem(company)" [disabled]="stageActionLoading">Khôi phục</button>
+              </div>
+            </div>
+          </div>
+        </section>
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary btn-sm" (click)="showSkippedModal = false">Đóng</button>
+      <button class="btn-secondary btn-sm" (click)="closeCompanyCustomization()" [disabled]="stageActionLoading">{{ companyCustomizeDirty ? 'Hủy thay đổi' : 'Đóng' }}</button>
+      <button class="btn-primary btn-sm" (click)="applyCompanyCustomization()" [disabled]="stageActionLoading || !companyCustomizeDirty">Xác nhận &amp; áp dụng</button>
     </div>
   </div>
 </div>
@@ -590,7 +843,7 @@
         <span class="config-loading-spinner" aria-hidden="true"></span>
         <span>{{ stageActionLoadingLabel || 'Đang áp dụng...' }}</span>
       </div>
-      <div class="price-bulk-controls">
+        <div class="price-bulk-controls">
         <div class="price-bulk-card">
           <strong>Áp % lọc nhóm</strong>
           <div class="percent-cell">
@@ -608,6 +861,7 @@
           </div>
         </div>
       </div>
+      <p class="help-text">Áp % lãi tính giá vốn từ giá bán trung bình từng nhóm. Tỷ lệ lãi/lỗ trong báo cáo được tính từ tổng lãi/lỗ chia tổng doanh thu.</p>
       <div class="rule-summary-row price-modal-list-toggle">
         <div>
           <strong>Danh sách mã VT nhiều đơn giá</strong>
@@ -701,10 +955,10 @@
                                     <th>Đơn vị tính</th>
                                     <th>Đơn giá</th>
                                     <th>Số lượng</th>
-                                    <th>Thành tiền</th>
+                                    <th>THÀNH TIỀN DOANH THU</th>
                                     <th>Tiền vốn</th>
-                                    <th>Chênh lệch thành tiền</th>
-                                    <th>%</th>
+                                    <th>Lãi/lỗ</th>
+                                    <th>Tỉ lệ lãi/lỗ</th>
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -718,7 +972,7 @@
                                     <td>{{ formatPrice(detail.totalAmount) }}</td>
                                     <td>{{ formatPrice(detail.costAmount) }}</td>
                                     <td><span class="price-delta" [class.profit]="detail.deltaTotal > 0" [class.loss]="detail.deltaTotal < 0" [class.neutral]="detail.deltaTotal === 0">{{ formatSignedPrice(detail.deltaTotal) }}</span></td>
-                                    <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ bucketDeltaLabel(detail) }} {{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
+                                    <td><span class="price-delta" [class.profit]="detail.deltaPercent > 0" [class.loss]="detail.deltaPercent < 0" [class.neutral]="detail.deltaPercent === 0">{{ detail.deltaPercent | number:'1.2-2' }}%</span></td>
                                   </tr>
                                 </tbody>
                               </table>

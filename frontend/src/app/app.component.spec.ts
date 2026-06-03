@@ -146,6 +146,7 @@ describe('AppComponent performance helpers', () => {
 
     expect(component.selectedProfileLabelText).toBe('Cao Thành');
     expect(component.wordRuleCountValue).toBe(2);
+    expect(component.activeCompanyList.map(company => company.mst)).toEqual(['123']);
     expect(component.skippedCompanyList.length).toBe(2);
     expect(component.skippedCompanyList.some(item => item.kind === 'company')).toBeTrue();
     expect(component.skippedCompanyList.some(item => item.kind === 'product' && item.productName === 'B')).toBeTrue();
@@ -263,6 +264,23 @@ describe('AppComponent performance helpers', () => {
     expect(component.companyNameInitials('Công ty TNHH Thương Mại')).toBe('TM');
     expect(component.companyNameInitials('Công ty TNHH Sản Xuất')).toBe('SX');
     expect(component.companyNameInitials('Công ty TNHH Dịch Vụ')).toBe('DV');
+  });
+
+  it('keeps the current Stage 3.2 screen intact after saving config', () => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.step = 3;
+    component.stage3Phase = 'price';
+    component.priceConflictRows = [{ key: 'price-code|||A', code: 'A' }];
+    component.priceCodeSections = [{ key: 'section', title: 'Công ty', groups: [{ key: 'group', code: 'A' }] }];
+
+    component.saveProfileConfig();
+
+    expect(component.step).toBe(3);
+    expect(component.stage3Phase).toBe('price');
+    expect(component.priceConflictRows.length).toBe(1);
+    expect(component.priceCodeSections.length).toBe(1);
+    expect(component.showErrorModal).toBeTrue();
   });
 
   it('shows stage loading when verifying prefixes from the prefix modal', fakeAsync(() => {
@@ -405,6 +423,135 @@ describe('AppComponent performance helpers', () => {
     expect(component.productCodeSections[0].codeCount).toBe(1);
   });
 
+  it('refreshes Stage 3.1 summaries and Mã VT list after updating company selection', () => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.includeCompanyPrefix = true;
+    component.companies = [
+      {
+        mst: '111',
+        company: 'Company One',
+        process: true,
+        value: 'C1',
+        selected_products: new Set(['A', 'B']),
+        all_products: [{ name: 'A', count: 2 }, { name: 'B', count: 3 }]
+      },
+      {
+        mst: '222',
+        company: 'Company Two',
+        process: true,
+        value: 'C2',
+        selected_products: new Set(['C']),
+        all_products: [{ name: 'C', count: 4 }]
+      }
+    ];
+
+    component.verifyPrefixes();
+    expect(component.companyCount).toBe(2);
+    expect(component.rowsToProcess).toBe(9);
+    expect(component.productCodeSections.length).toBe(2);
+
+    component.companies[1].process = false;
+    component.companies[0].selected_products.delete('B');
+    component.verifyPrefixes();
+
+    expect(component.companyCount).toBe(1);
+    expect(component.rowsToProcess).toBe(2);
+    expect(component.productCodeSections.length).toBe(1);
+    expect(component.productCodeSections[0].rowCount).toBe(2);
+  });
+
+  it('skips a company from Stage 3.1 and moves it to skipped items', fakeAsync(() => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.includeCompanyPrefix = true;
+    component.companies = [
+      {
+        mst: '111',
+        company: 'Company One',
+        process: true,
+        value: 'C1',
+        selected_products: new Set(['A']),
+        all_products: [{ name: 'A', count: 2 }]
+      },
+      {
+        mst: '222',
+        company: 'Company Two',
+        process: true,
+        value: 'C2',
+        selected_products: new Set(['B']),
+        all_products: [{ name: 'B', count: 3 }]
+      }
+    ];
+
+    component.verifyPrefixes();
+    component.skipCompany(component.companies[1]);
+    tick();
+    tick();
+
+    expect(component.companies[1].process).toBeFalse();
+    expect(component.companyCount).toBe(1);
+    expect(component.rowsToProcess).toBe(2);
+    expect(component.productCodeSections.length).toBe(1);
+    expect(component.activeCompanyList.map(company => company.mst)).toEqual(['111']);
+    expect(component.skippedCompanyList.some(item => item.kind === 'company' && item.mst === '222')).toBeTrue();
+
+    const skippedCompany = component.skippedCompanyList.find(item => item.kind === 'company' && item.mst === '222');
+    component.restoreSkippedCompany(skippedCompany);
+    tick();
+    tick();
+
+    expect(component.activeCompanyList.map(company => company.mst)).toEqual(['111', '222']);
+    expect(component.skippedCompanyList.some(item => item.kind === 'company' && item.mst === '222')).toBeFalse();
+  }));
+
+  it('stages company customization changes and recomputes only after applying', fakeAsync(() => {
+    const component = createComponent();
+    component.companies = [
+      { mst: '111', company: 'Company One', process: true, value: 'C1', selected_products: new Set(['A']), all_products: [{ name: 'A', count: 2 }] },
+      { mst: '222', company: 'Company Two', process: true, value: 'C2', selected_products: new Set(['B']), all_products: [{ name: 'B', count: 3 }] }
+    ];
+    component.verifyPrefixes();
+    spyOn(component, 'verifyPrefixes').and.callThrough();
+
+    component.openSkippedModal();
+    component.stageSkipCompany(component.companies[1]);
+
+    expect(component.companies[1].process).toBeTrue();
+    expect(component.customizationActiveCompanies.map(company => company.mst)).toEqual(['111']);
+    expect(component.customizationSkippedItems.some(item => item.mst === '222')).toBeTrue();
+    expect(component.verifyPrefixes).not.toHaveBeenCalled();
+
+    component.applyCompanyCustomization();
+    tick();
+    tick();
+
+    expect(component.companies[1].process).toBeFalse();
+    expect(component.verifyPrefixes).toHaveBeenCalledTimes(1);
+    expect(component.showSkippedModal).toBeFalse();
+  }));
+
+  it('refreshes Stage 3.1 sections when company prefix mode changes', fakeAsync(() => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.includeCompanyPrefix = true;
+    component.companies = [
+      { mst: '111', company: 'Company One', process: true, value: 'C1', selected_products: new Set(['A']), all_products: [{ name: 'A', count: 1 }] },
+      { mst: '222', company: 'Company Two', process: true, value: 'C2', selected_products: new Set(['A']), all_products: [{ name: 'A', count: 1 }] }
+    ];
+    component.verifyPrefixes();
+    expect(component.productCodeSections.length).toBe(2);
+
+    component.includeCompanyPrefix = false;
+    component.onCompanyPrefixToggleChange();
+    tick(0);
+    tick(0);
+
+    expect(component.productCodeSections.length).toBe(1);
+    expect(component.productCodeSections[0].title).toBe('Tất cả mã VT');
+    expect(component.stageProductCodeTotal()).toBe(1);
+  }));
+
   it('toggles product code company sections and code groups', () => {
     const component = createComponent();
     component.includeCompanyPrefix = false;
@@ -452,6 +599,30 @@ describe('AppComponent performance helpers', () => {
     tick(1600);
     expect(component.blinkingProductKey).toBe('');
   }));
+
+  it('opens company products from customization and returns to that modal when closed', () => {
+    const component = createComponent();
+    const company = {
+      mst: '123',
+      company: 'Company One',
+      process: false,
+      value: 'C1',
+      selected_products: new Set(['A']),
+      all_products: [{ name: 'A', count: 1 }, { name: 'B', count: 1 }]
+    };
+    component.showSkippedModal = true;
+
+    component.openProductsFromCompanyCustomization(company, 'B');
+
+    expect(component.showSkippedModal).toBeFalse();
+    expect(component.showProductModal).toBeTrue();
+    expect(component.targetProductKey).toBe('123|||B');
+
+    component.closeProductModal();
+
+    expect(component.showProductModal).toBeFalse();
+    expect(component.showSkippedModal).toBeTrue();
+  });
 
   it('shows localized loading state while stage work is running', fakeAsync(() => {
     const component = createComponent();
@@ -903,7 +1074,7 @@ describe('AppComponent performance helpers', () => {
     expect(buckets[1].adjustedAverage).toBeCloseTo(120.9, 6);
   }));
 
-  it('applies typed global margin to single and multi price codes when applying filters', fakeAsync(() => {
+  it('applies and stores typed global margin for single and multi price codes immediately', fakeAsync(() => {
     const component = createComponent();
     component.selectedProfile = 'cao_thanh';
     component.includeCompanyPrefix = false;
@@ -934,7 +1105,7 @@ describe('AppComponent performance helpers', () => {
     component.priceAdjustAllPercent = 7;
     component.onPriceAdjustAllPercentChange();
 
-    component.applyPriceGroupRules();
+    component.applyPriceAdjustPercentToAll();
     tick(0);
     tick(0);
 
@@ -945,7 +1116,74 @@ describe('AppComponent performance helpers', () => {
     expect(multiSection.groups[0].buckets.every((bucket: any) => bucket.marginPercent === 7)).toBeTrue();
     expect(singleSection.groups[0].buckets[0].marginPercent).toBe(7);
     expect(singleSection.groups[0].buckets[0].adjustedAverage).toBe(93);
+    expect(component.currentProfileSnapshot().price_adjust_all_percent).toBe(7);
+    expect(component.priceRangeRules['SINGLE'].groups[0].adjust_percent).toBe(7);
+    component.refreshPriceReportRows();
+    expect(component.priceReportSummaryTotals().profitRatio).toBeCloseTo(7, 6);
   }));
+
+  it('restores global and single-price margins from saved Stage 3.2 config', fakeAsync(() => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.includeCompanyPrefix = false;
+    component.companies = [{
+      mst: '123',
+      company: 'Cao Thành',
+      process: true,
+      value: 'CT',
+      selected_products: new Set(['Ống inox 1']),
+      all_products: [
+        { name: 'Ống inox 1', priceRows: [{ excelRow: 1, name: 'Ống inox 1', price: 100, quantity: 1, amount: 100 }] }
+      ]
+    }];
+    component.manualCodeOverrides = { '123|||Ống inox 1': 'SINGLE' };
+    component.refreshPriceGroups();
+    component.priceAdjustAllPercent = 7;
+    component.onPriceAdjustAllPercentChange();
+    component.applyPriceAdjustPercentToAll();
+    tick(0);
+    tick(0);
+    const savedProfile = component.currentProfileSnapshot();
+
+    component.config = {
+      ...config,
+      profiles: {
+        ...config.profiles,
+        cao_thanh: savedProfile
+      }
+    } as unknown as typeof component.config;
+    component.applyProfileConfig();
+    component.refreshPriceGroups();
+
+    expect(component.priceAdjustAllPercent).toBe(7);
+    expect(component.priceConflictRows[0].buckets[0].marginPercent).toBe(7);
+    expect(component.priceConflictRows[0].buckets[0].adjustedAverage).toBe(93);
+  }));
+
+  it('uses restored global margin for a single-price code without its own saved rule', () => {
+    const component = createComponent();
+    component.selectedProfile = 'cao_thanh';
+    component.includeCompanyPrefix = false;
+    component.priceAdjustAllPercent = 7;
+    component.companies = [{
+      mst: '123',
+      company: 'Cao Thành',
+      process: true,
+      value: 'CT',
+      selected_products: new Set(['Ống inox một giá']),
+      all_products: [
+        { name: 'Ống inox một giá', priceRows: [{ excelRow: 1, name: 'Ống inox một giá', price: 100, quantity: 2, amount: 200 }] }
+      ]
+    }];
+    component.manualCodeOverrides = { '123|||Ống inox một giá': 'SINGLE' };
+
+    component.refreshPriceGroups();
+
+    expect(component.priceConflictRows[0].buckets[0].marginPercent).toBe(7);
+    expect(component.priceConflictRows[0].buckets[0].adjustedAverage).toBe(93);
+    component.refreshPriceReportRows();
+    expect(component.priceReportSummaryRows[0].profitRatio).toBeCloseTo(7, 6);
+  });
 
   it('uses filtered price-code count for Stage 3.2 total mã VT', () => {
     const component = createComponent();
@@ -1127,6 +1365,7 @@ describe('AppComponent performance helpers', () => {
           stt: '1',
           invoiceNo: '',
           invoiceDate: '',
+          customerCode: '',
           companyName: 'A',
           productName: 'P1',
           unit: '',
@@ -1318,6 +1557,206 @@ describe('AppComponent performance helpers', () => {
 
     expect(component.bucketHasLoss(bucket)).toBeTrue();
     expect(component.bucketLossCount(bucket)).toBe(1);
+  });
+
+  it('summarizes only loss rows for the Stage 3.2 loss report', () => {
+    const component = createComponent();
+    const firstBucket: Parameters<AppComponent['refreshPriceBucketSummary']>[0] = {
+      key: 'bucket-1',
+      label: 'Nhóm 1',
+      count: 2,
+      min: 80,
+      max: 100,
+      averagePrice: 100,
+      marginPercent: 10,
+      adjustedAverage: 90,
+      rows: [
+        { key: '1', excelRow: '1', companyName: 'A', productName: 'P1', price: 80, quantity: 2, totalAmount: 160 },
+        { key: '2', excelRow: '2', companyName: 'A', productName: 'P2', price: 100, quantity: 1, totalAmount: 100 }
+      ],
+      details: null
+    };
+    const secondBucket: Parameters<AppComponent['refreshPriceBucketSummary']>[0] = {
+      key: 'bucket-2',
+      label: 'Nhóm 2',
+      count: 1,
+      min: 180,
+      max: 180,
+      averagePrice: 200,
+      marginPercent: 5,
+      adjustedAverage: 190,
+      rows: [
+        { key: '3', excelRow: '3', companyName: 'A', productName: 'P3', price: 180, quantity: 3, totalAmount: 540 }
+      ],
+      details: null
+    };
+    component.refreshPriceBucketSummary(firstBucket);
+    component.refreshPriceBucketSummary(secondBucket);
+    component.priceConflictRows = [{ key: 'row-1', code: 'LOSS', buckets: [firstBucket, secondBucket] }];
+
+    component.refreshPriceConflictViews();
+
+    expect(component.priceLossReport.rowCount).toBe(2);
+    expect(component.priceLossReport.revenue).toBe(700);
+    expect(component.priceLossReport.lossAmount).toBe(50);
+    expect(component.priceLossReport.lossPercent).toBeCloseTo((50 / 700) * 100, 6);
+    expect(component.priceLossReport.rowPercent).toBeCloseTo((2 / 3) * 100, 6);
+    expect(component.priceLossReport.revenuePercent).toBeCloseTo((700 / 800) * 100, 6);
+    expect(component.formatLossPrice(component.priceLossReport.lossAmount)).toBe('-50');
+    expect(component.formatLossPercent(component.priceLossReport.lossPercent)).toBe('-7.14%');
+  });
+
+  it('filters Stage 3.2 sections to only Mã VT with loss rows when requested', () => {
+    const component = createComponent();
+    component.includeCompanyPrefix = false;
+    const lossBucket: Parameters<AppComponent['refreshPriceBucketSummary']>[0] = {
+      key: 'loss-bucket', label: 'Nhóm 1', count: 1, min: 80, max: 80, averagePrice: 100, marginPercent: 10, adjustedAverage: 90,
+      rows: [{ key: '1', excelRow: '1', companyName: 'A', productName: 'P1', price: 80, quantity: 1, totalAmount: 80 }], details: null
+    };
+    const okBucket: Parameters<AppComponent['refreshPriceBucketSummary']>[0] = {
+      key: 'ok-bucket', label: 'Nhóm 1', count: 1, min: 120, max: 120, averagePrice: 100, marginPercent: 10, adjustedAverage: 90,
+      rows: [{ key: '2', excelRow: '2', companyName: 'A', productName: 'P2', price: 120, quantity: 1, totalAmount: 120 }], details: null
+    };
+    component.refreshPriceBucketSummary(lossBucket);
+    component.refreshPriceBucketSummary(okBucket);
+    component.priceConflictRows = [
+      { key: 'row-loss', code: 'LOSS', hasMultiplePrices: false, buckets: [lossBucket], sourceRows: [], products: [] },
+      { key: 'row-ok', code: 'OK', hasMultiplePrices: false, buckets: [okBucket], sourceRows: [], products: [] }
+    ];
+
+    component.refreshPriceConflictViews();
+    expect(component.priceCodeSections[0].groups.length).toBe(2);
+
+    component.priceLossOnly = true;
+    component.refreshPriceCodeSections();
+
+    expect(component.priceCodeSections[0].groups.length).toBe(1);
+    expect(component.priceCodeSections[0].groups[0].code).toBe('LOSS');
+  });
+
+  it('builds sales report rows sorted by date and invoice number with split codes first', () => {
+    const component = createComponent();
+    component.priceConflictRows = [
+      {
+        key: 'row-split',
+        code: 'SPLIT',
+        buckets: [
+          {
+            key: 'split-bucket-2', label: 'Nhóm 2', finalCode: 'SPLIT.002', count: 2, min: 100, max: 120, averagePrice: 110, marginPercent: 10, adjustedAverage: 90,
+            rows: [
+              { key: '2', excelRow: '2', stt: '2', invoiceNo: 'HD10', invoiceDate: '02/05/2024', customerCode: 'MST1', companyName: 'A', productName: 'Vật tư B', unit: 'Cái', price: 120, quantity: 1, totalAmount: 120 },
+              { key: '1', excelRow: '1', stt: '1', invoiceNo: 'HD2', invoiceDate: '01/05/2024', customerCode: 'MST1', companyName: 'A', productName: 'Vật tư A', unit: 'Cái', price: 100, quantity: 2, totalAmount: 200 }
+            ],
+            details: null
+          }
+        ]
+      },
+      {
+        key: 'row-single',
+        code: 'SINGLE',
+        buckets: [
+          {
+            key: 'single-bucket', label: 'Nhóm 1', finalCode: 'SINGLE', count: 1, min: 80, max: 80, averagePrice: 80, marginPercent: 0, adjustedAverage: 100,
+            rows: [{ key: '3', excelRow: '3', stt: '3', invoiceNo: 'HD1', invoiceDate: '01/05/2024', customerCode: 'MST2', companyName: 'B', productName: 'Vật tư C', unit: 'Mét', price: 80, quantity: 1, totalAmount: 80 }],
+            details: null
+          }
+        ]
+      }
+    ];
+
+    component.refreshPriceReportRows();
+
+    expect(component.priceReportInvoiceRows.map(row => row.invoiceNo)).toEqual(['HD1', 'HD2', 'HD10']);
+    expect(component.priceReportInvoiceRows.find(row => row.invoiceNo === 'HD2')?.customerCode).toBe('MST1');
+    expect(component.priceReportSummaryRows.map(row => row.finalCode)).toEqual(['SPLIT.002', 'SINGLE']);
+    expect(component.priceReportSummaryRows[0].quantity).toBe(3);
+    expect(component.priceReportSummaryRows[0].saleAmount).toBe(320);
+    expect(component.priceReportSummaryRows[0].costAmount).toBe(270);
+    expect(component.priceReportSummaryRows[0].profitAmount).toBe(50);
+    expect(component.priceReportSummaryRows[0].netAmount).toBe(50);
+    expect(component.priceReportSummaryRows[1].lossAmount).toBe(-20);
+    expect(component.priceReportSummaryRows[1].netAmount).toBe(-20);
+    expect(component.priceReportSummaryTotals().saleAmount).toBe(400);
+    expect(component.priceReportSummaryTotals().costAmount).toBe(370);
+    expect(component.priceReportSummaryTotals().netAmount).toBe(30);
+    expect(component.priceReportSummaryTotals().profitRatio).toBe(7.5);
+  });
+
+  it('shows loading before opening filtered invoice rows from the summary action', fakeAsync(() => {
+    const component = createComponent();
+    component.priceReportInvoiceRows = [
+      { key: 'a', summaryKey: 'split', finalCode: 'SPLIT.001', excelRow: '1', stt: '1', invoiceNo: 'HD1', invoiceDate: '01/05/2024', customerCode: 'MST1', companyName: 'A', productName: 'A', unit: 'Cái', price: 100, salePrice: 100, quantity: 1, totalAmount: 100, saleAmount: 100, costUnitPrice: 90, costAmount: 90, deltaAmount: 10, deltaTotal: 10, deltaPercent: 10, profitRatio: 10 },
+      { key: 'b', summaryKey: 'single', finalCode: 'SINGLE', excelRow: '2', stt: '2', invoiceNo: 'HD2', invoiceDate: '02/05/2024', customerCode: 'MST2', companyName: 'B', productName: 'B', unit: 'Cái', price: 80, salePrice: 80, quantity: 1, totalAmount: 80, saleAmount: 80, costUnitPrice: 100, costAmount: 100, deltaAmount: -20, deltaTotal: -20, deltaPercent: -25, profitRatio: -25 }
+    ];
+    component.priceReportSummaryRows = component.buildPriceReportSummaryRows(component.priceReportInvoiceRows);
+
+    component.selectPriceReportSummary(component.priceReportSummaryRows[0]);
+
+    expect(component.priceReportTransitionLoading).toBeTrue();
+    expect(component.priceReportTransitionLabel).toContain('hóa đơn liên quan');
+    expect(component.activePriceReportTab).toBe('summary');
+    tick(0);
+    tick(0);
+    expect(component.visiblePriceReportInvoiceRows().length).toBe(1);
+    expect(component.visiblePriceReportInvoiceRows()[0].summaryKey).toBe('split');
+    expect(component.priceReportInvoiceTitle()).toContain('SPLIT.001');
+    expect(component.activePriceReportTab).toBe('invoice');
+    expect(component.priceReportInvoiceTotals().netAmount).toBe(10);
+    expect(component.priceReportInvoiceTotals().profitRatio).toBe(10);
+    spyOn(component, 'scrollSelectedPriceReportSummaryIntoView');
+    component.selectPriceReportTab('summary');
+    tick(0);
+    expect(component.activePriceReportTab).toBe('summary');
+    expect(component.selectedPriceReportSummaryKey).toBe(component.priceReportSummaryRows[0].key);
+    expect(component.scrollSelectedPriceReportSummaryIntoView).toHaveBeenCalled();
+    component.selectedPriceReportSummaryKey = '';
+    expect(component.visiblePriceReportInvoiceRows().length).toBe(2);
+    expect(component.priceReportInvoiceTotals().netAmount).toBe(-10);
+    expect(component.priceReportInvoiceTotals().profitRatio).toBeCloseTo(-5.56, 2);
+  }));
+
+  it('shows loading when opening the invoice report tab', fakeAsync(() => {
+    const component = createComponent();
+
+    component.selectPriceReportTab('invoice');
+
+    expect(component.priceReportTransitionLoading).toBeTrue();
+    expect(component.activePriceReportTab).toBe('summary');
+    tick(0);
+    tick(0);
+    expect(component.priceReportTransitionLoading).toBeFalse();
+    expect(component.activePriceReportTab).toBe('invoice');
+  }));
+
+  it('builds an Excel workbook with both sales report sheets', () => {
+    const component = createComponent();
+    component.priceReportInvoiceRows = [
+      { key: 'a', summaryKey: 'split', finalCode: 'SPLIT.001', excelRow: '8', stt: '8', invoiceNo: 'HD1', invoiceDate: '01/05/2024', customerCode: 'MST1', companyName: 'A', productName: 'A & B', unit: 'Cái', price: 100, salePrice: 100, quantity: 1, totalAmount: 100, saleAmount: 100, costUnitPrice: 90, costAmount: 90, deltaAmount: 10, deltaTotal: 10, deltaPercent: 10, profitRatio: 10 },
+      { key: 'b', summaryKey: 'single', finalCode: 'SINGLE', excelRow: '15', stt: '15', invoiceNo: 'HD2', invoiceDate: '02/05/2024', customerCode: 'MST2', companyName: 'B', productName: 'B', unit: 'Cái', price: 80, salePrice: 80, quantity: 1, totalAmount: 80, saleAmount: 80, costUnitPrice: 100, costAmount: 100, deltaAmount: -20, deltaTotal: -20, deltaPercent: -25, profitRatio: -25 }
+    ];
+    component.priceReportSummaryRows = component.buildPriceReportSummaryRows(component.priceReportInvoiceRows);
+
+    const workbook = component.excelWorkbookHtml([
+      { name: 'Báo cáo tổng hợp bán hàng', rows: component.priceReportSummaryExportRows() },
+      { name: 'Kết xuất hóa đơn', rows: component.priceReportInvoiceExportRows() }
+    ]);
+
+    expect(workbook).toContain('<x:Name>Báo cáo tổng hợp bán hàng</x:Name>');
+    expect(workbook).toContain('<x:Name>Kết xuất hóa đơn</x:Name>');
+    expect(workbook).toContain('<th>Mã VT</th>');
+    expect(workbook).toContain('<th>Lãi/lỗ</th>');
+    expect(component.priceReportSummaryExportRows()[0]['Lãi/lỗ']).toBe(10);
+    expect(component.priceReportSummaryExportRows()[0]['Lãi']).toBeUndefined();
+    expect(component.priceReportSummaryExportRows()[0]['Lỗ']).toBeUndefined();
+    expect(component.priceReportInvoiceExportRows().map(row => row['STT'])).toEqual([1, 2, 'TỔNG CỘNG']);
+    expect(component.priceReportInvoiceExportRows()[0]['Tên công ty']).toBe('A');
+    const summaryExportRows = component.priceReportSummaryExportRows();
+    expect(summaryExportRows[summaryExportRows.length - 1]['Tỷ lệ lãi/lỗ'] as number).toBeCloseTo(-5.56, 2);
+    expect(component.priceReportExportFileName()).toBe('bao-cao-ban-hang_bao_cao_ban_hang.xlsx');
+    expect(workbook).toContain('<th>Tên công ty</th>');
+    expect(workbook).toContain('<td>SPLIT.001</td>');
+    expect(workbook).toContain('<td>A &amp; B</td>');
+    expect(workbook).toContain('<td>HD1</td>');
   });
 
   it('advances processing progress while keeping it below completion', fakeAsync(() => {
