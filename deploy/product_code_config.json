@@ -1,5 +1,5 @@
 {
-  "selected_profile": "quang_thinh",
+  "selected_profile": "son_phuong",
   "profiles": {
     "son_phuong": {
       "prefixes": {
@@ -16200,6 +16200,24 @@
       "price_range_rules": {},
       "manual_code_overrides": {},
       "output_path": ""
+    },
+    "vietmax": {
+      "columns": {},
+      "first_word_rules": {},
+      "include_company_prefix": true,
+      "manual_code_overrides": {},
+      "output_path": "",
+      "prefixes": {},
+      "price_adjust_all_percent": 0,
+      "price_group_rules": {},
+      "price_range_rules": {},
+      "removed_companies": {},
+      "repeated_phrase_removals": [],
+      "selected_products": {},
+      "word_rules": {
+        "tôn": "TON",
+        "đen": "DEN"
+      }
     }
   },
   "columns": {

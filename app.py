@@ -69,6 +69,7 @@ PROFILE_LABELS = {
     "son_phuong": "S\u01a1n Ph\u01b0\u01a1ng",
     "cao_thanh": "Cao Th\u00e0nh",
     "quang_thinh": "Quang Th\u1ecbnh",
+    "vietmax": "Vietmax",
 }
 
 PROFILE_ALIASES = {
@@ -441,15 +442,19 @@ def normalize_token(text):
     return text
 
 
-def normalize_code_token(text, keep_slash=False):
+def normalize_code_token(text, keep_slash=False, keep_hyphen=False):
     text = rm_accents(text).upper()
-    pattern = r"[^A-Z0-9./]+" if keep_slash else r"[^A-Z0-9.]+"
-    return re.sub(pattern, "", text)
+    allowed = "A-Z0-9."
+    if keep_slash:
+        allowed += "/"
+    if keep_hyphen:
+        allowed += "-"
+    return re.sub(rf"[^{allowed}]+", "", text)
 
 
 def is_upper_code_token(text):
     raw = rm_accents(str(text or "")).strip()
-    return bool(re.fullmatch(r"[A-Z0-9./]+", raw) and re.search(r"[A-Z]", raw))
+    return bool(re.fullmatch(r"[A-Z0-9./-]+", raw) and re.search(r"[A-Z]", raw))
 
 
 def normalize_rule_key(text):
@@ -647,12 +652,12 @@ def cell(df, row, col):
     return "" if col < 0 or col >= df.shape[1] else df.iat[row, col]
 
 
-def word_piece(token, word_rules, keep_numeric=True, keep_liter=False, default_len=1, preserve_upper_code=False, keep_slash=False):
+def word_piece(token, word_rules, keep_numeric=True, keep_liter=False, default_len=1, preserve_upper_code=False, keep_slash=False, keep_hyphen=False):
     key = normalize_rule_key(token)
     rule_key = next((rule for rule in word_rules if normalize_rule_key(rule) == key), None)
     if rule_key is not None:
         return normalize_token(word_rules[rule_key])
-    compact = normalize_code_token(token, keep_slash=keep_slash)
+    compact = normalize_code_token(token, keep_slash=keep_slash, keep_hyphen=keep_hyphen)
     if preserve_upper_code and is_upper_code_token(token):
         return compact
     if keep_numeric and has_number(token):
@@ -767,6 +772,12 @@ def make_product_part(profile, product, word_rules, first_word_rules=None, repea
         return "".join(first + rest)
 
     words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
+
+    if profile == "vietmax":
+        parts = []
+        for index, word in enumerate(words):
+            parts.append(word_piece(word, {}, keep_numeric=True, default_len=(len(str(word)) if index == 0 else 2), preserve_upper_code=True, keep_hyphen=True))
+        return "".join(p for p in parts if p)
 
     if profile == "quang_thinh":
         filtered = []

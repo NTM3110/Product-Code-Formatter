@@ -1,13 +1,28 @@
-import unittest
+﻿import unittest
 from pathlib import Path
 from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
 
-from app import process_workbook
+from app import default_config, make_product_part, process_workbook, profile_key
 
 
 class ProcessWorkbookTests(unittest.TestCase):
+    def test_vietmax_profile_is_available_by_default(self):
+        self.assertEqual(profile_key("vietmax"), "vietmax")
+        self.assertIn("vietmax", default_config()["profiles"])
+
+    def test_vietmax_product_code_keeps_first_word_and_two_chars_after(self):
+        self.assertEqual(
+            make_product_part("vietmax", "Máy bơm công nghiệp", {}),
+            "MAYBOCONG",
+        )
+
+    def test_vietmax_product_code_preserves_upper_hyphenated_token(self):
+        self.assertEqual(
+            make_product_part("vietmax", "Pin SYNWK-F1840N dung lượng", {}),
+            "PINSYNWK-F1840NDULU",
+        )
     def test_removes_invoice_rows_that_are_not_assigned_a_processed_code(self):
         outputs = Path(__file__).parent / "outputs"
         outputs.mkdir(exist_ok=True)

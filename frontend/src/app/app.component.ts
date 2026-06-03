@@ -3,7 +3,7 @@ import { CommonModule, KeyValuePipe } from '@angular/common';
 import { HttpClient, HttpErrorResponse, HttpEventType } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 
-type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh';
+type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax';
 type SuspectSectionKey = 'near_phrase' | 'misorder';
 type Stage3Phase = 'customize' | 'price';
 type PriceReportTab = 'summary' | 'invoice';
@@ -146,7 +146,8 @@ export class AppComponent {
   profiles: Array<{ key: ProfileKey; label: string; note: string }> = [
     { key: 'son_phuong', label: 'Sơn Phương', note: 'Lấy chữ đầu của mỗi từ, giữ nguyên số/kích thước và các từ được cấu hình.' },
     { key: 'cao_thanh', label: 'Cao Thành', note: 'Giữ nguyên 2 từ đầu, phần còn lại lấy chữ đầu của mã hàng hóa.' },
-    { key: 'quang_thinh', label: 'Quang Thịnh', note: 'Bỏ chữ Sơn và phần sau HÀNG KM, lấy 2 ký tự mỗi từ, ngăn bằng dấu chấm.' }
+    { key: 'quang_thinh', label: 'Quang Thịnh', note: 'Bỏ chữ Sơn và phần sau HÀNG KM, lấy 2 ký tự mỗi từ, ngăn bằng dấu chấm.' },
+    { key: 'vietmax', label: 'Vietmax', note: 'Giữ nguyên từ đầu, các từ sau lấy 2 ký tự; token mã in hoa như SYNWK-F1840N được giữ nguyên.' }
   ];
   selectedProfile: ProfileKey = 'son_phuong';
   config: AppConfig | null = null;
@@ -501,7 +502,8 @@ export class AppComponent {
     const profiles: Record<ProfileKey, ConfigProfile> = {
       son_phuong: { ...this.emptyProfileState('son_phuong'), ...(this.config?.profiles?.son_phuong || {}) },
       cao_thanh: { ...this.emptyProfileState('cao_thanh'), ...(this.config?.profiles?.cao_thanh || {}) },
-      quang_thinh: { ...this.emptyProfileState('quang_thinh'), ...(this.config?.profiles?.quang_thinh || {}) }
+      quang_thinh: { ...this.emptyProfileState('quang_thinh'), ...(this.config?.profiles?.quang_thinh || {}) },
+      vietmax: { ...this.emptyProfileState('vietmax'), ...(this.config?.profiles?.vietmax || {}) }
     };
     profiles[this.selectedProfile] = this.currentProfileSnapshot();
     return {
@@ -2525,11 +2527,11 @@ export class AppComponent {
     return this.normalizeProductWords(name).join('|');
   }
 
-  tokenPart(token: string, keepNumeric: boolean, defaultLen = 1, preserveUpperCode = false, keepSlash = false, rules = this.wordRules) {
+  tokenPart(token: string, keepNumeric: boolean, defaultLen = 1, preserveUpperCode = false, keepSlash = false, rules = this.wordRules, keepHyphen = false) {
     const key = this.normalizeRuleKey(token);
     const ruleKey = Object.keys(rules || {}).find(k => this.normalizeRuleKey(k) === key);
     if (ruleKey) return this.normalizeCodeText(rules[ruleKey]);
-    const compact = this.normalizeCodeText(token, keepSlash);
+    const compact = this.normalizeCodeText(token, keepSlash, keepHyphen);
     if (preserveUpperCode && this.isUpperCodeToken(token)) return compact;
     if (keepNumeric && /\d/.test(token)) return compact;
     return compact.slice(0, defaultLen);
@@ -2598,8 +2600,8 @@ export class AppComponent {
     return result;
   }
 
-  normalizeCodeText(value: string, keepSlash = false) {
-    const allowedPattern = keepSlash ? /[^A-Z0-9./]+/g : /[^A-Z0-9.]+/g;
+  normalizeCodeText(value: string, keepSlash = false, keepHyphen = false) {
+    const allowedPattern = keepSlash && keepHyphen ? /[^A-Z0-9./-]+/g : keepSlash ? /[^A-Z0-9./]+/g : keepHyphen ? /[^A-Z0-9.-]+/g : /[^A-Z0-9.]+/g;
     return (value || '')
       .replace(/\u0110/g, 'D')
       .replace(/\u0111/g, 'd')
@@ -2621,7 +2623,7 @@ export class AppComponent {
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
       .trim();
-    return /^[A-Z0-9./]+$/.test(raw) && /[A-Z]/.test(raw);
+    return /^[A-Z0-9./-]+$/.test(raw) && /[A-Z]/.test(raw);
   }
 
   normalizeSep(value: string) {
@@ -2689,6 +2691,8 @@ export class AppComponent {
         w => this.tokenPart(w, true, 1, true, true, {})
       );
       tail = first.join('') + rest.join('');
+    } else if (this.selectedProfile === 'vietmax') {
+      tail = words.map((word, index) => this.tokenPart(word, true, index === 0 ? word.length : 2, true, false, {}, true)).filter(Boolean).join('');
     } else if (this.selectedProfile === 'quang_thinh') {
       const filtered: string[] = [];
       for (const w of words) {
