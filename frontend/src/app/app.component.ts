@@ -293,7 +293,8 @@ export class AppComponent {
         const savedProfile = cfg.selected_profile || 'son_phuong';
         this.selectedProfile = ((savedProfile === 'quang_thinh_1' || savedProfile === 'quang_thinh_2') ? 'quang_thinh' : savedProfile) as ProfileKey;
         this.applyProfileColumnDefaults();
-        this.applyProfileConfig();
+      if (this.selectedProfile !== 'cao_thanh') this.stage3Phase = 'customize';
+      this.applyProfileConfig();
       }
     });
   }
@@ -319,6 +320,7 @@ export class AppComponent {
     const operationId = this.beginConfigOperation('Đang tải cấu hình...');
     try {
       this.applyProfileColumnDefaults();
+      if (this.selectedProfile !== 'cao_thanh') this.stage3Phase = 'customize';
       this.applyProfileConfig();
       await this.yieldToBrowser();
       if (this.companies.length) {
@@ -453,6 +455,7 @@ export class AppComponent {
         }
       }
     }
+    const usesPriceRules = this.selectedProfile === 'cao_thanh';
     return {
       ...existing,
       prefixes,
@@ -461,9 +464,9 @@ export class AppComponent {
       word_rules: { ...this.wordRules },
       first_word_rules: { ...this.firstWordRules },
       repeated_phrase_removals: this.normalizePhraseList(this.repeatedPhraseRemovals),
-      price_group_rules: { ...this.priceGroupRules },
-      price_range_rules: { ...this.priceRangeRules },
-      price_adjust_all_percent: this.percentValue(this.priceAdjustAllPercent, 0),
+      price_group_rules: usesPriceRules ? { ...this.priceGroupRules } : {},
+      price_range_rules: usesPriceRules ? { ...this.priceRangeRules } : {},
+      price_adjust_all_percent: usesPriceRules ? this.percentValue(this.priceAdjustAllPercent, 0) : 0,
       manual_code_overrides: { ...this.manualCodeOverrides },
       include_company_prefix: this.includeCompanyPrefix,
       output_path: this.outputPath || '',
@@ -669,7 +672,8 @@ export class AppComponent {
       next: async (cfg) => {
         this.config = cfg;
         this.applyProfileColumnDefaults();
-        this.applyProfileConfig();
+      if (this.selectedProfile !== 'cao_thanh') this.stage3Phase = 'customize';
+      this.applyProfileConfig();
         if (this.companies.length) {
           this.applySavedProfileToCompanies();
           this.verifyPrefixes(true, false);
@@ -948,9 +952,19 @@ export class AppComponent {
     this.runWithStageLoading(label, () => this.verifyPrefixes(updateList, refreshDerived));
   }
 
-  applyPrefixOption(company: any, value: string) {
-    company.value = this.normalizeCodeText(value || '');
-    this.runWithStageLoading('Đang áp dụng prefix...', () => this.verifyPrefixes(false, false));
+  applyPrefixOption(company: any, option: PrefixOption) {
+    this.runWithStageLoading('Đang áp dụng prefix cho tất cả công ty...', () => {
+      if (option.key === 'current') {
+        company.value = this.normalizeCodeText(option.value || '');
+      } else {
+        for (const item of this.companies) {
+          if (!item.process) continue;
+          const value = this.prefixValueForOption(item, option.key);
+          if (value) item.value = this.normalizeCodeText(value);
+        }
+      }
+      this.verifyPrefixes(false, false);
+    });
   }
 
   onManualPrefixChange() {
@@ -958,19 +972,25 @@ export class AppComponent {
   }
 
   prefixOptions(company: any): PrefixOption[] {
-    const current = this.normalizeCodeText(company?.value || '');
-    const mstSuffix = this.companyMstSuffix(company);
-    const initials = this.companyNameInitials(company?.company || '');
-    const initialsMst = initials && mstSuffix ? `${initials}${mstSuffix}` : '';
     const options = [
-      { key: 'current', label: 'Đang chọn', value: current },
-      { key: 'mst', label: `${this.prefixMstSuffixLength} số cuối MST`, value: mstSuffix },
-      { key: 'initials', label: '2 chữ từ tên công ty', value: initials },
-      { key: 'initials-mst', label: '2 chữ + MST', value: initialsMst }
+      { key: 'current', label: 'Đang chọn', value: this.prefixValueForOption(company, 'current') },
+      { key: 'mst', label: `${this.prefixMstSuffixLength} số cuối MST`, value: this.prefixValueForOption(company, 'mst') },
+      { key: 'initials', label: '2 chữ từ tên công ty', value: this.prefixValueForOption(company, 'initials') },
+      { key: 'initials-mst', label: '2 chữ + MST', value: this.prefixValueForOption(company, 'initials-mst') }
     ];
     return options
       .filter(option => option.value)
       .map(option => ({ ...option, warning: this.prefixOptionWarning(company, option.value, option.key) }));
+  }
+  prefixValueForOption(company: any, key: string) {
+    const current = this.normalizeCodeText(company?.value || '');
+    const mstSuffix = this.companyMstSuffix(company);
+    const initials = this.companyNameInitials(company?.company || '');
+    if (key === 'current') return current;
+    if (key === 'mst') return mstSuffix;
+    if (key === 'initials') return initials;
+    if (key === 'initials-mst') return initials && mstSuffix ? `${initials}${mstSuffix}` : '';
+    return '';
   }
 
   prefixOptionWarning(company: any, value: string, source: string) {
@@ -2931,6 +2951,7 @@ export class AppComponent {
     this.isLoading = true;
     this.syncInvoiceStatusSkipValuesFromOptions();
     this.startProcessingProgress();
+    const usesPriceRules = this.selectedProfile === 'cao_thanh';
     const payload: any = {
       ...this.basePayload(),
       output_path: this.outputPath,
@@ -2938,9 +2959,10 @@ export class AppComponent {
       first_word_rules: this.firstWordRules,
       repeated_phrase_removals: this.repeatedPhraseRemovals,
       include_company_prefix: this.includeCompanyPrefix,
-      price_group_rules: this.priceGroupRules,
-      price_range_rules: this.priceRangeRules,
-      price_adjust_all_percent: this.percentValue(this.priceAdjustAllPercent, 0),
+      price_col: usesPriceRules ? this.priceCol : '',
+      price_group_rules: usesPriceRules ? this.priceGroupRules : {},
+      price_range_rules: usesPriceRules ? this.priceRangeRules : {},
+      price_adjust_all_percent: usesPriceRules ? this.percentValue(this.priceAdjustAllPercent, 0) : 0,
       manual_code_overrides: this.manualCodeOverrides,
       all_mst: [],
       mst_safe_id: [],

@@ -102,30 +102,6 @@ if not %errorlevel%==0 (
     exit /b 1
 )
 
-echo.
-echo Building Angular frontend...
-cd frontend
-call npm install
-if not %errorlevel%==0 (
-    echo ERROR: Failed to install frontend dependencies.
-    cd ..
-    pause
-    exit /b 1
-)
-call npm run build
-if not %errorlevel%==0 (
-    echo ERROR: Failed to build frontend.
-    cd ..
-    pause
-    exit /b 1
-)
-cd ..
-
-echo.
-echo Preparing static folder...
-if exist static rmdir /s /q static
-mkdir static
-xcopy /E /I /Y "frontend\dist\frontend\browser\*" "static\"
 
 echo.
 echo Closing any running instances of the application...
@@ -136,7 +112,7 @@ echo Building EXE...
 set "PYI_WORKPATH=C:\tmp\ProductCodeFormatter-pyi-build"
 if not exist "C:\tmp" mkdir "C:\tmp"
 if exist "%PYI_WORKPATH%" rmdir /s /q "%PYI_WORKPATH%"
-"%VENV_PY%" -m PyInstaller --clean --workpath "%PYI_WORKPATH%" --noconsole --onefile --icon "app_icon.ico" --add-data "static;static" --add-data "app_icon.ico;." --add-data "mau HD ban ra.xlsx;." --name ProductCodeFormatter app.py
+"%VENV_PY%" -m PyInstaller --clean --workpath "%PYI_WORKPATH%" --noconsole --onefile --icon "app_icon.ico" --add-data "app_icon.ico;." --add-data "mau HD ban ra.xlsx;." --name ProductCodeFormatter desktop_app.py
 if not %errorlevel%==0 (
     echo ERROR: PyInstaller build failed.
     pause

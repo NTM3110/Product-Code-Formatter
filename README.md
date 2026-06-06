@@ -1,14 +1,14 @@
-# Product Code Formatter - MST All Names V6
+﻿# Product Code Formatter - MST All Names V6
 
 ## Overview
 
-Desktop Flask + Angular tool for formatting `Mã VT` from Excel invoice data.
+Native Windows desktop app (PySide6 + Python) for formatting `Mã VT` from Excel invoice data.
 
 Main capabilities:
 - group sellers by `MST`
 - suggest and validate company prefixes
 - let users include or skip companies and products
-- generate product codes by profile (`Sơn Phương`, `Cao Thành`, `Quang Thịnh`)
+- generate product codes by profile (`Sơn Phương`, `Cao Thành`, `Quang Thịnh`, `Vietmax`)
 - persist config, rules, overrides, price-group settings, and skipped items
 - export a processed Excel workbook
 
@@ -29,15 +29,15 @@ Main capabilities:
 ## Run From Source
 
 - Backend: `run_python_app.bat`
-- Frontend dev server: in `frontend`, run `npm start`
+- Native desktop source: `.venv\\Scripts\\python.exe desktop_app.py`
 
 ## Key Paths
 
 - Backend: `app.py`
-- Frontend app: `frontend/src/app/app.component.ts`
-- Frontend template: `frontend/src/app/app.component.html`
-- Frontend styles: `frontend/src/app/app.component.css`
-- Frontend tests: `frontend/src/app/app.component.spec.ts`
+- Native desktop app: `desktop_app.py`
+- Legacy frontend template: `frontend/src/app/app.component.html`
+- Legacy frontend styles: `frontend/src/app/app.component.css`
+- Legacy frontend tests: `frontend/src/app/app.component.spec.ts`
 - Build script: `build_exe_auto.bat`
 - Packaged app output: `deploy/ProductCodeFormatter.exe`
 

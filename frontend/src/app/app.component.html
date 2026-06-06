@@ -665,7 +665,7 @@
         <td><input class="form-control prefix-input" [(ngModel)]="item.value" (ngModelChange)="onManualPrefixChange()" [disabled]="!item.process || !includeCompanyPrefix" /></td>
         <td>
           <div class="prefix-option-list">
-            <button type="button" class="prefix-option" *ngFor="let option of prefixOptions(item); trackBy: trackByKey" [class.active]="option.value === item.value" [class.warn]="option.warning" (click)="applyPrefixOption(item, option.value)" [disabled]="!item.process || !includeCompanyPrefix">
+            <button type="button" class="prefix-option" *ngFor="let option of prefixOptions(item); trackBy: trackByKey" [class.active]="option.value === item.value" [class.warn]="option.warning" (click)="applyPrefixOption(item, option)" [disabled]="!item.process || !includeCompanyPrefix">
               <span>{{ option.label }}: <strong>{{ option.value }}</strong></span>
               <small *ngIf="option.warning">{{ option.warning }}</small>
             </button>

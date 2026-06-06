@@ -1,7 +1,8 @@
-flask
+﻿flask
 pandas
 openpyxl
 pyinstaller
 pystray
 Pillow
 flask-cors
+PySide6

@@ -66,16 +66,20 @@ if not getattr(sys, "frozen", False):
 
 
 PROFILE_LABELS = {
-    "son_phuong": "S\u01a1n Ph\u01b0\u01a1ng",
-    "cao_thanh": "Cao Th\u00e0nh",
-    "quang_thinh": "Quang Th\u1ecbnh",
-    "vietmax": "Vietmax",
+    "son_phuong": "Sơn Phương",
+    "cao_thanh": "Cao Thành",
+    "quang_thinh": "Quang Thịnh",
+    "vietmax_mua_vao": "Vietmax mua vào",
+    "vietmax_ban_ra": "Vietmax bán ra",
 }
 
 PROFILE_ALIASES = {
     "quang_thinh_1": "quang_thinh",
     "quang_thinh_2": "quang_thinh",
+    "vietmax": "vietmax_mua_vao",
 }
+
+VIETMAX_PROFILES = {"vietmax_mua_vao", "vietmax_ban_ra"}
 
 MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
@@ -106,6 +110,10 @@ def empty_profile_config(profile_key_name=None):
         "price_range_rules": {},
         "price_adjust_all_percent": 0,
         "manual_code_overrides": {},
+        "inventory_pairs": [],
+        "use_default_inventory_pair": False,
+        "default_inventory_pair_id": "",
+        "inventory_pair_rules": [],
         "include_company_prefix": True,
         "output_path": "",
         "columns": {},
@@ -232,6 +240,50 @@ def normalize_phrase_list(value):
     return result
 
 
+def normalize_inventory_pairs(value):
+    result = []
+    seen = set()
+    if not isinstance(value, list):
+        return result
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        pair_id = str(item.get("id") or "").strip()
+        if not pair_id or pair_id in seen:
+            continue
+        seen.add(pair_id)
+        ma_kho = str(item.get("ma_kho") or "").strip()
+        tk_vat_tu = str(item.get("tk_vat_tu") or "").strip()
+        if re.fullmatch(r"\d+(?:\.\d+)?", ma_kho) and re.search(r"[A-Za-z]", tk_vat_tu):
+            ma_kho, tk_vat_tu = tk_vat_tu, ma_kho
+        result.append({
+            "id": pair_id,
+            "ma_kho": ma_kho,
+            "tk_vat_tu": tk_vat_tu,
+        })
+    return result
+
+
+def normalize_inventory_pair_rules(value):
+    result = []
+    if not isinstance(value, list):
+        return result
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        operator = str(item.get("operator") or "contains").strip().casefold()
+        if operator not in {"contains", "equals"}:
+            operator = "contains"
+        result.append({
+            "source_col": str(item.get("source_col") or "").strip().upper(),
+            "operator": operator,
+            "value": str(item.get("value") or "").strip(),
+            "pair_id": str(item.get("pair_id") or "").strip(),
+            "enabled": item.get("enabled") is not False,
+        })
+    return result
+
+
 def price_ranges_from_groups(price_group_rules):
     ranges = {}
     for rule in price_group_rules.values():
@@ -287,6 +339,10 @@ def normalize_profile_config(profile_key_name, profile):
         "price_range_rules": price_ranges,
         "price_adjust_all_percent": legacy_price_adjust_all_percent(profile, price_groups, price_ranges),
         "manual_code_overrides": products,
+        "inventory_pairs": normalize_inventory_pairs(profile.get("inventory_pairs") or []),
+        "use_default_inventory_pair": bool(profile.get("use_default_inventory_pair")),
+        "default_inventory_pair_id": str(profile.get("default_inventory_pair_id") or "").strip(),
+        "inventory_pair_rules": normalize_inventory_pair_rules(profile.get("inventory_pair_rules") or []),
         "include_company_prefix": profile.get("include_company_prefix") is not False,
         "output_path": str(profile.get("output_path") or ""),
         "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
@@ -461,6 +517,148 @@ def normalize_rule_key(text):
     text = rm_accents(str(text or "")).casefold().strip()
     return re.sub(r"\s+", " ", text)
 
+
+# Exact Vietmax examples from "mã vietmax.xlsx". Keep these before the
+# generic fallback because several rows intentionally use custom abbreviations.
+VIETMAX_PRODUCT_CODE_OVERRIDES = (
+    ('Bản nhôm CTP (D-L) 400x530x0.3 (50 tấm) 2 lớp', 'BNCTP400x530x0.3'),
+    ('Bản nhôm CTP (D-L) 470x560x0.3 (50 tấm) 2 lớp', 'BCTP470x560x0.3'),
+    ('Bản nhôm CTP BOCICA 470x560x0.3 (50 tấm)', 'BNCTPBOCICA470x560x0.3'),
+    ('Bản nhôm CTP BOCICA 560x670x0.3 (50 tấm)', 'BNCTPBOCICA560x670x0.3'),
+    ('Bản nhôm CTP BOCICA 600x730x0.3 (50 tấm)', 'BNCTPBOCICA600x730x0.3'),
+    ('Bột khô F-20', 'BKF-20'),
+    ('Cao su KINYO MC0877  khổ 0.730x0.710', 'CSKINYOMC0877.0.730x0.710'),
+    ('Cao su KINYO MC0877  khổ 1.030x0.920', 'CSKINYOMC0877.1.030x0.920'),
+    ('Cồn Công Nghiệp', 'CCN'),
+    ('Dung dịch hiện bản CTP', 'DDHBCTP'),
+    ('Dung dịch làm ẩm stabilat PR2105', 'DDLAstabilatPR2105'),
+    ('Giấy  Couche 250 gsm (79x47) cm', 'GCOUCHE250GSM79X47'),
+    ('Giấy  Couche 300 gsm (43x62) cm', 'GCOUCHE300GSM43X62'),
+    ('Giấy  Couche 300 gsm (62x88) cm', 'GCOUCHE300GSM62X88'),
+    ('Giấy  Couche Pindo 300 gsm (86x70) cm', 'GCOUCHEPINDO300GSM86X70'),
+    ('Giấy  Couche Pindo 350 gsm (43x65) cm', 'GCOUCHEPINDO350GSM43X65'),
+    ('Giấy An Hòa 92/70gms/790x1090', 'GAH9270GMS790x1090'),
+    ('Giấy An Hòa 95/60gms/620x860', 'GAH9560GMS620x860'),
+    ('Giấy An Hòa 95/70gms/620x860', 'GAH9570GMS620x860'),
+    ('Giấy Bãi Bằng 70/92 gsm', 'GBB7092GSM'),
+    ('Giấy Cacbon CB white 56/610*860_TL (R500)', 'GCCBWHITE56610*860_TL(R500)'),
+    ('Giấy Cacbon CB white 56/650*860 _TL (R500)', 'GCCBWHITE56650*860 _TL(R500)'),
+    ('Giấy Cacbon CF Blue 56/610*860_TL (R500)', 'GCCFBLUE56610*860_TL(R500)'),
+    ('Giấy Cacbon CF pink 56/610*860_TL (R500)', 'GCCFPINK56610*860_TL(R500)'),
+    ('Giấy Cacbon CF pink 56/650*860_TL (R500)', 'GCCFPINK56650*860_TL(R500)'),
+    ('Giấy Cacbon CF White 56/610*860_TL (R500)', 'GCCFWHITE56610*860_TL(R500)'),
+    ('Giấy Cacbon CF yellow 56/610*860_TL (R500)', 'GCCFYELLOW56610*860_TL(R500)'),
+    ('Giấy Cacbon CF yellow 56/650*860_TL (R500)', 'GCCFYELLOW56650*860_TL(R500)'),
+    ('Giấy Cacbon CFB blue 50/790*1094_ TL (R500)', 'GCCFBBLUE56790*1094_ TL(R500)'),
+    ('Giấy Cacbon CFB pink 50/610*860_TL (R500)', 'GCCFBPINK56610*860_TL(R500)'),
+    ('Giấy Cacbon CFB pink 50/650*860_TL (R500)', 'GCCFBPINK56650*860_TL(R500)'),
+    ('Giấy Cacbon CFB yellow 50/650*860_TL (R500)', 'GCCFBYELLOW56650*860_TL(R500)'),
+    ('Giấy Couche 100 gsm (65x86) cm', 'GCOUCHE100GSM65X86'),
+    ('Giấy Couche 150 gsm (62x86) cm', 'GCOUCHE150GSM62X86'),
+    ('Giấy Couche 80 gsm (43x65) cm', 'GCOUCHE80GSM43X65'),
+    ('Giấy Couche định lượng 300gsm, khổ 620mm', 'GCOUCHE300620MM'),
+    ('Giấy Couche định lượng 300gsm, khổ 790mm', 'GCOUCHE300790MM'),
+    ('Giấy Couche Gloss 148/32.5x63cm', 'GCOUCHEGLOSS14832.5X63CM'),
+    ('Giấy Couche Gloss 148/56x86cm', 'GCOUCHEGLOSSGLOSS148/56X86CM'),
+    ('Giấy couche hikote 120gsm                 khổ 62x86cm', 'GCOUCHEHIKOTE120GSMKHO62X86CM'),
+    ('Giấy couche hikote 148gsm                 khổ 72cm', 'GCOUCHEHIKOTE120GSMKHO62X86CM'),
+    ('Giấy couche hikote 148gsm           khổ 62x86cm', 'GCOUCHEHIKOTE148GSMKHO62X86CM'),
+    ('Giấy couche hikote 200gsm           khổ 62x86cm', 'GCOUCHEHIKOTE200GSMKHO62X86CM'),
+    ('Giấy couche hikote 200gsm           khổ 79x109cm', 'GCOUCHEHIKOTE200GSMKHO79X109CM'),
+    ('Giấy couche hikote 250gsm           khổ 62x86cm', 'GCOUCHEHIKOTE250GSMKHO62X86CM'),
+    ('Giấy couche hikote 300gsm           khổ 62x86cm', 'GCOUCHEHIKOTE300GSMKHO62X86CM'),
+    ('Giấy couche hikote 300gsm           khổ 79x109cm', 'GCOUCHEHIKOTE300GSMKHO79X109CM'),
+    ('Giấy Couche matt 148/52x72cm', 'GCOUCHEMATTMATT148/52X72CM'),
+    ('Giấy Couche matt 80/46x79cm', 'GCOUCHEMATTMATT80/46X79CM'),
+    ('Giấy decal tự dính', 'GIAYDECELTUDINH'),
+    ('Giấy Duplex', 'GIAYDUPLEX'),
+    ('Giấy Duplex ĐL 300 g/m2', 'GDL300gm2M2'),
+    ('Giấy Duplex ĐL 400 g/m2', 'GDL400gm2M2'),
+    ('GIẤY DUPLEX LION 250GSM - 650MM', 'GDUPLEXLION250GSM650MM'),
+    ('Giấy in', 'GIAYIN'),
+    ('GIẤY IVORY (SLIVER PARK) 250GSM - 650MM', 'GIVORYSLIVERPARK350GSM720MM'),
+    ('GIẤY IVORY (SLIVER PARK) 350GSM - 720MM', 'GIVORYSLIVERPARK250GSM651MM'),
+    ('Giấy Ivory (S-Pak Plus) - 300gsm Khổ 72cm', 'GIVORYSPALPLUS30GSM72CM'),
+    ('Giấy Ivory 230 gsm (100x54) cm', 'GIVORY230GSM100X54'),
+    ('Giấy Ivory 350 gsm (36x61) cm', 'GIVORY350GSM36X61'),
+    ('Giấy Ivory SP 250/43x61cm', 'GIVORYSPSP250/43X61CM'),
+    ('Giấy mỹ thuật 120gsm', 'GMYTHUAT120gsm'),
+    ('Giấy mỹ thuật 200 gsm 79x109cm', 'GMYTHUAT200GSM79X109CM'),
+    ('Giấy Offset 100 gsm (62x86) cm', 'GOFFSET100GSM62X86'),
+    ('Giấy Offset 100 gsm (79x109) cm', 'GOFFSET100GSM79X109'),
+    ('Giấy Offset 100/43.5x62cm', 'GOFFSET10010043.5X62CM'),
+    ('Giấy offset 100gsm khổ 62x86cm', 'GOFFSET100GSM62X86CM'),
+    ('Giấy offset 120gsm khổ 79x109cm', 'GOFFSET12079X109CM'),
+    ('Giấy offset 140gsm khổ 79x109cm', 'GOFFSET140GSM79X109CM'),
+    ('Giấy Offset 180 gsm (39x54) cm', 'GOFFSET180GSM39X54CM'),
+    ('Giấy Offset 80/62x86cm', 'GOFFSET80OFFSET80/62X86CM'),
+    ('Giấy offset 80gsm khổ 62x86cm', 'GOFFSET8062X86CM'),
+    ('Keo 3035', 'KEO3035'),
+    ('Keo làm từ Polyme ( Gôm bản)', 'KEOPOLYMR'),
+    ('Màng bóng BOPP - 20 mic', 'MANGBONGBOPP'),
+    ('Màng Bopp bóng', 'MANGBOPPBONG'),
+    ('Màng Bopp mờ', 'MANGBOPPMO'),
+    ('Màng tự dính BLWK-Z0585MW', 'MANGTUDINH'),
+    ('Màng tự dính SYNWK-F1840N', 'MANGTUDINH'),
+    ('Mực in - TK Mark V T Black (LT) (đen)', 'MUCINDEN'),
+    ('Mực in - TK Mark V T Cyan (VN) - 2Kg (xanh)', 'MUCINXANH'),
+    ('Mực in - TK Mark V T Magenta (VN) - 2kg (đỏ)', 'MUCINDO'),
+    ('Mực in - TK Mark V T Yellow (VN) - 2kg (vàng)', 'MUCINVANG'),
+    ('Mực in Peony đỏ cờ (KELE-04)', 'MUCINPEONYDO'),
+    ('Tấm bản in bằng nhôm CTP 1130x930', 'TAMBANNHOMCTP1130X930'),
+    ('Tấm bản in bằng nhôm CTP HL 1030x800', 'TAMBANNHOMCTP1030X800'),
+    ('Véc ni phủ bóng bề mặt OP Varnish (new)', 'VECNI'),
+)
+
+
+def vietmax_product_code_override(product):
+    key = normalize_rule_key(product)
+    for source, code in VIETMAX_PRODUCT_CODE_OVERRIDES:
+        if normalize_rule_key(source) == key:
+            return code
+    return None
+
+
+VIETMAX_ALL_WORD_PHRASES = (
+    "Giấy Couche",
+    "Giấy Cacbon",
+    "Giấy Duplex",
+    "Giấy Ivory",
+    "Giấy Offset",
+    "Giấy in 70/76",
+    "Giấy in BB58/92gsm",
+    "Giấy in BB60/92gsm",
+    "Giấy in BB80/92gsm",
+    "Giấy in Cacbon",
+    "Giấy in Couche",
+    "Giấy in Duplex",
+    "Giấy in Ivory",
+    "Giấy In Offset",
+)
+
+VIETMAX_ALL_WORD_PREFIXES = (
+    "Giấy ivory ningbo",
+)
+
+
+def vietmax_all_words_code(product):
+    key = normalize_rule_key(product)
+    phrase_keys = {normalize_rule_key(phrase) for phrase in VIETMAX_ALL_WORD_PHRASES}
+    prefix_keys = tuple(normalize_rule_key(prefix) for prefix in VIETMAX_ALL_WORD_PREFIXES)
+    if key not in phrase_keys and not any(key.startswith(prefix_key + " ") or key == prefix_key for prefix_key in prefix_keys):
+        return None
+    return "".join(normalize_code_token(word, keep_hyphen=True) for word in code_words(product))
+
+
+def vietmax_ban_ra_fallback_code(words):
+    parts = []
+    for index, word in enumerate(words):
+        if index == 0 or is_upper_code_token(word):
+            default_len = len(str(word))
+        else:
+            default_len = 2
+        parts.append(word_piece(word, {}, keep_numeric=True, default_len=default_len, preserve_upper_code=True, keep_hyphen=True))
+    return "".join(p for p in parts if p)
 
 VIETNAM_LOCATION_PHRASES = sorted(
     [
@@ -652,6 +850,85 @@ def cell(df, row, col):
     return "" if col < 0 or col >= df.shape[1] else df.iat[row, col]
 
 
+def normalized_inventory_match_value(value):
+    return raw_text(value).casefold().strip()
+
+
+def inventory_rule_matches(source_value, rule_value, operator):
+    source_value = normalized_inventory_match_value(source_value)
+    rule_value = normalized_inventory_match_value(rule_value)
+    if operator == "equals":
+        return source_value == rule_value
+    return rule_value in source_value
+
+
+def normalized_header_label(value):
+    return rm_accents(raw_text(value)).casefold().strip()
+
+
+def inventory_column_indexes(df, header_index):
+    labels = {"tk vat tu": None, "ma kho": None}
+    if 0 <= header_index < len(df):
+        for col in range(df.shape[1]):
+            key = normalized_header_label(cell(df, header_index, col))
+            if key in labels and labels[key] is None:
+                labels[key] = col
+    for key in labels:
+        if labels[key] is None:
+            labels[key] = df.shape[1]
+            df[df.shape[1]] = ""
+    df.iat[header_index, labels["tk vat tu"]] = "TK vật tư"
+    df.iat[header_index, labels["ma kho"]] = "Mã kho"
+    return labels["tk vat tu"], labels["ma kho"]
+
+
+def apply_inventory_pairs(df, header_index, processed_row_indexes, data):
+    pairs = {pair["id"]: pair for pair in normalize_inventory_pairs(data.get("inventory_pairs") or [])}
+    rules = normalize_inventory_pair_rules(data.get("inventory_pair_rules") or [])
+    default_enabled = bool(data.get("use_default_inventory_pair"))
+    default_pair_id = str(data.get("default_inventory_pair_id") or "").strip()
+    if default_enabled and default_pair_id not in pairs:
+        raise ValueError(f"Inventory default pair is missing: {default_pair_id}")
+    fallback_pair = None
+    if default_enabled:
+        fallback_pair = pairs[default_pair_id]
+    elif len(pairs) == 1:
+        fallback_pair = next(iter(pairs.values()))
+
+    prepared_rules = []
+    for rule in rules:
+        if not rule.get("enabled"):
+            continue
+        pair_id = rule.get("pair_id")
+        if pair_id not in pairs:
+            raise ValueError(f"Inventory rule pair is missing: {pair_id}")
+        source_col = rule.get("source_col")
+        try:
+            source_index = excel_col_to_index(source_col)
+        except ValueError as exc:
+            raise ValueError(f"Invalid inventory rule source column: {source_col}") from exc
+        if source_index >= df.shape[1]:
+            raise ValueError(f"Inventory rule source column exceeds the number of columns in the sheet: {source_col}")
+        prepared_rules.append((source_index, rule))
+
+    has_inventory_config = bool(pairs or rules or default_enabled or default_pair_id)
+    if not has_inventory_config:
+        return df
+
+    tk_index, ma_kho_index = inventory_column_indexes(df, header_index)
+    for row_index in processed_row_indexes:
+        selected_pair = None
+        for source_index, rule in prepared_rules:
+            if inventory_rule_matches(cell(df, row_index, source_index), rule.get("value"), rule.get("operator")):
+                selected_pair = pairs[rule["pair_id"]]
+                break
+        if selected_pair is None:
+            selected_pair = fallback_pair
+        df.iat[row_index, tk_index] = selected_pair["tk_vat_tu"] if selected_pair else ""
+        df.iat[row_index, ma_kho_index] = selected_pair["ma_kho"] if selected_pair else ""
+    return df
+
+
 def word_piece(token, word_rules, keep_numeric=True, keep_liter=False, default_len=1, preserve_upper_code=False, keep_slash=False, keep_hyphen=False):
     key = normalize_rule_key(token)
     rule_key = next((rule for rule in word_rules if normalize_rule_key(rule) == key), None)
@@ -773,7 +1050,16 @@ def make_product_part(profile, product, word_rules, first_word_rules=None, repea
 
     words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
 
-    if profile == "vietmax":
+    if profile == "vietmax_ban_ra":
+        return vietmax_ban_ra_fallback_code(words)
+
+    if profile == "vietmax_mua_vao":
+        override = vietmax_product_code_override(name)
+        if override is not None:
+            return override
+        all_words_code = vietmax_all_words_code(name)
+        if all_words_code is not None:
+            return all_words_code
         parts = []
         for index, word in enumerate(words):
             parts.append(word_piece(word, {}, keep_numeric=True, default_len=(len(str(word)) if index == 0 else 2), preserve_upper_code=True, keep_hyphen=True))
@@ -1027,14 +1313,15 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
 
 
 def resolve_output_path(original, requested_path):
-    default_name = f"{Path(original).stem}_formatted.xlsx"
+    default_name = f"{Path(original).stem}_fdi.xlsx"
     requested_path = str(requested_path or "").strip().strip('"')
     if not requested_path:
         return OUTPUT_DIR / default_name
     p = Path(requested_path)
     if p.suffix.lower() in {".xlsx", ".xlsm"}:
         p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+        stem = p.stem if p.stem.casefold().endswith("_fdi") else f"{p.stem}_fdi"
+        return p.with_name(f"{stem}.xlsx")
     p.mkdir(parents=True, exist_ok=True)
     return p / default_name
 
@@ -1081,7 +1368,9 @@ def process_workbook(path, out, data):
     mst_col = data.get("mst_col", "G").upper()
     product_col = data.get("product_col", "N").upper()
     qty_col = str(data.get("qty_col", "P") or "").upper()
-    price_col = str(data.get("price_col", "R") or "").upper()
+    profile = profile_key(data.get("profile", "son_phuong"))
+    uses_price_rules = profile == "cao_thanh"
+    price_col = str(data.get("price_col", "R") or "").upper() if uses_price_rules else ""
     output_col = data.get("output_col", "M").upper()
     invoice_status_col = str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper()
     invoice_status_skip_values = data.get("invoice_status_skip_values")
@@ -1095,14 +1384,12 @@ def process_workbook(path, out, data):
         indexes.append(qi)
     if df.shape[1] <= max(indexes):
         raise ValueError("Selected columns exceed the number of columns in the sheet.")
-
-    profile = data.get("profile", "son_phuong")
     word_rules = data.get("word_rules") or {}
     first_word_rules = data.get("first_word_rules") or {}
     repeated_phrase_removals = normalize_phrase_list(data.get("repeated_phrase_removals") or [])
     include_company_prefix = data.get("include_company_prefix") is not False
-    price_rules = data.get("price_group_rules") or {}
-    price_range_rules = data.get("price_range_rules") or {}
+    price_rules = (data.get("price_group_rules") or {}) if uses_price_rules else {}
+    price_range_rules = (data.get("price_range_rules") or {}) if uses_price_rules else {}
     manual_code_overrides = data.get("manual_code_overrides") or {}
     prefix_map, selected_products = validate_payload(data)
     rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values)
@@ -1154,6 +1441,8 @@ def process_workbook(path, out, data):
     if header_index is None:
         header_index = min(processed_row_indexes, default=len(df)) - 1
 
+    df = apply_inventory_pairs(df, header_index, processed_row_indexes, data)
+
     keep_indexes = [
         i for i in range(len(df))
         if i <= header_index or i in processed_row_indexes
@@ -1183,6 +1472,22 @@ def up_ban_ra_template_sheet(workbook):
     return workbook.worksheets[0]
 
 
+def processed_inventory_column_indexes(processed_df, output_code_index):
+    labels = {"tk vat tu": None, "ma kho": None}
+    header_index = None
+    for row in range(len(processed_df)):
+        if "ma vt" in normalized_header_label(cell(processed_df, row, output_code_index)):
+            header_index = row
+            break
+    if header_index is None:
+        return {"tk_vat_tu": None, "ma_kho": None}
+    for col in range(processed_df.shape[1]):
+        key = normalized_header_label(cell(processed_df, header_index, col))
+        if key in labels and labels[key] is None:
+            labels[key] = col
+    return {"tk_vat_tu": labels["tk vat tu"], "ma_kho": labels["ma kho"]}
+
+
 def create_up_ban_ra_workbook(processed_df):
     from openpyxl import load_workbook
 
@@ -1204,6 +1509,7 @@ def create_up_ban_ra_workbook(processed_df):
         ws.delete_rows(2, ws.max_row - 1)
 
     source_indexes = {name: excel_col_to_index(name) for name in ["C", "D", "J", "L", "O", "P", "Q", "R", "W"]}
+    inventory_indexes = processed_inventory_column_indexes(processed_df, source_indexes["L"])
     output_row = 2
     for row in range(len(processed_df)):
         code = raw_text(cell(processed_df, row, source_indexes["L"]))
@@ -1225,9 +1531,10 @@ def create_up_ban_ra_workbook(processed_df):
             "Y": cell(processed_df, row, source_indexes["W"]),
             "Z": "1311",
             "AA": "",
-            "AB": "",
+            "AB": cell(processed_df, row, inventory_indexes["tk_vat_tu"]) if inventory_indexes["tk_vat_tu"] is not None else "",
             "AC": "632",
             "AE": "33311",
+            "AF": cell(processed_df, row, inventory_indexes["ma_kho"]) if inventory_indexes["ma_kho"] is not None else "",
             "AG": cell(processed_df, row, source_indexes["L"]),
             "AH": "Xuất bán hàng",
             "AK": 1,
@@ -1238,6 +1545,7 @@ def create_up_ban_ra_workbook(processed_df):
             output_cell = ws.cell(output_row, col)
             output_cell._style = copy(data_styles[col - 1])
             output_cell.number_format = data_number_formats[col - 1]
+            output_cell.value = ""
         for column, value in values.items():
             ws[f"{column}{output_row}"] = "" if pd.isna(value) else value
         output_row += 1
@@ -1249,7 +1557,7 @@ def create_up_ban_ra_workbook(processed_df):
 
 
 def up_ban_ra_output_path(formatted_path):
-    return formatted_path.with_name(f"{formatted_path.stem}_UP_ban_ra.xlsx")
+    return formatted_path.with_name(f"{formatted_path.stem}_nhap_kho.xlsx")
 
 
 def process_zip_stream(formatted_path, up_path):
@@ -1525,12 +1833,13 @@ def process():
         up_out = up_ban_ra_output_path(out)
         up_out.write_bytes(up_stream.getvalue())
         cfg = load_config()
-        profile = data.get("profile", cfg.get("selected_profile", "son_phuong"))
+        profile = profile_key(data.get("profile", cfg.get("selected_profile", "son_phuong")))
+        uses_price_rules = profile == "cao_thanh"
         cfg["selected_profile"] = profile
         cfg["columns"].update({k: data.get(k, v) for k, v in cfg["columns"].items()})
         cfg["profiles"].setdefault(profile, empty_profile_config(profile))
         old_profile = cfg["profiles"].get(profile) or empty_profile_config(profile)
-        merged_price_ranges = merge_price_ranges(old_profile.get("price_range_rules"), data.get("price_range_rules", {}))
+        merged_price_ranges = merge_price_ranges(old_profile.get("price_range_rules"), data.get("price_range_rules", {})) if uses_price_rules else {}
         cfg["profiles"][profile].update({
             "prefixes": data.get("prefixes", {}),
             "selected_products": data.get("skipped_products_map", {}),
@@ -1538,10 +1847,14 @@ def process():
             "word_rules": data.get("word_rules", {}),
             "first_word_rules": data.get("first_word_rules", {}),
             "repeated_phrase_removals": normalize_phrase_list(data.get("repeated_phrase_removals", old_profile.get("repeated_phrase_removals", []))),
-            "price_group_rules": data.get("price_group_rules", {}),
+            "price_group_rules": data.get("price_group_rules", {}) if uses_price_rules else {},
             "price_range_rules": merged_price_ranges,
-            "price_adjust_all_percent": float(data.get("price_adjust_all_percent") or 0),
+            "price_adjust_all_percent": float(data.get("price_adjust_all_percent") or 0) if uses_price_rules else 0,
             "manual_code_overrides": data.get("manual_code_overrides", {}),
+            "inventory_pairs": normalize_inventory_pairs(data.get("inventory_pairs") or old_profile.get("inventory_pairs") or []),
+            "use_default_inventory_pair": bool(data.get("use_default_inventory_pair", old_profile.get("use_default_inventory_pair", False))),
+            "default_inventory_pair_id": str(data.get("default_inventory_pair_id", old_profile.get("default_inventory_pair_id", "")) or "").strip(),
+            "inventory_pair_rules": normalize_inventory_pair_rules(data.get("inventory_pair_rules") or old_profile.get("inventory_pair_rules") or []),
             "include_company_prefix": data.get("include_company_prefix") is not False,
             "output_path": data.get("output_path", ""),
         })
