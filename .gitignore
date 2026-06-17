@@ -1,0 +1,97 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node dependencies and generated frontend builds
+node_modules/
+*/node_modules/
+react_frontend/dist/
+react_frontend/tsconfig.tsbuildinfo
+frontend/dist/
+static/
+frontend/.angular/cache/
+frontend/tmp/
+frontend/out-tsc/
+frontend/.angular/
+
+# PyInstaller and packaged application outputs
+build/
+dist/
+deploy/
+*.exe
+*.dll
+*.pyd
+*.so
+*.dylib
+*.pkg
+*.pyz
+*.toc
+*.manifest
+*.zip
+
+# Runtime uploads, generated Excel output, and reports
+uploads/
+outputs/
+deploy/uploads/
+deploy/outputs/
+*.xlsx
+*.xlsm
+!mau HD ban ra.xlsx
+*.pdf
+
+# Local runtime configuration and secrets
+config.json
+product_code_config.json
+deploy/product_code_config.json
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# Logs and local debug scratch files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+profile_debug.txt
+profile_ui_debug.txt
+excel_output.txt
+comprehensive_check.txt
+all_rows.txt
+slash_*.txt
+test_all_excel.txt
+test_vietmax_codes.txt
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+
+# Nested app generated artifacts
+inventory_allocation_app/build*/
+inventory_allocation_app/dist*/
+inventory_allocation_app/dist_export_templates/
+inventory_allocation_app/*.exe
+inventory_allocation_app/outputs/
+inventory_allocation_app/uploads/
+.aider*

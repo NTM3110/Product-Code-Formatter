@@ -1,0 +1,146 @@
+import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, LicenseStatus, MatchRow, ProcessResult, ReviewProduct, ReviewRow, UploadSummary } from './types';
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  if (response.ok) {
+    return response.json() as Promise<T>;
+  }
+  const payload = await response.json().catch(() => ({}));
+  throw new Error(String(payload.detail || payload.error || response.statusText));
+}
+
+export async function uploadExcel(file: File): Promise<UploadSummary> {
+  const form = new FormData();
+  form.append('file', file);
+  return parseJsonResponse<UploadSummary>(await fetch('/api/files/upload', { method: 'POST', body: form }));
+}
+
+export async function getLicenseStatus(): Promise<LicenseStatus> {
+  return parseJsonResponse<LicenseStatus>(await fetch('/api/license/status'));
+}
+
+export async function activateLicense(payload: { server_url: string; account_id: string; license_key: string }): Promise<LicenseStatus> {
+  return parseJsonResponse<LicenseStatus>(
+    await fetch('/api/license/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function reloadLicense(): Promise<LicenseStatus> {
+  return parseJsonResponse<LicenseStatus>(await fetch('/api/license/reload', { method: 'POST' }));
+}
+
+export async function createPurchaseReview(savedName: string, comparisonScope: string, wordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[]) {
+  return parseJsonResponse<{ products: unknown[]; review_rows: unknown[] }>(
+    await fetch('/api/vietmax/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ saved_name: savedName, phase: 'purchase', comparison_scope: comparisonScope, price_col: 'P', word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals, products }),
+    }),
+  );
+}
+
+export async function analyzeVietmaxCompanies(savedName: string, phase: 'purchase' | 'sales' = 'purchase') {
+  const company_col = phase === 'sales' ? 'I' : 'F';
+  const mst_col = phase === 'sales' ? 'J' : 'G';
+  const address_col = phase === 'sales' ? 'K' : 'H';
+  return parseJsonResponse<{ rows_to_process: number; company_count: number; companies: CompanyRow[]; manual_code_overrides?: Record<string, string>; word_rules?: Record<string, string>; repeated_phrase_removals?: string[]; inventory_pairs?: InventoryPair[]; use_default_inventory_pair?: boolean; default_inventory_pair_id?: string; inventory_pair_rules?: InventoryRule[]; sales_match_rules?: MatchRow[] }>(
+    await fetch('/api/vietmax/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ saved_name: savedName, phase, company_col, mst_col, address_col, product_col: 'M', qty_col: 'O', price_col: 'P' }),
+    }),
+  );
+}
+
+export async function previewVietmaxProductCodes(products: string[], wordRules: Record<string, string>, repeatedPhraseRemovals: string[], phase: 'purchase' | 'sales' = 'purchase') {
+  return parseJsonResponse<{ codes: Record<string, string> }>(
+    await fetch('/api/vietmax/product-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phase, products, word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals }),
+    }),
+  );
+}
+
+
+export async function saveVietmaxConfig(payload: Record<string, unknown>) {
+  return parseJsonResponse<Record<string, unknown>>(
+    await fetch('/api/vietmax/save-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function processVietmaxPurchase(savedName: string, originalName: string, payload: Record<string, unknown>): Promise<ProcessResult> {
+  const response = await fetch('/api/vietmax/process', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ saved_name: savedName, original_name: originalName, payload }),
+  });
+  if (!response.ok) {
+    const errorPayload = await response.json().catch(() => ({}));
+    throw new Error(String(errorPayload.detail || errorPayload.error || response.statusText));
+  }
+  return { blob: await response.blob(), processedSavedName: response.headers.get('X-Processed-Saved-Name') || '' };
+}
+
+export async function createSalesMatches(salesSavedName: string, purchaseSavedName: string, comparisonScope: string) {
+  return parseJsonResponse<{ sales_products: unknown[]; purchase_products: unknown[]; exact_matches: MatchRow[]; matches: MatchRow[]; match_rules?: MatchRow[] }>(
+    await fetch('/api/vietmax/sales-match', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sales_saved_name: salesSavedName,
+        purchase_saved_name: purchaseSavedName,
+        comparison_scope: comparisonScope,
+        sales_price_col: 'P',
+        purchase_price_col: 'P',
+        sales_company_col: 'I',
+        sales_mst_col: 'J',
+        require_existing_purchase_code: true,
+      }),
+    }),
+  );
+}
+
+export async function exportMatches(matches: MatchRow[]): Promise<Blob> {
+  const response = await fetch('/api/vietmax/export-matches', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ matches }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(String(payload.detail || payload.error || response.statusText));
+  }
+  return response.blob();
+}
+
+export async function startInventoryAllocation(payload: { purchaseSavedName: string; salesSavedName: string; salesOriginalName: string; openingFile?: File | null; config: InventoryAllocationConfig }) {
+  const form = new FormData();
+  form.append('purchase_saved_name', payload.purchaseSavedName);
+  form.append('sales_saved_name', payload.salesSavedName);
+  form.append('sales_original_name', payload.salesOriginalName);
+  form.append('mapping', JSON.stringify(payload.config.mapping));
+  form.append('policy', JSON.stringify(payload.config.policy));
+  if (payload.openingFile) form.append('opening_file', payload.openingFile);
+  return parseJsonResponse<{ analysis_job_id: string }>(await fetch('/api/inventory-allocation/analyze-job', { method: 'POST', body: form }));
+}
+
+export async function getInventoryAllocationJob(jobId: string): Promise<InventoryAllocationJob> {
+  return parseJsonResponse<InventoryAllocationJob>(await fetch(`/api/inventory-allocation/analyze-job/${encodeURIComponent(jobId)}`));
+}
+
+export async function downloadInventoryAllocationReport(jobId: string): Promise<Blob> {
+  const response = await fetch(`/api/inventory-allocation/download/${encodeURIComponent(jobId)}`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(String(payload.detail || payload.error || response.statusText));
+  }
+  return response.blob();
+}

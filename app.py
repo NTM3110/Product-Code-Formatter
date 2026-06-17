@@ -1,4 +1,5 @@
 ﻿import json
+import ipaddress
 import os
 import re
 import subprocess
@@ -11,9 +12,13 @@ import webbrowser
 import zipfile
 from collections import Counter
 from copy import copy
+from difflib import SequenceMatcher
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -21,6 +26,7 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask.json.provider import DefaultJSONProvider
 
 APP_VERSION = "0.1"
+LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 class CustomJSONProvider(DefaultJSONProvider):
     def default(self, o):
@@ -69,6 +75,7 @@ PROFILE_LABELS = {
     "son_phuong": "Sơn Phương",
     "cao_thanh": "Cao Thành",
     "quang_thinh": "Quang Thịnh",
+    "vietmax": "Vietmax",
     "vietmax_mua_vao": "Vietmax mua vào",
     "vietmax_ban_ra": "Vietmax bán ra",
 }
@@ -76,10 +83,71 @@ PROFILE_LABELS = {
 PROFILE_ALIASES = {
     "quang_thinh_1": "quang_thinh",
     "quang_thinh_2": "quang_thinh",
-    "vietmax": "vietmax_mua_vao",
 }
 
-VIETMAX_PROFILES = {"vietmax_mua_vao", "vietmax_ban_ra"}
+VIETMAX_PROFILE = "vietmax"
+VIETMAX_PHASE_PURCHASE = "purchase"
+VIETMAX_PHASE_SALES = "sales"
+VIETMAX_PROFILES = {"vietmax", "vietmax_mua_vao", "vietmax_ban_ra"}
+VIETMAX_BAN_RA_MATCH_MA_KHO = "KHH"
+VIETMAX_BAN_RA_MATCH_TK_VAT_TU = "152"
+VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES = "all_companies"
+VIETMAX_COMPARISON_SCOPE_SAME_COMPANY = "same_company"
+VIETMAX_COMPARISON_SCOPES = {VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, VIETMAX_COMPARISON_SCOPE_SAME_COMPANY}
+VIETMAX_CONVERSION_MODE_NONE = "none"
+VIETMAX_CONVERSION_MODE_QTY_AND_UNIT = "qty_and_unit"
+VIETMAX_CONVERSION_MODE_QTY_ONLY = "qty_only"
+VIETMAX_CONVERSION_MODE_UNIT_ONLY = "unit_only"
+VIETMAX_CONVERSION_MODE_LABELS = {
+    VIETMAX_CONVERSION_MODE_NONE: "Chỉ ghi chú, không đổi file",
+    VIETMAX_CONVERSION_MODE_QTY_AND_UNIT: "Đổi số lượng + ĐVT",
+    VIETMAX_CONVERSION_MODE_QTY_ONLY: "Chỉ đổi số lượng",
+    VIETMAX_CONVERSION_MODE_UNIT_ONLY: "Chỉ đổi ĐVT",
+}
+VIETMAX_CONVERSION_MODES = set(VIETMAX_CONVERSION_MODE_LABELS)
+VIETMAX_BAN_RA_FOCUS_PRODUCTS = [
+    "Cabon 1 liên kích thước A4",
+    "Cabon CB white 56/610*860_TL (R500)",
+    "Cabon CF pink 56/610*860_TL (R500)",
+    "Cabon CF yellow 56/650*860_TL (R500)",
+    "Cabon CFB blue 50/610*860_TL (R500)",
+    "Giấy An Hòa 92/70gms/790x1090",
+    "Giấy An Hòa PP 92/70",
+    "Cabon kích thước A4",
+    "Cabon kích thước A5",
+    "Giấy Couche",
+    "Giấy Couche 300 gsm (62x86) cm",
+    "Giấy in",
+    "Giấy in couche",
+    "Giấy in logo Desylia",
+    "Giấy Ivory Ningbo 300gsm khổ 62 cm",
+    "Giấy in offset 100gsm",
+    "Giấy in offset 120gsm (790x1090mm)",
+    "Giấy Ivory 300 gsm (79x109) cm",
+    "Giấy không in",
+    "Giấy không in KT 7,4x43,9cm",
+    "Giấy mỹ thuật",
+    "Giấy nháp",
+    "Giấy Offset",
+    "Giấy thi",
+]
+
+VIETMAX_PURCHASE_REVIEW_FORCED_PAIRS = (
+    ("Giấy An Hòa PP 92/70", "Giấy An Hòa 92/70gms/790x1090"),
+    ("Giấy in offset 100gsm", "Giấy In Offset"),
+    ("Giấy Offset", "Giấy In Offset"),
+    ("Giấy Couche", "Giấy in Couche"),
+    ("Cabon CB white 56/610*860_TL (R500)", "Giấy Cacbon CB white 56/610*860_TL (R500)"),
+    ("Cabon CF pink 56/610*860_TL (R500)", "Giấy Cacbon CF pink 56/610*860_TL (R500)"),
+    ("Cabon CF yellow 56/650*860_TL (R500)", "Giấy Cacbon CF yellow 56/650*860_TL (R500)"),
+    ("Cabon CFB blue 50/610*860_TL (R500)", "Giấy Cacbon CFB blue 50/610*860_TL (R500)"),
+)
+KEYGEN_ACTIVATION_REQUIRED_CODES = {
+    "NO_MACHINE",
+    "NO_MACHINES",
+    "FINGERPRINT_SCOPE_MISMATCH",
+    "MACHINE_SCOPE_MISMATCH",
+}
 
 MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
@@ -110,6 +178,7 @@ def empty_profile_config(profile_key_name=None):
         "price_range_rules": {},
         "price_adjust_all_percent": 0,
         "manual_code_overrides": {},
+        "vietmax_ban_ra_purchase_match_rules": [],
         "inventory_pairs": [],
         "use_default_inventory_pair": False,
         "default_inventory_pair_id": "",
@@ -124,6 +193,7 @@ def default_config():
     return {
         "app_version": APP_VERSION,
         "selected_profile": "son_phuong",
+        "license": empty_license_config(),
         "profiles": {key: empty_profile_config(key) for key in PROFILE_LABELS},
         "columns": {
             "company_col": "F",
@@ -132,6 +202,7 @@ def default_config():
             "product_col": "M",
             "qty_col": "O",
             "price_col": "",
+            "purchase_price_col": "",
             "output_col": "L",
             "invoice_status_col": DEFAULT_INVOICE_STATUS_COL,
             "invoice_status_skip_values": DEFAULT_INVOICE_STATUS_SKIP_VALUES[:],
@@ -139,9 +210,36 @@ def default_config():
     }
 
 
+def empty_license_config():
+    return {
+        "server_url": "",
+        "account_id": "",
+        "license_key": "",
+        "machine_fingerprint": "",
+        "machine_id": "",
+        "activated": False,
+        "last_validated_at": "",
+        "status": "",
+        "allowed_companies": [],
+        "allowed_profiles": [],
+    }
+
+
 def profile_key(value):
     key = PROFILE_ALIASES.get(value, value)
     return key if key in PROFILE_LABELS else "son_phuong"
+
+
+def normalize_vietmax_phase(value):
+    value = str(value or "").strip().casefold()
+    return VIETMAX_PHASE_SALES if value in {VIETMAX_PHASE_SALES, "ban_ra", "bán ra", "sales"} else VIETMAX_PHASE_PURCHASE
+
+
+def effective_processing_profile(profile, vietmax_phase=None):
+    profile = profile_key(profile)
+    if profile != VIETMAX_PROFILE:
+        return profile
+    return "vietmax_ban_ra" if normalize_vietmax_phase(vietmax_phase) == VIETMAX_PHASE_SALES else "vietmax_mua_vao"
 
 
 def normalize_removed_companies(value):
@@ -284,6 +382,239 @@ def normalize_inventory_pair_rules(value):
     return result
 
 
+def normalize_string_list(value):
+    if isinstance(value, str):
+        items = re.split(r"[,;\n]+", value)
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    result = []
+    seen = set()
+    for item in items:
+        text = str(item or "").strip()
+        key = normalize_rule_key(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def normalize_license_config(value):
+    defaults = empty_license_config()
+    value = value if isinstance(value, dict) else {}
+    result = dict(defaults)
+    for key in ["server_url", "account_id", "license_key", "machine_fingerprint", "machine_id", "last_validated_at", "status"]:
+        result[key] = str(value.get(key) or "").strip()
+    result["activated"] = bool(value.get("activated"))
+    result["allowed_companies"] = normalize_string_list(value.get("allowed_companies") or [])
+    result["allowed_profiles"] = normalize_string_list(value.get("allowed_profiles") or [])
+    return result
+
+
+def local_machine_fingerprint():
+    return f"{os.environ.get('COMPUTERNAME') or 'windows'}-{uuid.getnode():012x}".upper()
+
+
+def license_has_local_activation(value):
+    license_cfg = normalize_license_config(value)
+    if not license_cfg.get("activated"):
+        return False
+    return license_cfg.get("machine_fingerprint") == local_machine_fingerprint()
+
+
+def license_company_match(value, allowed_companies):
+    if not allowed_companies:
+        return True
+    key = normalize_rule_key(value)
+    allowed = {normalize_rule_key(item) for item in allowed_companies if normalize_rule_key(item)}
+    digits = re.sub(r"\D+", "", raw_text(value))
+    allowed_digits = {re.sub(r"\D+", "", raw_text(item)) for item in allowed_companies}
+    allowed_digits = {item for item in allowed_digits if item}
+    return key in allowed or (bool(digits) and digits in allowed_digits)
+
+
+def license_allows_company(company, allowed_companies):
+    if not allowed_companies:
+        return True
+    names = [company.get("mst", ""), company.get("company", ""), *(company.get("all_names") or [])]
+    return any(license_company_match(name, allowed_companies) for name in names)
+
+
+def profile_match_value(value):
+    key = profile_key(value)
+    if key != "son_phuong" or normalize_rule_key(value) in {"son phuong", "son_phuong"}:
+        return key
+    normalized = normalize_rule_key(value).replace("_", " ")
+    for profile, label in PROFILE_LABELS.items():
+        if normalized in {normalize_rule_key(profile).replace("_", " "), normalize_rule_key(label)}:
+            return profile
+    return ""
+
+
+def license_allows_profile(profile, allowed_profiles):
+    if not allowed_profiles:
+        return True
+    current = profile_match_value(profile)
+    allowed = {profile_match_value(item) for item in allowed_profiles}
+    return bool(current and current in allowed)
+
+
+def extract_allowed_companies(metadata):
+    if not isinstance(metadata, dict):
+        return []
+    for key in ["allowed_companies", "allowedCompanies", "companies", "allowed_company_mst", "allowedCompanyMst", "allowed_mst", "allowedMst", "mst", "msts"]:
+        if key in metadata:
+            return normalize_string_list(metadata.get(key))
+    return []
+
+
+def extract_allowed_profiles(metadata):
+    if not isinstance(metadata, dict):
+        return []
+    for key in ["allowed_profiles", "allowedProfiles", "profiles", "company_profiles", "companyProfiles"]:
+        if key in metadata:
+            return normalize_string_list(metadata.get(key))
+    return []
+
+
+def keygen_license_metadata(response):
+    data = response.get("data") if isinstance(response, dict) else {}
+    attributes = data.get("attributes") if isinstance(data, dict) else {}
+    metadata = attributes.get("metadata") if isinstance(attributes, dict) else {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def keygen_url(server_url, account_id, path):
+    base = str(server_url or "").strip().rstrip("/")
+    account = str(account_id or "").strip().strip("/")
+    if not base or not account:
+        raise ValueError("Cần nhập địa chỉ server và account của Keygen.")
+    parsed = urlparse(base)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("License server phải bắt đầu bằng http:// hoặc https://.")
+    if parsed.scheme == "http" and not keygen_allows_http_host(parsed.hostname):
+        raise ValueError("License server HTTP chỉ được phép cho localhost hoặc máy trong mạng LAN.")
+    return f"{base}/v1/accounts/{account}/{path.lstrip('/')}"
+
+
+def keygen_allows_http_host(hostname):
+    host = str(hostname or "").strip().lower()
+    if host in LOCAL_KEYGEN_HOSTS:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.endswith(".local") or "." not in host
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def keygen_is_local_http_url(url):
+    parsed = urlparse(str(url or ""))
+    return parsed.scheme == "http" and keygen_allows_http_host(parsed.hostname)
+
+
+def keygen_request(method, url, payload=None, license_key=None, timeout=10):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {
+        "Accept": "application/vnd.api+json",
+        "Content-Type": "application/vnd.api+json",
+    }
+    if keygen_is_local_http_url(url):
+        headers["X-Forwarded-Proto"] = "https"
+    if license_key:
+        headers["Authorization"] = f"License {license_key}"
+    request_obj = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request_obj, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Keygen trả về lỗi {exc.code}: {detail or exc.reason}") from exc
+    except URLError as exc:
+        raise ValueError(f"Không kết nối được license server: {exc.reason}") from exc
+    return json.loads(body) if body else {}
+
+
+def keygen_validate_license(server_url, account_id, license_key, fingerprint=None, timeout=10):
+    key = str(license_key or "").strip()
+    if not key:
+        raise ValueError("Cần nhập license key.")
+    fingerprint = str(fingerprint or local_machine_fingerprint()).strip()
+    payload = {"meta": {"key": key, "scope": {"fingerprint": fingerprint}}}
+    response = keygen_request("POST", keygen_url(server_url, account_id, "licenses/actions/validate-key"), payload, timeout=timeout)
+    meta = response.get("meta") if isinstance(response, dict) else {}
+    data = response.get("data") if isinstance(response, dict) else {}
+    attributes = data.get("attributes") if isinstance(data, dict) else {}
+    metadata = keygen_license_metadata(response)
+    return {
+        "valid": meta.get("valid") is not False,
+        "code": str(meta.get("code") or ""),
+        "detail": str(meta.get("detail") or ""),
+        "license_id": str(data.get("id") or "") if isinstance(data, dict) else "",
+        "status": str((attributes or {}).get("status") or meta.get("code") or "valid"),
+        "allowed_companies": extract_allowed_companies(metadata),
+        "allowed_profiles": extract_allowed_profiles(metadata),
+        "raw": response,
+    }
+
+
+def keygen_activate_machine(server_url, account_id, license_key, license_id, fingerprint=None, timeout=10):
+    fingerprint = str(fingerprint or local_machine_fingerprint()).strip()
+    license_id = str(license_id or "").strip()
+    if not license_id:
+        raise ValueError("Không tìm thấy license id để kích hoạt máy.")
+    payload = {
+        "data": {
+            "type": "machines",
+            "attributes": {
+                "fingerprint": fingerprint,
+                "name": os.environ.get("COMPUTERNAME") or "ProductCodeFormatter",
+                "platform": sys.platform,
+            },
+            "relationships": {
+                "license": {
+                    "data": {"type": "licenses", "id": license_id}
+                }
+            },
+        }
+    }
+    try:
+        response = keygen_request("POST", keygen_url(server_url, account_id, "machines"), payload, license_key=license_key, timeout=timeout)
+    except ValueError as exc:
+        if "409" not in str(exc):
+            raise
+        return ""
+    data = response.get("data") if isinstance(response, dict) else {}
+    return str(data.get("id") or "") if isinstance(data, dict) else ""
+
+
+def activate_keygen_license(server_url, account_id, license_key, timeout=10):
+    fingerprint = local_machine_fingerprint()
+    validation = keygen_validate_license(server_url, account_id, license_key, fingerprint, timeout)
+    machine_id = ""
+    if not validation["valid"]:
+        if validation["code"] not in KEYGEN_ACTIVATION_REQUIRED_CODES:
+            raise ValueError(validation["detail"] or validation["code"] or "License không hợp lệ.")
+        machine_id = keygen_activate_machine(server_url, account_id, license_key, validation["license_id"], fingerprint, timeout)
+        validation = keygen_validate_license(server_url, account_id, license_key, fingerprint, timeout)
+    if not validation["valid"]:
+        raise ValueError(validation["detail"] or validation["code"] or "License chưa hợp lệ sau khi kích hoạt máy.")
+    return {
+        "server_url": str(server_url or "").strip().rstrip("/"),
+        "account_id": str(account_id or "").strip(),
+        "license_key": str(license_key or "").strip(),
+        "machine_fingerprint": fingerprint,
+        "machine_id": machine_id,
+        "activated": True,
+        "last_validated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": validation["status"],
+        "allowed_companies": validation["allowed_companies"],
+        "allowed_profiles": validation["allowed_profiles"],
+    }
+
+
 def price_ranges_from_groups(price_group_rules):
     ranges = {}
     for rule in price_group_rules.values():
@@ -339,6 +670,7 @@ def normalize_profile_config(profile_key_name, profile):
         "price_range_rules": price_ranges,
         "price_adjust_all_percent": legacy_price_adjust_all_percent(profile, price_groups, price_ranges),
         "manual_code_overrides": products,
+        "vietmax_ban_ra_purchase_match_rules": list(profile.get("vietmax_ban_ra_purchase_match_rules") or profile.get("sales_match_rules") or []),
         "inventory_pairs": normalize_inventory_pairs(profile.get("inventory_pairs") or []),
         "use_default_inventory_pair": bool(profile.get("use_default_inventory_pair")),
         "default_inventory_pair_id": str(profile.get("default_inventory_pair_id") or "").strip(),
@@ -355,6 +687,7 @@ def normalize_config(data):
     if isinstance(data, dict):
         selected = data.get("selected_profile") or data.get("active_profile") or data.get("format_rule")
         cfg["selected_profile"] = profile_key(selected) if selected else cfg["selected_profile"]
+        cfg["license"] = normalize_license_config(data.get("license") or {})
         cfg["columns"].update(data.get("columns") or {})
         cfg["columns"].setdefault("invoice_status_col", DEFAULT_INVOICE_STATUS_COL)
         if not isinstance(cfg["columns"].get("invoice_status_skip_values"), list):
@@ -572,8 +905,8 @@ VIETMAX_PRODUCT_CODE_OVERRIDES = (
     ('Giấy Couche matt 80/46x79cm', 'GCOUCHEMATTMATT80/46X79CM'),
     ('Giấy decal tự dính', 'GIAYDECELTUDINH'),
     ('Giấy Duplex', 'GIAYDUPLEX'),
-    ('Giấy Duplex ĐL 300 g/m2', 'GDL300gm2M2'),
-    ('Giấy Duplex ĐL 400 g/m2', 'GDL400gm2M2'),
+    ('Giấy Duplex ĐL 300 g/m2', 'GDL300GM2'),
+    ('Giấy Duplex ĐL 400 g/m2', 'GDL400GM2'),
     ('GIẤY DUPLEX LION 250GSM - 650MM', 'GDUPLEXLION250GSM650MM'),
     ('Giấy in', 'GIAYIN'),
     ('GIẤY IVORY (SLIVER PARK) 250GSM - 650MM', 'GIVORYSLIVERPARK350GSM720MM'),
@@ -606,7 +939,6 @@ VIETMAX_PRODUCT_CODE_OVERRIDES = (
     ('Mực in - TK Mark V T Yellow (VN) - 2kg (vàng)', 'MUCINVANG'),
     ('Mực in Peony đỏ cờ (KELE-04)', 'MUCINPEONYDO'),
     ('Tấm bản in bằng nhôm CTP 1130x930', 'TAMBANNHOMCTP1130X930'),
-    ('Tấm bản in bằng nhôm CTP HL 1030x800', 'TAMBANNHOMCTP1030X800'),
     ('Véc ni phủ bóng bề mặt OP Varnish (new)', 'VECNI'),
 )
 
@@ -617,6 +949,24 @@ def vietmax_product_code_override(product):
         if normalize_rule_key(source) == key:
             return code
     return None
+
+
+def vietmax_preserve_dimension_unit_code(product, code):
+    text = normalize_sep(product)
+    match = re.search(r"\d+(?:[.,]\d+)?\s*x\s*\d+(?:[.,]\d+)?(?:\s*x\s*\d+(?:[.,]\d+)?)?\s*\)?\s*(cm|mm|m)\b", text, re.IGNORECASE)
+    if not match:
+        return code
+    dimension = extract_dimensions(text)
+    if not dimension:
+        return code
+    compact_dimension = normalize_code_token(dimension)
+    unit = normalize_code_token(match.group(1))
+    value = raw_text(code)
+    if value.upper().endswith(f"{compact_dimension}{unit}"):
+        return value
+    if value.upper().endswith(compact_dimension):
+        return f"{value}{unit}"
+    return value
 
 
 VIETMAX_ALL_WORD_PHRASES = (
@@ -637,8 +987,213 @@ VIETMAX_ALL_WORD_PHRASES = (
 )
 
 VIETMAX_ALL_WORD_PREFIXES = (
+    "Giấy in offset",
     "Giấy ivory ningbo",
 )
+
+
+VIETMAX_FALLBACK_PREFIX_RULES = (
+    ("Bản nhôm CTP BOCICA", "BNCTPBOCICA"),
+    ("Bản nhôm CTP", "BNCTP"),
+    ("Giấy Cacbon CFB", "GCCFB"),
+    ("Giấy Cacbon CF", "GCCF"),
+    ("Giấy Cacbon CB", "GCCB"),
+    ("Giấy An Hòa", "GAH"),
+    ("Giấy Ivory", "GIVORY"),
+    ("Giấy Couche", "GCOUCHE"),
+    ("Giấy mỹ thuật", "GMYTHUAT"),
+    ("Giấy Offset", "GOFFSET"),
+    ("Màng tự dính", "MANGTUDINH"),
+    ("Tấm bản in bằng nhôm CTP", "TAMBANNHOMCTP"),
+    ("Giấy tự dính", "GIAYTUDINH"),
+)
+
+
+VIETMAX_RULE_WORKBOOK_CANDIDATES = (
+    Path(r"E:\Excel Mom\Dóc\VIETMAX\mã vietmax.xlsx"),
+    BASE_DIR.parent / "Dóc" / "VIETMAX" / "mã vietmax.xlsx",
+    BASE_DIR / "Dóc" / "VIETMAX" / "mã vietmax.xlsx",
+    RESOURCE_DIR / "mã vietmax.xlsx",
+)
+
+
+def vietmax_suffix_token(token, keep_slash=False):
+    text = rm_accents(str(token or "")).strip()
+    parenthesized_dimension = bool(re.fullmatch(r"\(\d+(?:[xX.]*\d+)+\)", text, re.IGNORECASE))
+    text = re.sub(r"\s+", "", text)
+    if keep_slash:
+        text = re.sub(r"[^A-Za-z0-9.*()_/-]+", "", text)
+    else:
+        text = re.sub(r"[^A-Za-z0-9.*()_-]+", "", text.replace("/", ""))
+    if re.fullmatch(r"\(?\d+(?:[xX.]*\d+)+\)?(?:MM|CM|M)?", text, re.IGNORECASE):
+        text = text.strip("()")
+    if parenthesized_dimension:
+        return text.upper()
+    dimension_token = bool(re.search(r"\d+[xX]\d+", text))
+    result = []
+    for char in text:
+        result.append("x" if dimension_token and char in {"x", "X"} else char.upper())
+    return "".join(result)
+
+
+def vietmax_suffix_is_dimension(value):
+    return bool(re.search(r"\d+[xX.]\d+", str(value or "")))
+
+
+def vietmax_rule_marker(value):
+    key = normalize_rule_key(value)
+    return key if "+" in key and ("ki tu sau" in key or "kitu sau" in key or "kich thuoc" in key or "cac ki tu sau" in key) else ""
+
+
+def vietmax_rule_prefix(value):
+    text = raw_text(value)
+    if "+" not in text:
+        return ""
+    return normalize_code_token(text.split("+", 1)[0])
+
+
+def vietmax_target_code_prefix(value):
+    match = re.match(r"[A-Za-z]+", raw_text(value))
+    return match.group(0) if match else ""
+
+
+def vietmax_workbook_rule_path():
+    for path in VIETMAX_RULE_WORKBOOK_CANDIDATES:
+        if path.exists():
+            return path
+    return None
+
+
+def vietmax_common_prefix(values):
+    if not values:
+        return ""
+    prefix = str(values[0] or "")
+    for value in values[1:]:
+        text = str(value or "")
+        while prefix and not text.startswith(prefix):
+            prefix = prefix[:-1]
+    return prefix
+
+
+def vietmax_candidate_phrase_for_rule(name, prefix):
+    words = code_words(name)
+    if not words:
+        return ""
+    best = ""
+    for index in range(1, len(words) + 1):
+        candidate_words = words[:index]
+        acronym = "".join((normalize_code_token(word) if is_upper_code_token(word) else normalize_code_token(word)[:1]) for word in candidate_words if normalize_code_token(word))
+        compact = "".join(normalize_code_token(word) for word in candidate_words)
+        without_giay = "".join(normalize_code_token(word) for word in candidate_words[1:]) if normalize_rule_key(candidate_words[0]) == "giay" else compact
+        if prefix in {acronym, compact, without_giay}:
+            best = " ".join(candidate_words)
+    if best:
+        return best
+    for index, word in enumerate(words):
+        if has_number(word):
+            return " ".join(words[:index])
+    return " ".join(words[:1])
+
+
+@lru_cache(maxsize=1)
+def vietmax_workbook_prefix_rules():
+    path = vietmax_workbook_rule_path()
+    if path is None:
+        return VIETMAX_FALLBACK_PREFIX_RULES
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, data_only=True, read_only=True)
+        ws = wb.active
+        rules = []
+        for row in range(2, ws.max_row + 1):
+            name = raw_text(ws.cell(row, 1).value)
+            rule_value = ws.cell(row, 2).value
+            target_prefix = vietmax_target_code_prefix(ws.cell(row, 3).value)
+            marker = vietmax_rule_marker(rule_value)
+            if marker:
+                prefix = vietmax_rule_prefix(rule_value)
+                if target_prefix and not target_prefix.startswith(prefix):
+                    prefix = target_prefix
+                phrase = vietmax_candidate_phrase_for_rule(name, prefix)
+                if phrase and prefix:
+                    rules.append((phrase, prefix))
+        wb.close()
+        seen = set()
+        unique_rules = []
+        for phrase, prefix in sorted(rules, key=lambda item: len(code_words(item[0])), reverse=True):
+            key = (normalize_rule_key(phrase), prefix)
+            if key not in seen:
+                seen.add(key)
+                unique_rules.append((phrase, prefix))
+        seen_phrases = {normalize_rule_key(phrase) for phrase, _prefix in unique_rules}
+        for phrase, prefix in VIETMAX_FALLBACK_PREFIX_RULES:
+            phrase_key = normalize_rule_key(phrase)
+            if phrase_key not in seen_phrases:
+                unique_rules.append((phrase, prefix))
+                seen_phrases.add(phrase_key)
+        unique_rules.sort(key=lambda item: len(code_words(item[0])), reverse=True)
+        return tuple(unique_rules) or VIETMAX_FALLBACK_PREFIX_RULES
+    except Exception:
+        return VIETMAX_FALLBACK_PREFIX_RULES
+
+
+def vietmax_prefix_rule_code(product, sales_style=False):
+    words = code_words(product)
+    for phrase, prefix in vietmax_workbook_prefix_rules():
+        phrase_words = code_words(phrase)
+        if len(words) < len(phrase_words):
+            continue
+        if normalize_rule_key(" ".join(words[:len(phrase_words)])) != normalize_rule_key(phrase):
+            continue
+        suffix_parts = []
+        for word in words[len(phrase_words):]:
+            word_key = normalize_rule_key(word)
+            if word_key in {"dinh", "luong"}:
+                continue
+            if word_key == "kho" and prefix in {"GOFFSET", "GCOUCHE", "GIVORY"}:
+                continue
+            part = vietmax_sales_suffix_token(word) if sales_style else vietmax_suffix_token(word)
+            suffix_parts.append(part)
+        suffix = "".join(suffix_parts)
+        if suffix:
+            return f"{prefix}{suffix}"
+    return None
+
+
+def vietmax_early_prefix_rule_code(product):
+    words = code_words(product)
+    for phrase, prefix in vietmax_workbook_prefix_rules():
+        if normalize_rule_key(phrase) != "giay an hoa":
+            continue
+        phrase_words = code_words(phrase)
+        if len(words) >= len(phrase_words) and normalize_rule_key(" ".join(words[:len(phrase_words)])) == normalize_rule_key(phrase):
+            suffix = "".join(vietmax_suffix_token(word) for word in words[len(phrase_words):])
+            return f"{prefix}{suffix}" if suffix else None
+    return None
+
+
+def vietmax_manual_prefix_rule_code(product):
+    rules = (
+        ("Giấy Ivory", "GIVORY"),
+        ("Màng tự dính", "MANGTUDINH"),
+        ("Tấm bản in bằng nhôm CTP", "TAMBANNHOMCTP"),
+    )
+    words = code_words(product)
+    for phrase, prefix in rules:
+        phrase_words = code_words(phrase)
+        if len(words) < len(phrase_words):
+            continue
+        if normalize_rule_key(" ".join(words[:len(phrase_words)])) != normalize_rule_key(phrase):
+            continue
+        suffix_parts = []
+        for word in words[len(phrase_words):]:
+            word_key = normalize_rule_key(word)
+            if word_key in {"dinh", "luong", "kho"}:
+                continue
+            suffix_parts.append(vietmax_suffix_token(word))
+        suffix = "".join(suffix_parts)
+        return f"{prefix}{suffix}" if suffix else prefix
+    return None
 
 
 def vietmax_all_words_code(product):
@@ -647,18 +1202,21 @@ def vietmax_all_words_code(product):
     prefix_keys = tuple(normalize_rule_key(prefix) for prefix in VIETMAX_ALL_WORD_PREFIXES)
     if key not in phrase_keys and not any(key.startswith(prefix_key + " ") or key == prefix_key for prefix_key in prefix_keys):
         return None
-    return "".join(normalize_code_token(word, keep_hyphen=True) for word in code_words(product))
+    return "".join(normalize_code_token(word, keep_hyphen=True, keep_slash=True) for word in code_words(product))
+
+
+def vietmax_sales_suffix_token(token, first_word=False):
+    part = vietmax_suffix_token(token, keep_slash=True)
+    if not part:
+        return ""
+    if first_word or has_number(token) or is_upper_code_token(token):
+        return part
+    return part[:1]
 
 
 def vietmax_ban_ra_fallback_code(words):
-    parts = []
-    for index, word in enumerate(words):
-        if index == 0 or is_upper_code_token(word):
-            default_len = len(str(word))
-        else:
-            default_len = 2
-        parts.append(word_piece(word, {}, keep_numeric=True, default_len=default_len, preserve_upper_code=True, keep_hyphen=True))
-    return "".join(p for p in parts if p)
+    parts = [vietmax_sales_suffix_token(word, index == 0) for index, word in enumerate(words)]
+    return "".join(part for part in parts if part)[:MAX_CODE_LENGTH]
 
 VIETNAM_LOCATION_PHRASES = sorted(
     [
@@ -672,7 +1230,7 @@ VIETNAM_LOCATION_PHRASES = sorted(
             "Long An", "Nam Định", "Nghệ An", "Ninh Bình", "Ninh Thuận", "Phú Thọ", "Phú Yên", "Quảng Bình",
             "Quảng Nam", "Quảng Ngãi", "Quảng Ninh", "Quảng Trị", "Sóc Trăng", "Sơn La", "Tây Ninh",
             "Thái Bình", "Thái Nguyên", "Thanh Hóa", "Thành phố Huế", "Thừa Thiên Huế", "Huế", "Tiền Giang",
-            "Trà Vinh", "Tuyên Quang", "Vĩnh Long", "Vĩnh Phúc", "Yên Bái",
+            "Trà Vinh", "Tuyên Quang", "Vĩnh Long", "Vĩnh Phúc", "Yên Bái", "Việt Nam",
         ]
     ],
     key=len,
@@ -698,12 +1256,33 @@ def remove_company_location_phrases(tokens):
 
 def suggest_prefix(company):
     words = re.sub(r"[^A-Za-z0-9À-ỹĐđ ]+", " ", str(company)).split()
-    skip = {"CONG", "TY", "TNHH", "TM", "DV", "CP", "CO", "LTD", "MTV", "THUONG", "MAI"}
     meaningful = remove_company_location_phrases([normalize_token(w) for w in words if normalize_token(w)])
-    meaningful = [word for word in meaningful if word not in skip]
     tail_words = meaningful[-2:]
     prefix = "".join(w[:1] for w in tail_words)
     return prefix or normalize_token(company)[:2]
+
+
+def prefix_last_2_words(company):
+    return suggest_prefix(company)
+
+
+def prefix_last_n_mst(mst, n=3):
+    digits = re.sub(r"\D", "", str(mst))
+    return digits[-n:] if len(digits) >= n else digits
+
+
+def prefix_2_words_mst(company, mst, mst_digits=3):
+    words_prefix = prefix_last_2_words(company)
+    mst_suffix = prefix_last_n_mst(mst, mst_digits)
+    return f"{words_prefix}{mst_suffix}" if words_prefix and mst_suffix else (words_prefix or mst_suffix or "")
+
+
+def compute_prefix_strategies(company, mst):
+    return {
+        "last_2_words": prefix_last_2_words(company),
+        "last_3_mst": prefix_last_n_mst(mst, 3),
+        "2_words_mst": prefix_2_words_mst(company, mst, 3),
+    }
 
 
 def normalize_sep(text):
@@ -746,6 +1325,7 @@ def code_words(name):
     text = str(name or "")
     for ch in DIAMETER_CHARS:
         text = text.replace(ch, "F")
+    text = re.sub(r"(?i)(khổ|kho)(?=\d)", lambda match: match.group(1) + " ", text)
     text = normalize_sep(text)
     return [w for w in re.split(r"\s+", text.strip()) if w]
 
@@ -882,7 +1462,7 @@ def inventory_column_indexes(df, header_index):
     return labels["tk vat tu"], labels["ma kho"]
 
 
-def apply_inventory_pairs(df, header_index, processed_row_indexes, data):
+def apply_inventory_pairs(df, header_index, processed_row_indexes, data, excluded_row_indexes=None):
     pairs = {pair["id"]: pair for pair in normalize_inventory_pairs(data.get("inventory_pairs") or [])}
     rules = normalize_inventory_pair_rules(data.get("inventory_pair_rules") or [])
     default_enabled = bool(data.get("use_default_inventory_pair"))
@@ -916,7 +1496,10 @@ def apply_inventory_pairs(df, header_index, processed_row_indexes, data):
         return df
 
     tk_index, ma_kho_index = inventory_column_indexes(df, header_index)
+    excluded_row_indexes = set(excluded_row_indexes or [])
     for row_index in processed_row_indexes:
+        if row_index in excluded_row_indexes:
+            continue
         selected_pair = None
         for source_index, rule in prepared_rules:
             if inventory_rule_matches(cell(df, row_index, source_index), rule.get("value"), rule.get("operator")):
@@ -937,11 +1520,27 @@ def word_piece(token, word_rules, keep_numeric=True, keep_liter=False, default_l
     compact = normalize_code_token(token, keep_slash=keep_slash, keep_hyphen=keep_hyphen)
     if preserve_upper_code and is_upper_code_token(token):
         return compact
+    compact_descriptor = vietmax_compact_descriptor_piece(token, default_len, keep_slash=keep_slash, keep_hyphen=keep_hyphen)
+    if compact_descriptor:
+        return compact_descriptor
     if keep_numeric and has_number(token):
         return compact
     if keep_liter and re.search(r"\d+\s*[lL]\b|[lL]\s*$", str(token)):
         return compact
     return compact[:default_len]
+
+
+def vietmax_compact_descriptor_piece(token, default_len=2, keep_slash=False, keep_hyphen=False):
+    raw = str(token or "").strip()
+    if is_upper_code_token(raw):
+        return ""
+    match = re.fullmatch(r"([A-Za-zÀ-ỹĐđ]{3,})(\d.*)", raw)
+    if not match:
+        return ""
+    prefix, suffix = match.groups()
+    normalized_prefix = normalize_code_token(prefix)[:default_len]
+    normalized_suffix = normalize_code_token(suffix, keep_slash=keep_slash, keep_hyphen=keep_hyphen)
+    return f"{normalized_prefix}{normalized_suffix}" if normalized_prefix and normalized_suffix else ""
 
 
 def phrase_rule_piece(words, start, word_rules):
@@ -970,6 +1569,36 @@ def word_pieces(words, word_rules, fallback):
         parts.append(fallback(words[i]))
         i += 1
     return parts
+
+
+def apply_word_rules_to_words(words, word_rules):
+    if not word_rules:
+        return list(words)
+    result = []
+    i = 0
+    while i < len(words):
+        matched = phrase_rule_piece(words, i, word_rules)
+        if matched:
+            part, length = matched
+            result.append(part)
+            i += length
+            continue
+        result.append(apply_inline_word_rules_to_word(words[i], word_rules))
+        i += 1
+    return result
+
+
+def apply_inline_word_rules_to_word(word, word_rules):
+    text = str(word or "")
+    for rule, replacement in (word_rules or {}).items():
+        rule_text = str(rule or "").strip()
+        if not rule_text or " " in rule_text:
+            continue
+        replacement_text = normalize_token(replacement)
+        if not replacement_text:
+            continue
+        text = re.sub(rf"(?<![A-Za-zÀ-ỹ]){re.escape(rule_text)}(?![A-Za-zÀ-ỹ])", replacement_text, text, flags=re.IGNORECASE)
+    return text
 
 
 def remove_repeated_phrases(words, repeated_phrases):
@@ -1051,19 +1680,43 @@ def make_product_part(profile, product, word_rules, first_word_rules=None, repea
     words = remove_repeated_phrases(code_words(name), repeated_phrase_removals)
 
     if profile == "vietmax_ban_ra":
-        return vietmax_ban_ra_fallback_code(words)
-
-    if profile == "vietmax_mua_vao":
+        if word_rules:
+            words = apply_word_rules_to_words(words, word_rules)
+            name = " ".join(words)
         override = vietmax_product_code_override(name)
         if override is not None:
-            return override
+            return vietmax_preserve_dimension_unit_code(name, override)
         all_words_code = vietmax_all_words_code(name)
         if all_words_code is not None:
-            return all_words_code
+            return vietmax_preserve_dimension_unit_code(name, all_words_code)
+        prefix_rule_code = vietmax_prefix_rule_code(name, sales_style=True)
+        if prefix_rule_code is not None:
+            return vietmax_preserve_dimension_unit_code(name, prefix_rule_code)
+        return vietmax_preserve_dimension_unit_code(name, vietmax_ban_ra_fallback_code(words))
+
+    if profile == "vietmax_mua_vao":
+        if word_rules:
+            words = apply_word_rules_to_words(words, word_rules)
+            name = " ".join(words)
+        override = vietmax_product_code_override(name)
+        if override is not None:
+            return vietmax_preserve_dimension_unit_code(name, override)
+        early_prefix_rule_code = vietmax_early_prefix_rule_code(name)
+        if early_prefix_rule_code is not None:
+            return vietmax_preserve_dimension_unit_code(name, early_prefix_rule_code)
+        manual_prefix_rule_code = vietmax_manual_prefix_rule_code(name)
+        if manual_prefix_rule_code is not None:
+            return vietmax_preserve_dimension_unit_code(name, manual_prefix_rule_code)
+        prefix_rule_code = vietmax_prefix_rule_code(name)
+        if prefix_rule_code is not None:
+            return vietmax_preserve_dimension_unit_code(name, prefix_rule_code)
+        all_words_code = vietmax_all_words_code(name)
+        if all_words_code is not None:
+            return vietmax_preserve_dimension_unit_code(name, all_words_code)
         parts = []
         for index, word in enumerate(words):
             parts.append(word_piece(word, {}, keep_numeric=True, default_len=(len(str(word)) if index == 0 else 2), preserve_upper_code=True, keep_hyphen=True))
-        return "".join(p for p in parts if p)
+        return vietmax_preserve_dimension_unit_code(name, "".join(p for p in parts if p))
 
     if profile == "quang_thinh":
         filtered = []
@@ -1176,7 +1829,12 @@ def read_workbook(path):
     return sheet, df
 
 
-def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None):
+def report_loop_progress(progress_callback, done, total, label, interval=200):
+    if progress_callback and (done == 1 or done == total or done % interval == 0):
+        progress_callback(done, total, label)
+
+
+def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None):
     ci, mi, pi = map(excel_col_to_index, [company_col, mst_col, product_col])
     qi = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
     indexes = [ci, mi, pi]
@@ -1196,6 +1854,7 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
         raise ValueError("Selected columns exceed the number of columns in the sheet.")
     rows = []
     for i in range(len(df)):
+        report_loop_progress(progress_callback, i + 1, len(df), "Đang quét dòng hóa đơn")
         if status_index is not None and df.shape[1] > status_index and ignored_invoice_status(cell(df, i, status_index), invoice_status_skip_values):
             continue
         if qi is not None and not should_process_qty(cell(df, i, qi)):
@@ -1228,6 +1887,984 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
     return rows
 
 
+def vietmax_ban_ra_match_key(value):
+    text = rm_accents(str(value or "")).casefold()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\bcabon\b", "cacbon", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def vietmax_equivalent_product_key(value):
+    text = normalize_sep(str(value or ""))
+    text = rm_accents(text).casefold()
+    text = re.sub(r"\bcabon\b", "cacbon", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def vietmax_review_product_name(value):
+    text = " ".join(code_words(value))
+    text = re.sub(
+        r"(?i)(\d+(?:[.,]\d+)?)x(\d+(?:[.,]\d+)?)(cm|mm|m)?\b",
+        lambda match: f"{match.group(1)} x {match.group(2)}{match.group(3) or ''}",
+        text,
+    )
+    return text
+
+
+def normalize_vietmax_comparison_scope(value):
+    return value if value in VIETMAX_COMPARISON_SCOPES else VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES
+
+
+def vietmax_company_identity_key(company="", mst=""):
+    mst_digits = re.sub(r"\D+", "", raw_text(mst))
+    if mst_digits:
+        return f"mst:{mst_digits}"
+    company_key = vietmax_ban_ra_match_key(company)
+    return f"company:{company_key}" if company_key else ""
+
+
+def add_vietmax_company_identity(row, prefix, company="", mst=""):
+    company_text = raw_text(company)
+    mst_text = raw_text(mst)
+    row[f"{prefix}_company"] = company_text
+    row[f"{prefix}_mst"] = mst_text
+    row[f"{prefix}_company_key"] = vietmax_company_identity_key(company_text, mst_text) or raw_text(row.get(f"{prefix}_company_key"))
+    return row
+
+
+def vietmax_ban_ra_match_score(sales_product, purchase_product):
+    sales_key = vietmax_ban_ra_match_key(sales_product)
+    purchase_key = vietmax_ban_ra_match_key(purchase_product)
+    if not sales_key or not purchase_key:
+        return 0.0
+    return SequenceMatcher(None, sales_key, purchase_key).ratio()
+
+
+def vietmax_ban_ra_focus_match(product):
+    product_key_value = vietmax_ban_ra_match_key(product)
+    if not product_key_value:
+        return False
+    return any(vietmax_ban_ra_match_key(item) in product_key_value for item in VIETMAX_BAN_RA_FOCUS_PRODUCTS)
+
+
+def vietmax_ban_ra_skip_purchase_suggestion(product):
+    product_key_value = vietmax_ban_ra_match_key(product)
+    return product_key_value.startswith(("in ", "cong in ", "gia cong in "))
+
+
+def vietmax_sales_product_row(value):
+    if isinstance(value, dict):
+        product = raw_text(value.get("sales_product") or value.get("product") or value.get("name"))
+        row = dict(value)
+        row["sales_product"] = product
+        row["invoice_no"] = raw_text(value.get("invoice_no") or value.get("so_hd"))
+        row["invoice_date"] = raw_text(value.get("invoice_date") or value.get("date") or value.get("ngay_co_hang_ban_ra"))
+        if "sales_company" in row or "sales_mst" in row or "sales_company_key" in row:
+            add_vietmax_company_identity(row, "sales", row.get("sales_company"), row.get("sales_mst"))
+        return row
+    return raw_text(value)
+
+
+def unique_vietmax_sales_products(values, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    result = []
+    seen = {}
+    for value in values:
+        normalized = vietmax_sales_product_row(value)
+        product = raw_text(normalized.get("sales_product") if isinstance(normalized, dict) else normalized)
+        key = vietmax_ban_ra_match_key(product)
+        company_key = raw_text(normalized.get("sales_company_key")) if isinstance(normalized, dict) else ""
+        unique_key = (company_key, key) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else key
+        if not product or not key:
+            continue
+        row = normalized if isinstance(normalized, dict) else product
+        if unique_key in seen:
+            existing_index = seen[unique_key]
+            if vietmax_display_metadata_score(row, "sales") > vietmax_display_metadata_score(result[existing_index], "sales"):
+                result[existing_index] = row
+            continue
+        seen[unique_key] = len(result)
+        result.append(row)
+    return result
+
+
+def vietmax_display_metadata_score(row, prefix):
+    if not isinstance(row, dict):
+        return 0
+    score = 0
+    if raw_text(row.get(f"{prefix}_price")):
+        score += 8
+    if raw_text(row.get("invoice_no") or row.get(f"{prefix}_invoice_no")):
+        score += 2
+    if raw_text(row.get("invoice_date") or row.get(f"{prefix}_invoice_date")):
+        score += 2
+    if raw_text(row.get(f"{prefix}_unit") or row.get("unit")):
+        score += 1
+    return score
+
+
+def normalized_vietmax_unit(value):
+    return normalize_rule_key(value).replace(" ", "")
+
+
+def vietmax_unit_mismatch(sales_unit, purchase_unit):
+    sales_key = normalized_vietmax_unit(sales_unit)
+    purchase_key = normalized_vietmax_unit(purchase_unit)
+    return bool(sales_key and purchase_key and sales_key != purchase_key)
+
+
+def normalize_vietmax_conversion_mode(value):
+    mode = raw_text(value)
+    return mode if mode in VIETMAX_CONVERSION_MODES else VIETMAX_CONVERSION_MODE_NONE
+
+
+def vietmax_conversion_mode_label(mode):
+    return VIETMAX_CONVERSION_MODE_LABELS.get(normalize_vietmax_conversion_mode(mode), VIETMAX_CONVERSION_MODE_LABELS[VIETMAX_CONVERSION_MODE_NONE])
+
+
+def vietmax_conversion_mode_requires_formula(mode):
+    return normalize_vietmax_conversion_mode(mode) in {
+        VIETMAX_CONVERSION_MODE_QTY_AND_UNIT,
+        VIETMAX_CONVERSION_MODE_QTY_ONLY,
+        VIETMAX_CONVERSION_MODE_UNIT_ONLY,
+    }
+
+
+def parse_vietmax_formula_number(value):
+    text = raw_text(value).replace(" ", "")
+    if not re.fullmatch(r"\d+(?:[,.]\d+)?", text):
+        return None
+    try:
+        number = float(text.replace(",", "."))
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def parse_vietmax_conversion_formula(formula):
+    text = raw_text(formula)
+    match = re.fullmatch(r"\s*(\d+(?:[,.]\d+)?)\s+([^=]+?)\s*=\s*(\d+(?:[,.]\d+)?)\s+([^=]+?)\s*", text)
+    if not match:
+        return None
+    left_qty = parse_vietmax_formula_number(match.group(1))
+    right_qty = parse_vietmax_formula_number(match.group(3))
+    left_unit = raw_text(match.group(2))
+    right_unit = raw_text(match.group(4))
+    if not left_qty or not right_qty or not left_unit or not right_unit:
+        return None
+    return {
+        "left_qty": left_qty,
+        "left_unit": left_unit,
+        "right_qty": right_qty,
+        "right_unit": right_unit,
+    }
+
+
+def vietmax_conversion_quantity_factor(sales_unit, purchase_unit, parsed_formula):
+    if not parsed_formula:
+        return None
+    sales_key = normalized_vietmax_unit(sales_unit)
+    purchase_key = normalized_vietmax_unit(purchase_unit)
+    left_key = normalized_vietmax_unit(parsed_formula.get("left_unit"))
+    right_key = normalized_vietmax_unit(parsed_formula.get("right_unit"))
+    left_qty = parsed_formula.get("left_qty")
+    right_qty = parsed_formula.get("right_qty")
+    if not sales_key or not purchase_key or not left_key or not right_key or not left_qty or not right_qty:
+        return None
+    if sales_key == left_key and purchase_key == right_key:
+        return right_qty / left_qty
+    if sales_key == right_key and purchase_key == left_key:
+        return left_qty / right_qty
+    return None
+
+
+def format_vietmax_converted_quantity(value):
+    if value is None:
+        return value
+    if abs(value - round(value)) < 0.000001:
+        return int(round(value))
+    return round(value, 6)
+
+
+def apply_vietmax_match_conversion_to_row(df, row_index, qty_index, unit_index, match):
+    mode = normalize_vietmax_conversion_mode(match.get("conversion_mode"))
+    if not match.get("unit_mismatch") or not vietmax_conversion_mode_requires_formula(mode):
+        return False
+    parsed_formula = parse_vietmax_conversion_formula(match.get("conversion_formula"))
+    factor = vietmax_conversion_quantity_factor(match.get("sales_unit"), match.get("purchase_unit"), parsed_formula)
+    if factor is None:
+        return False
+    if unit_index >= df.shape[1]:
+        df[df.shape[1]] = ""
+    if mode in {VIETMAX_CONVERSION_MODE_QTY_AND_UNIT, VIETMAX_CONVERSION_MODE_QTY_ONLY} and qty_index is not None:
+        quantity = parse_price(cell(df, row_index, qty_index))
+        if quantity is None:
+            return False
+        df.iat[row_index, qty_index] = format_vietmax_converted_quantity(quantity * factor)
+        price_index = qty_index + 1
+        if price_index < df.shape[1]:
+            unit_price = parse_price(cell(df, row_index, price_index))
+            if unit_price is not None:
+                df.iat[row_index, price_index] = format_vietmax_converted_quantity(unit_price / factor)
+    if mode in {VIETMAX_CONVERSION_MODE_QTY_AND_UNIT, VIETMAX_CONVERSION_MODE_UNIT_ONLY}:
+        df.iat[row_index, unit_index] = raw_text(match.get("purchase_unit"))
+    return True
+
+
+_VIETMAX_DIMENSION_RE = re.compile(r"^(D\d+|[A-Z]\d+|\d+(?:[,.]\d+)?\s*(l|lit|lít|ml)|\d+\s*gsm|\d+x\d+(?:x\d+(?:[,.]\d+)?)?[\w]*|D\d+x\d+|\d+/\d+[*\w]*|BB\d+[\w/]*|\d{1,3}\s*(cm|mm|m|inch|kg|g)|\d+(?:[,.]\d+)?|\d{1,3}|loại\d+|type\d+|mẫu\d+|hạng\d+)$", re.IGNORECASE)
+
+
+def vietmax_is_case_space_only_diff(current, target):
+    current_norm = vietmax_equivalent_product_key(current)
+    target_norm = vietmax_equivalent_product_key(target)
+    return current_norm == target_norm and str(current or "") != str(target or "")
+
+
+def vietmax_has_dimension_diff(current, target):
+    if vietmax_is_case_space_only_diff(current, target):
+        return False
+    current_dimension = extract_dimensions(current)
+    target_dimension = extract_dimensions(target)
+    if current_dimension and target_dimension and current_dimension != target_dimension:
+        return True
+    current_parts = str(current or "").split()
+    target_parts = str(target or "").split()
+    matcher = SequenceMatcher(None, current_parts, target_parts)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        current_words = current_parts[i1:i2]
+        target_words = target_parts[j1:j2]
+        if tag == "replace":
+            current_joined = "".join(current_words)
+            target_joined = "".join(target_words)
+            if current_joined.lower().replace(" ", "") == target_joined.lower().replace(" ", ""):
+                continue
+            if _VIETMAX_DIMENSION_RE.match(current_joined) and _VIETMAX_DIMENSION_RE.match(target_joined):
+                return True
+        for word in current_words + target_words:
+            if _VIETMAX_DIMENSION_RE.match(word):
+                return True
+    return False
+
+
+def vietmax_product_review_rows(products, product_key, unit_key, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, threshold=0.92):
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    normalized = []
+    key_counts = {}
+    token_index = {}
+    token_counts = {}
+    for item in products or []:
+        if isinstance(item, dict):
+            raw_product = raw_text(item.get(product_key) or item.get("product") or item.get("name"))
+            product = vietmax_review_product_name(raw_product)
+            unit = raw_text(item.get(unit_key) or item.get("unit"))
+            invoice_no = raw_text(item.get("invoice_no") or item.get("so_hd"))
+            invoice_date = raw_text(item.get("invoice_date") or item.get("date") or item.get("ngay_hd") or item.get("ngay_co_hang_ban_ra"))
+            company = raw_text(item.get("purchase_company") or item.get("sales_company"))
+            mst = raw_text(item.get("purchase_mst") or item.get("sales_mst"))
+            company_key = raw_text(item.get("purchase_company_key") or item.get("sales_company_key")) or vietmax_company_identity_key(company, mst)
+        else:
+            raw_product = raw_text(item)
+            product = vietmax_review_product_name(raw_product)
+            unit = ""
+            invoice_no = ""
+            invoice_date = ""
+            company = ""
+            mst = ""
+            company_key = ""
+        key = vietmax_ban_ra_match_key(product)
+        equivalent_key = vietmax_equivalent_product_key(product)
+        if product and key:
+            row = {"product": product, "unit": unit, "invoice_no": invoice_no, "invoice_date": invoice_date, "company": company, "mst": mst, "company_key": company_key, "match_key": key, "equivalent_key": equivalent_key}
+            for extra_key in ("code", "product_key", "company_index", "product_index"):
+                if extra_key in item:
+                    row[extra_key] = item.get(extra_key)
+            row_index = len(normalized)
+            normalized.append(row)
+            key_scope = company_key if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+            key_counts[(key_scope, equivalent_key)] = key_counts.get((key_scope, equivalent_key), 0) + 1
+            for token in set(key.split()):
+                if len(token) >= 2:
+                    token_index.setdefault((key_scope, token), set()).add(row_index)
+                    token_counts[(key_scope, token)] = token_counts.get((key_scope, token), 0) + 1
+    rows = []
+    seen_products = set()
+    for row_index, row in enumerate(normalized):
+        row_scope = row.get("company_key") if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        if key_counts.get((row_scope, row.get("equivalent_key")), 0) > 1:
+            continue
+        candidate_indexes = set()
+        row_tokens = {token for token in str(row.get("match_key") or "").split() if len(token) >= 2}
+        rare_tokens = sorted(row_tokens, key=lambda token: token_counts.get((row_scope, token), len(normalized)))[:4]
+        for token in rare_tokens:
+            if len(token) >= 2:
+                candidate_indexes.update(token_index.get((row_scope, token), set()))
+        best = None
+        best_score = 0.0
+        for other_index in candidate_indexes:
+            if row_index == other_index:
+                continue
+            other = normalized[other_index]
+            if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY and row.get("company_key") != other.get("company_key"):
+                continue
+            if row.get("equivalent_key") == other.get("equivalent_key"):
+                continue
+            other_tokens = {token for token in str(other.get("match_key") or "").split() if len(token) >= 2}
+            shared_token_count = len(row_tokens & other_tokens)
+            required_shared_tokens = min(len(row_tokens), len(other_tokens))
+            if required_shared_tokens >= 3 and shared_token_count < required_shared_tokens - 1:
+                continue
+            if required_shared_tokens == 2 and shared_token_count < 1:
+                continue
+            row_key_length = len(str(row.get("match_key") or ""))
+            other_key_length = len(str(other.get("match_key") or ""))
+            if min(row_key_length, other_key_length) / max(row_key_length, other_key_length) < threshold:
+                continue
+            score = vietmax_ban_ra_match_score(row.get("product"), other.get("product"))
+            if score >= threshold and score > best_score:
+                best = other
+                best_score = score
+        if not best:
+            continue
+        pair_key = tuple(sorted((row.get("match_key"), best.get("match_key"))))
+        unique_key = (row.get("company_key") if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else "", pair_key)
+        if unique_key in seen_products:
+            continue
+        seen_products.add(unique_key)
+        review_row = dict(row)
+        review_row["similar_product"] = best.get("product", "")
+        review_row["similar_unit"] = best.get("unit", "")
+        review_row["similar_invoice_no"] = best.get("invoice_no", "")
+        review_row["similar_invoice_date"] = best.get("invoice_date", "")
+        review_row["similar_company"] = best.get("company", "")
+        review_row["similar_mst"] = best.get("mst", "")
+        review_row["similar_company_key"] = best.get("company_key", "")
+        review_row["similar_code"] = best.get("code", "")
+        review_row["similar_product_key"] = best.get("product_key", "")
+        review_row["similar_company_index"] = best.get("company_index")
+        review_row["similar_product_index"] = best.get("product_index")
+        review_row["similarity"] = f"{best_score * 100:.1f}%"
+        if vietmax_has_dimension_diff(row.get("product"), best.get("product")):
+            review_row["review_group"] = "dimension_diff"
+            review_row["dimension_only"] = True
+        else:
+            review_row["review_group"] = "other"
+            review_row["dimension_only"] = False
+        rows.append(review_row)
+    rows.extend(vietmax_forced_purchase_review_rows(normalized, seen_products, scope))
+    return rows
+
+
+def vietmax_forced_purchase_review_rows(normalized, seen_products, scope):
+    by_match_key = {}
+    for row in normalized:
+        row_scope = row.get("company_key") if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        by_match_key.setdefault((row_scope, row.get("match_key")), row)
+    rows = []
+    scopes = sorted({row.get("company_key") if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else "" for row in normalized}) or [""]
+    for left_name, right_name in VIETMAX_PURCHASE_REVIEW_FORCED_PAIRS:
+        left_key = vietmax_ban_ra_match_key(vietmax_review_product_name(left_name))
+        right_key = vietmax_ban_ra_match_key(vietmax_review_product_name(right_name))
+        for row_scope in scopes:
+            left = by_match_key.get((row_scope, left_key))
+            right = by_match_key.get((row_scope, right_key))
+            if not left or not right:
+                continue
+            pair_key = tuple(sorted((left.get("match_key"), right.get("match_key"))))
+            unique_key = (row_scope, pair_key)
+            if unique_key in seen_products:
+                continue
+            seen_products.add(unique_key)
+            score = vietmax_ban_ra_match_score(left.get("product"), right.get("product"))
+            review_row = dict(left)
+            review_row["similar_product"] = right.get("product", "")
+            review_row["similar_unit"] = right.get("unit", "")
+            review_row["similar_invoice_no"] = right.get("invoice_no", "")
+            review_row["similar_invoice_date"] = right.get("invoice_date", "")
+            review_row["similar_company"] = right.get("company", "")
+            review_row["similar_mst"] = right.get("mst", "")
+            review_row["similar_company_key"] = right.get("company_key", "")
+            review_row["similar_code"] = right.get("code", "")
+            review_row["similar_product_key"] = right.get("product_key", "")
+            review_row["similar_company_index"] = right.get("company_index")
+            review_row["similar_product_index"] = right.get("product_index")
+            review_row["similarity"] = f"{score * 100:.1f}%"
+            review_row["review_group"] = "other"
+            review_row["dimension_only"] = False
+            review_row["forced_review"] = True
+            rows.append(review_row)
+    return rows
+
+
+def vietmax_ban_ra_sales_products_from_workbook(path, product_col="M", qty_col="O", invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None, company_col=None, mst_col=None, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, price_col=None):
+    _, df = read_workbook(path)
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    product_index = excel_col_to_index(product_col or "M")
+    unit_index = product_index + 1
+    qty_index = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
+    price_index = excel_col_to_index(price_col) if str(price_col or "").strip() else None
+    company_index = excel_col_to_index(company_col) if str(company_col or "").strip() else None
+    mst_index = excel_col_to_index(mst_col) if str(mst_col or "").strip() else None
+    invoice_no_index = excel_col_to_index("C")
+    invoice_date_index = excel_col_to_index("D")
+    status_col = str(invoice_status_col or "").strip().upper()
+    status_index = excel_col_to_index(status_col) if status_col else None
+    indexes = [product_index, invoice_no_index, invoice_date_index]
+    if qty_index is not None:
+        indexes.append(qty_index)
+    if price_index is not None:
+        indexes.append(price_index)
+    if company_index is not None:
+        indexes.append(company_index)
+    if mst_index is not None:
+        indexes.append(mst_index)
+    if status_index is not None and df.shape[1] > status_index:
+        indexes.append(status_index)
+    if df.shape[1] <= max(indexes):
+        raise ValueError("Selected columns exceed the number of columns in the sheet.")
+    products = []
+    for row_index in range(len(df)):
+        report_loop_progress(progress_callback, row_index + 1, len(df), "Đang đọc hàng bán ra")
+        if status_index is not None and df.shape[1] > status_index and ignored_invoice_status(cell(df, row_index, status_index), invoice_status_skip_values):
+            continue
+        if qty_index is not None and not should_process_qty(cell(df, row_index, qty_index)):
+            continue
+        product = raw_text(cell(df, row_index, product_index))
+        if product and "ten" not in vietmax_ban_ra_match_key(product):
+            row = {
+                "sales_product": product,
+                "sales_unit": raw_text(cell(df, row_index, unit_index)) if df.shape[1] > unit_index else "",
+                "sales_price": raw_text(cell(df, row_index, price_index)) if price_index is not None and df.shape[1] > price_index else "",
+                "invoice_no": raw_text(cell(df, row_index, invoice_no_index)),
+                "invoice_date": raw_text(cell(df, row_index, invoice_date_index)),
+            }
+            if company_index is not None or mst_index is not None:
+                add_vietmax_company_identity(
+                    row,
+                    "sales",
+                    cell(df, row_index, company_index) if company_index is not None else "",
+                    cell(df, row_index, mst_index) if mst_index is not None else "",
+                )
+            products.append(row)
+    return unique_vietmax_sales_products(products, scope)
+
+
+def vietmax_purchase_column_score(df, column_index, labels):
+    score = 0
+    for row_index in range(min(10, len(df))):
+        key = normalized_header_label(cell(df, row_index, column_index))
+        if key in labels:
+            score += 10
+        elif any(label in key for label in labels):
+            score += 5
+    nonempty = sum(1 for row_index in range(min(len(df), 20)) if raw_text(cell(df, row_index, column_index)))
+    return score + min(nonempty, 5)
+
+
+def detect_vietmax_purchase_columns(df):
+    preferred_code_columns = [excel_col_to_index(col) for col in ["L", "M"] if excel_col_to_index(col) < df.shape[1]]
+    preferred_product_columns = [excel_col_to_index(col) for col in ["M", "N"] if excel_col_to_index(col) < df.shape[1]]
+    code_labels = {"ma vt", "ma vat tu", "ma hang", "ma hang hoa"}
+    product_labels = {"ten hang", "ten hang hoa", "hang hoa", "ten vat tu"}
+    code_candidates = preferred_code_columns or list(range(df.shape[1]))
+    product_candidates = preferred_product_columns or list(range(df.shape[1]))
+    code_index = max(code_candidates, key=lambda index: vietmax_purchase_column_score(df, index, code_labels))
+    product_index = max(product_candidates, key=lambda index: vietmax_purchase_column_score(df, index, product_labels))
+    if product_index == code_index and len(product_candidates) > 1:
+        alternatives = [index for index in product_candidates if index != code_index]
+        product_index = max(alternatives, key=lambda index: vietmax_purchase_column_score(df, index, product_labels))
+    header_index = 0
+    for row_index in range(min(10, len(df))):
+        code_header = normalized_header_label(cell(df, row_index, code_index))
+        product_header = normalized_header_label(cell(df, row_index, product_index))
+        if code_header in code_labels or any(label in product_header for label in product_labels):
+            header_index = row_index
+            break
+    return code_index, product_index, header_index
+
+
+def detect_vietmax_purchase_company_columns(df):
+    company_labels = {
+        "ten nguoi mua",
+        "ten nguoi ban",
+        "nguoi mua",
+        "nguoi ban",
+        "ten don vi",
+        "don vi ban hang",
+        "don vi mua hang",
+        "cong ty",
+    }
+    mst_labels = {
+        "mst",
+        "ma so thue",
+        "mst nguoi mua",
+        "mst nguoi ban",
+        "ma so thue nguoi mua",
+        "ma so thue nguoi ban",
+    }
+    company_index = None
+    mst_index = None
+    for row_index in range(min(10, len(df))):
+        for column_index in range(df.shape[1]):
+            label = normalized_header_label(cell(df, row_index, column_index))
+            if company_index is None and (label in company_labels or any(item in label for item in company_labels)):
+                company_index = column_index
+            if mst_index is None and (label in mst_labels or any(item in label for item in mst_labels)):
+                mst_index = column_index
+        if company_index is not None and mst_index is not None:
+            return company_index, mst_index
+    for company_col, mst_col in [("F", "G"), ("I", "J")]:
+        company_fallback = excel_col_to_index(company_col)
+        mst_fallback = excel_col_to_index(mst_col)
+        if df.shape[1] > max(company_fallback, mst_fallback):
+            return company_index if company_index is not None else company_fallback, mst_index if mst_index is not None else mst_fallback
+    return company_index, mst_index
+
+
+def detect_vietmax_price_column(df, fallback_index=None):
+    price_labels = {"don gia", "don gia ban", "don gia mua", "unit price", "price"}
+    for row_index in range(min(10, len(df))):
+        for column_index in range(df.shape[1]):
+            label = normalized_header_label(cell(df, row_index, column_index))
+            if label in price_labels:
+                return column_index
+            if "don gia" in label and "thanh tien" not in label:
+                return column_index
+    return fallback_index
+
+
+def vietmax_purchase_products_from_workbook(path, code_col=None, product_col=None, price_col=None, progress_callback=None, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, require_existing_code=False):
+    _, df = read_workbook(path)
+    if df.empty:
+        return []
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    code_index, product_index, header_index = detect_vietmax_purchase_columns(df)
+    company_index, mst_index = detect_vietmax_purchase_company_columns(df) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else (None, None)
+    if code_col:
+        code_index = excel_col_to_index(code_col)
+    if product_col:
+        product_index = excel_col_to_index(product_col)
+    unit_index = product_index + 1
+    price_index = excel_col_to_index(price_col) if str(price_col or "").strip() else detect_vietmax_price_column(df, product_index + 3)
+    invoice_no_index = excel_col_to_index("C")
+    invoice_date_index = excel_col_to_index("D")
+    indexes = [code_index, product_index]
+    if price_index is not None and price_index < df.shape[1]:
+        indexes.append(price_index)
+    if company_index is not None:
+        indexes.append(company_index)
+    if mst_index is not None:
+        indexes.append(mst_index)
+    if df.shape[1] <= max(indexes):
+        raise ValueError("Selected purchase columns exceed the number of columns in the sheet.")
+    products = []
+    seen = {}
+    for row_index in range(header_index + 1, len(df)):
+        report_loop_progress(progress_callback, row_index - header_index, max(1, len(df) - header_index - 1), "Đang đọc hàng mua vào")
+        code = raw_text(cell(df, row_index, code_index))
+        product = raw_text(cell(df, row_index, product_index))
+        key = vietmax_ban_ra_match_key(product)
+        if not product or not key:
+            continue
+        if normalized_header_label(code) in {"ma vt", "ma vat tu"} or "ten hang" in normalized_header_label(product):
+            continue
+        if require_existing_code and (not code or code in {"0", "0.0"}):
+            continue
+        if not code or code in {"0", "0.0"}:
+            code = make_product_part("vietmax_mua_vao", product, {})
+        if not code:
+            continue
+        invoice_no = raw_text(cell(df, row_index, invoice_no_index)) if df.shape[1] > invoice_no_index else ""
+        invoice_date = raw_text(cell(df, row_index, invoice_date_index)) if df.shape[1] > invoice_date_index else ""
+        row = {
+            "purchase_product": product,
+            "purchase_code": code,
+            "purchase_row": row_index + 1,
+            "purchase_unit": raw_text(cell(df, row_index, unit_index)) if df.shape[1] > unit_index else "",
+            "purchase_price": raw_text(cell(df, row_index, price_index)) if price_index is not None and df.shape[1] > price_index else "",
+            "invoice_no": invoice_no,
+            "invoice_date": invoice_date,
+            "purchase_invoice_no": invoice_no,
+            "purchase_invoice_date": invoice_date,
+        }
+        company_key = ""
+        if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+            add_vietmax_company_identity(
+                row,
+                "purchase",
+                cell(df, row_index, company_index) if company_index is not None else "",
+                cell(df, row_index, mst_index) if mst_index is not None else "",
+            )
+            company_key = row.get("purchase_company_key", "")
+        seen_key = (company_key, key) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else key
+        if seen_key in seen:
+            existing_index = seen[seen_key]
+            if vietmax_display_metadata_score(row, "purchase") > vietmax_display_metadata_score(products[existing_index], "purchase"):
+                products[existing_index] = row
+            continue
+        seen[seen_key] = len(products)
+        products.append(row)
+    return products
+
+
+def validate_vietmax_processed_purchase_workbook(path):
+    _, df = read_workbook(path)
+    if df.empty:
+        raise ValueError("File HD mua vào đã xử lý không có dữ liệu.")
+    code_index, product_index, header_index = detect_vietmax_purchase_columns(df)
+    unit_index = product_index + 1
+    tk_index = ma_kho_index = None
+    try:
+        inventory_indexes = processed_inventory_column_indexes(df, code_index)
+        tk_index = inventory_indexes.get("tk_vat_tu")
+        ma_kho_index = inventory_indexes.get("ma_kho")
+    except Exception:
+        pass
+    valid_rows = 0
+    for row_index in range(header_index + 1, len(df)):
+        code = raw_text(cell(df, row_index, code_index))
+        product = raw_text(cell(df, row_index, product_index))
+        if code and code not in {"0", "0.0"} and product and normalized_header_label(code) not in {"ma vt", "ma vat tu"}:
+            valid_rows += 1
+    if not valid_rows:
+        raise ValueError("File HD mua vào đã xử lý chưa có dòng nào có Mã VT hợp lệ. Hãy xuất file mua vào đã xử lý trước khi tiếp tục bán ra.")
+    return {
+        "code_col": index_to_excel_col(code_index),
+        "product_col": index_to_excel_col(product_index),
+        "unit_col": index_to_excel_col(unit_index) if unit_index < df.shape[1] else "",
+        "tk_vat_tu_col": index_to_excel_col(tk_index) if tk_index is not None else "",
+        "ma_kho_col": index_to_excel_col(ma_kho_index) if ma_kho_index is not None else "",
+        "header_row": header_index + 1,
+        "valid_rows": valid_rows,
+    }
+
+
+def build_vietmax_ban_ra_purchase_matches(sales_products, purchase_products, threshold=0.92, progress_callback=None, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    normalized_purchase_products = []
+    purchase_token_index = {}
+    purchase_source = purchase_products or []
+    for item_index, item in enumerate(purchase_source):
+        report_loop_progress(progress_callback, item_index + 1, len(purchase_source), "Đang lập chỉ mục hàng mua", interval=100)
+        if isinstance(item, dict):
+            product = raw_text(item.get("purchase_product") or item.get("product") or item.get("name"))
+            code = raw_text(item.get("purchase_code") or item.get("code"))
+            row = item.get("purchase_row") or item.get("row") or ""
+            purchase_unit = raw_text(item.get("purchase_unit") or item.get("unit"))
+            purchase_price = raw_text(item.get("purchase_price"))
+            purchase_company = raw_text(item.get("purchase_company"))
+            purchase_mst = raw_text(item.get("purchase_mst"))
+            purchase_company_key = raw_text(item.get("purchase_company_key")) or vietmax_company_identity_key(purchase_company, purchase_mst)
+        else:
+            product = raw_text(item)
+            code = ""
+            row = ""
+            purchase_unit = ""
+            purchase_price = ""
+            purchase_company = ""
+            purchase_mst = ""
+            purchase_company_key = ""
+        if product and code:
+            purchase_key_value = vietmax_ban_ra_match_key(product)
+            purchase_index = len(normalized_purchase_products)
+            normalized_purchase_products.append({"purchase_product": product, "purchase_code": code, "purchase_row": row, "purchase_unit": purchase_unit, "purchase_price": purchase_price, "purchase_company": purchase_company, "purchase_mst": purchase_mst, "purchase_company_key": purchase_company_key, "match_key": purchase_key_value})
+            for token in set(purchase_key_value.split()):
+                if len(token) >= 2:
+                    purchase_token_index.setdefault(token, set()).add(purchase_index)
+    rows = []
+    unique_sales = unique_vietmax_sales_products(sales_products or [], scope)
+    for sales_index, sales_item in enumerate(unique_sales):
+        report_loop_progress(progress_callback, sales_index + 1, len(unique_sales), "Đang so khớp hàng bán/mua", interval=25)
+        if isinstance(sales_item, dict):
+            sales_product = raw_text(sales_item.get("sales_product") or sales_item.get("product") or sales_item.get("name"))
+            sales_unit = raw_text(sales_item.get("sales_unit") or sales_item.get("unit"))
+            sales_price = raw_text(sales_item.get("sales_price"))
+            invoice_no = raw_text(sales_item.get("invoice_no") or sales_item.get("so_hd"))
+            invoice_date = raw_text(sales_item.get("invoice_date") or sales_item.get("date") or sales_item.get("ngay_co_hang_ban_ra"))
+            sales_company = raw_text(sales_item.get("sales_company"))
+            sales_mst = raw_text(sales_item.get("sales_mst"))
+            sales_company_key = raw_text(sales_item.get("sales_company_key")) or vietmax_company_identity_key(sales_company, sales_mst)
+        else:
+            sales_product = raw_text(sales_item)
+            sales_unit = ""
+            sales_price = ""
+            invoice_no = ""
+            invoice_date = ""
+            sales_company = ""
+            sales_mst = ""
+            sales_company_key = ""
+        if vietmax_ban_ra_skip_purchase_suggestion(sales_product):
+            continue
+        sales_key_value = vietmax_ban_ra_match_key(sales_product)
+        candidate_indexes = set()
+        for token in set(sales_key_value.split()):
+            if len(token) >= 2:
+                candidate_indexes.update(purchase_token_index.get(token, set()))
+        best = None
+        best_score = 0.0
+        focus = vietmax_ban_ra_focus_match(sales_product)
+        candidates = [normalized_purchase_products[index] for index in candidate_indexes]
+        if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+            candidates = [purchase for purchase in candidates if sales_company_key and purchase.get("purchase_company_key") == sales_company_key]
+        if focus and not candidates:
+            candidates = normalized_purchase_products
+            if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+                candidates = [purchase for purchase in candidates if sales_company_key and purchase.get("purchase_company_key") == sales_company_key]
+        for purchase in candidates:
+            score = vietmax_ban_ra_match_score(sales_product, purchase["purchase_product"])
+            if score > best_score or (score == best_score and vietmax_display_metadata_score(purchase, "purchase") > vietmax_display_metadata_score(best, "purchase")):
+                best = purchase
+                best_score = score
+        if best and (best_score >= threshold or focus):
+            purchase_unit = raw_text(best.get("purchase_unit"))
+            unit_mismatch = vietmax_unit_mismatch(sales_unit, purchase_unit)
+            rows.append({
+                "sales_product": sales_product,
+                "sales_unit": sales_unit,
+                "sales_price": sales_price,
+                "sales_company": sales_company,
+                "sales_mst": sales_mst,
+                "sales_company_key": sales_company_key,
+                "invoice_no": invoice_no,
+                "invoice_date": invoice_date,
+                "purchase_product": best["purchase_product"],
+                "purchase_code": best["purchase_code"],
+                "purchase_row": best.get("purchase_row", ""),
+                "purchase_unit": purchase_unit,
+                "purchase_price": raw_text(best.get("purchase_price")),
+                "purchase_company": raw_text(best.get("purchase_company")),
+                "purchase_mst": raw_text(best.get("purchase_mst")),
+                "purchase_company_key": raw_text(best.get("purchase_company_key")),
+                "comparison_scope": scope,
+                "unit_mismatch": unit_mismatch,
+                "unit_warning": "Khác đơn vị tính" if unit_mismatch else "",
+                "conversion_mode": VIETMAX_CONVERSION_MODE_NONE,
+                "conversion_mode_label": vietmax_conversion_mode_label(VIETMAX_CONVERSION_MODE_NONE),
+                "conversion_formula": "",
+                "score": best_score,
+                "focus": focus,
+                "confirmed": True,
+            })
+    return rows
+
+
+def vietmax_purchase_match_export_rows(matches):
+    rows = [["Dùng", "Hàng bán ra", "ĐVT bán ra", "Số HD", "Ngày có hàng bán ra", "Mã VT mua vào", "Hàng mua vào", "ĐVT mua vào", "Cảnh báo", "Quy đổi", "Khác biệt", "Độ giống"]]
+    for match in matches or []:
+        if not isinstance(match, dict):
+            continue
+        try:
+            score = float(match.get("score") or 0) * 100
+        except Exception:
+            score = 0
+        rows.append([
+            "Có" if match.get("confirmed") is not False else "Không",
+            raw_text(match.get("sales_product")),
+            raw_text(match.get("sales_unit")),
+            raw_text(match.get("invoice_no")),
+            raw_text(match.get("invoice_date")),
+            raw_text(match.get("purchase_code")),
+            raw_text(match.get("purchase_product")),
+            raw_text(match.get("purchase_unit")),
+            raw_text(match.get("unit_warning") or ("Khác đơn vị tính" if match.get("unit_mismatch") else "")),
+            raw_text(match.get("conversion_formula")),
+            f"{raw_text(match.get('sales_product'))} -> {raw_text(match.get('purchase_product'))}",
+            f"{score:.1f}%",
+        ])
+    return rows
+
+def vietmax_purchase_match_lookup_key(product, company="", mst="", comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    product_match_key = vietmax_ban_ra_match_key(product)
+    if not product_match_key:
+        return ""
+    if normalize_vietmax_comparison_scope(comparison_scope) == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+        company_key = vietmax_company_identity_key(company, mst)
+        return f"{company_key}|||{product_match_key}" if company_key else ""
+    return product_match_key
+
+
+def vietmax_internal_merge_lookup_key(product, company="", mst="", company_key="", comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    product_match_key = vietmax_ban_ra_match_key(product)
+    if not product_match_key:
+        return ""
+    if normalize_vietmax_comparison_scope(comparison_scope) == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+        identity_key = raw_text(company_key) or vietmax_company_identity_key(company, mst)
+        return f"{identity_key}|||{product_match_key}" if identity_key else ""
+    return product_match_key
+
+
+def normalize_vietmax_internal_merges(value, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    result = {}
+    if not isinstance(value, list):
+        return result
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    for item in value:
+        if not isinstance(item, dict) or item.get("confirmed") is False:
+            continue
+        product = raw_text(item.get("product"))
+        similar_product = raw_text(item.get("similar_product"))
+        if not product or not similar_product:
+            continue
+        key = vietmax_internal_merge_lookup_key(
+            product,
+            item.get("company"),
+            item.get("mst"),
+            item.get("company_key"),
+            item.get("comparison_scope") or scope,
+        )
+        if key:
+            result[key] = dict(item, product=product, similar_product=similar_product)
+    return result
+
+
+def apply_vietmax_internal_merges_to_products(products, product_key_name, unit_key_name, merges, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    if not merges:
+        return list(products or [])
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    merged_products = []
+    seen = set()
+    for item in products or []:
+        row = dict(item) if isinstance(item, dict) else {product_key_name: raw_text(item)}
+        product = raw_text(row.get(product_key_name) or row.get("product") or row.get("name"))
+        company = raw_text(row.get("purchase_company") or row.get("sales_company"))
+        mst = raw_text(row.get("purchase_mst") or row.get("sales_mst"))
+        company_key = raw_text(row.get("purchase_company_key") or row.get("sales_company_key"))
+        merge_key = vietmax_internal_merge_lookup_key(product, company, mst, company_key, scope)
+        merge = merges.get(merge_key) if merge_key else None
+        if merge:
+            row[f"original_{product_key_name}"] = product
+            row[product_key_name] = raw_text(merge.get("similar_product"))
+            similar_code = raw_text(merge.get("similar_code"))
+            if similar_code and product_key_name == "purchase_product":
+                row["original_purchase_code"] = raw_text(row.get("purchase_code") or row.get("code"))
+                if "purchase_code" in row:
+                    row["purchase_code"] = similar_code
+                elif "code" in row:
+                    row["code"] = similar_code
+            if raw_text(merge.get("similar_unit")):
+                row[f"original_{unit_key_name}"] = raw_text(row.get(unit_key_name))
+                row[unit_key_name] = raw_text(merge.get("similar_unit"))
+        product_after_merge = raw_text(row.get(product_key_name))
+        merged_company_key = raw_text(row.get("purchase_company_key") or row.get("sales_company_key")) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        unique_key = (merged_company_key, vietmax_ban_ra_match_key(product_after_merge))
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+        merged_products.append(row if isinstance(item, dict) else product_after_merge)
+    return merged_products
+
+
+def build_vietmax_khh_exact_purchase_matches(sales_products, processed_purchase_products, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    purchase_by_key = {}
+    for purchase in processed_purchase_products or []:
+        code = raw_text(purchase.get("purchase_code"))
+        product = raw_text(purchase.get("purchase_product"))
+        if not code or code in {"0", "0.0"} or not product:
+            continue
+        company_key = raw_text(purchase.get("purchase_company_key")) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        key = (company_key, vietmax_ban_ra_match_key(product)) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else vietmax_ban_ra_match_key(product)
+        purchase_by_key.setdefault(key, purchase)
+    matches = []
+    seen = set()
+    for sales in sales_products or []:
+        product = raw_text(sales.get("sales_product"))
+        if not product:
+            continue
+        company_key = raw_text(sales.get("sales_company_key")) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        key = (company_key, vietmax_ban_ra_match_key(product)) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else vietmax_ban_ra_match_key(product)
+        purchase = purchase_by_key.get(key)
+        if not purchase or key in seen:
+            continue
+        seen.add(key)
+        sales_unit = raw_text(sales.get("sales_unit"))
+        purchase_unit = raw_text(purchase.get("purchase_unit"))
+        unit_mismatch = vietmax_unit_mismatch(sales_unit, purchase_unit)
+        matches.append({
+            "confirmed": True,
+            "khh_exact_match": True,
+            "sales_product": product,
+            "sales_unit": sales_unit,
+            "sales_price": raw_text(sales.get("sales_price")),
+            "invoice_no": raw_text(sales.get("invoice_no")),
+            "invoice_date": raw_text(sales.get("invoice_date")),
+            "purchase_code": raw_text(purchase.get("purchase_code")),
+            "purchase_product": raw_text(purchase.get("purchase_product")),
+            "purchase_unit": purchase_unit,
+            "purchase_price": raw_text(purchase.get("purchase_price")),
+            "purchase_company": raw_text(purchase.get("purchase_company")),
+            "purchase_mst": raw_text(purchase.get("purchase_mst")),
+            "purchase_company_key": raw_text(purchase.get("purchase_company_key")),
+            "unit_mismatch": unit_mismatch,
+            "unit_warning": "Khác đơn vị tính" if unit_mismatch else "Từ HD mua vào đã xử lý (KHH)",
+            "conversion_mode": VIETMAX_CONVERSION_MODE_NONE,
+            "conversion_formula": "",
+            "score": 1,
+            "sales_company": raw_text(sales.get("sales_company")),
+            "sales_mst": raw_text(sales.get("sales_mst")),
+            "sales_company_key": raw_text(sales.get("sales_company_key")),
+        })
+    return matches
+
+
+def normalize_vietmax_ban_ra_purchase_matches(value, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    result = {}
+    default_scope = normalize_vietmax_comparison_scope(comparison_scope)
+    if isinstance(value, dict):
+        iterable = [dict({"sales_product": key, "purchase_code": code}) for key, code in value.items()]
+    elif isinstance(value, list):
+        iterable = value
+    else:
+        iterable = []
+    for item in iterable:
+        if not isinstance(item, dict) or item.get("confirmed") is False:
+            continue
+        sales_product = raw_text(item.get("sales_product"))
+        purchase_code = raw_text(item.get("purchase_code"))
+        scope = normalize_vietmax_comparison_scope(item.get("comparison_scope") or default_scope)
+        sales_company = raw_text(item.get("sales_company"))
+        sales_mst = raw_text(item.get("sales_mst"))
+        sales_company_key = raw_text(item.get("sales_company_key")) or vietmax_company_identity_key(sales_company, sales_mst)
+        key = vietmax_purchase_match_lookup_key(sales_product, sales_company, sales_mst, scope)
+        if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY and sales_company_key:
+            key = f"{sales_company_key}|||{vietmax_ban_ra_match_key(sales_product)}"
+        if key and purchase_code:
+            sales_unit = raw_text(item.get("sales_unit"))
+            purchase_unit = raw_text(item.get("purchase_unit"))
+            unit_mismatch = item.get("unit_mismatch")
+            if unit_mismatch is None:
+                unit_mismatch = vietmax_unit_mismatch(sales_unit, purchase_unit)
+            result[key] = {
+                "sales_product": sales_product,
+                "purchase_code": purchase_code,
+                "purchase_product": raw_text(item.get("purchase_product")),
+                "comparison_scope": scope,
+                "sales_company": sales_company,
+                "sales_mst": sales_mst,
+                "sales_company_key": sales_company_key,
+                "purchase_company": raw_text(item.get("purchase_company")),
+                "purchase_mst": raw_text(item.get("purchase_mst")),
+                "purchase_company_key": raw_text(item.get("purchase_company_key")),
+                "sales_unit": sales_unit,
+                "purchase_unit": purchase_unit,
+                "unit_mismatch": bool(unit_mismatch),
+                "conversion_mode": normalize_vietmax_conversion_mode(item.get("conversion_mode")),
+                "conversion_formula": raw_text(item.get("conversion_formula")),
+            }
+    return result
+
+
+def apply_vietmax_ban_ra_match_inventory(df, header_index, row_indexes):
+    if not row_indexes:
+        return df
+    tk_index, ma_kho_index = inventory_column_indexes(df, header_index)
+    for row_index in row_indexes:
+        df.iat[row_index, tk_index] = VIETMAX_BAN_RA_MATCH_TK_VAT_TU
+        df.iat[row_index, ma_kho_index] = VIETMAX_BAN_RA_MATCH_MA_KHO
+    return df
+
+
 def choose_company(names):
     names = [n for n in names if str(n).strip()]
     return Counter(names).most_common(1)[0][0] if names else ""
@@ -1245,13 +2882,14 @@ def unique_values(values):
     return result
 
 
-def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None):
+def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None):
     _, df = read_workbook(path)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col, invoice_status_col, invoice_status_skip_values)
+    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col, invoice_status_col, invoice_status_skip_values, progress_callback=progress_callback)
     by = {}
     addresses = {}
     products = {}
-    for r in rows:
+    for row_index, r in enumerate(rows):
+        report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang gom công ty và hàng hóa")
         by.setdefault(r["mst"], []).append(r["company"])
         if r["address"]:
             addresses.setdefault(r["mst"], []).append(r["address"])
@@ -1264,8 +2902,10 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
     saved_prefixes = profile_cfg.get("prefixes") or {}
     saved_selected = profile_cfg.get("selected_products") or {}
 
-    for mst in mst_company:
+    for company_index, mst in enumerate(mst_company):
+        report_loop_progress(progress_callback, company_index + 1, len(mst_company), "Đang dựng danh sách công ty", interval=50)
         suggested = saved_prefixes.get(mst) or suggestions[mst]
+        prefix_strategies = compute_prefix_strategies(mst_company[mst], mst)
         product_items = []
         for name, product_rows in products.get(mst, {}).items():
             prices = [r["price"] for r in product_rows if r["price"] is not None]
@@ -1279,7 +2919,7 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
                 "invoiceDate": r["invoice_date"],
                 "unit": r["unit"],
                 "name": r["product"],
-            } for r in product_rows if r["price"] is not None]
+            } for r in product_rows]
             product_items.append({
                 "name": name,
                 "count": len(product_rows),
@@ -1304,6 +2944,7 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
             "value": str(suggested),
             "needs_manual": (not suggested) or cnt[suggestions[mst]] > 1,
             "status": "OK" if suggested and cnt[suggestions[mst]] <= 1 else "Need manual check",
+            "prefix_strategies": prefix_strategies,
         })
 
     companies_data.sort(key=lambda x: (x["mst"], x["company"]))
@@ -1362,14 +3003,16 @@ def validate_payload(data):
     return prefix_map, selected_products
 
 
-def process_workbook(path, out, data):
+def process_workbook(path, out, data, progress_callback=None):
     sheet, df = read_workbook(path)
     company_col = data.get("company_col", "F").upper()
     mst_col = data.get("mst_col", "G").upper()
     product_col = data.get("product_col", "N").upper()
     qty_col = str(data.get("qty_col", "P") or "").upper()
     profile = profile_key(data.get("profile", "son_phuong"))
-    uses_price_rules = profile == "cao_thanh"
+    vietmax_phase = normalize_vietmax_phase(data.get("vietmax_phase"))
+    effective_profile = effective_processing_profile(profile, vietmax_phase)
+    uses_price_rules = effective_profile == "cao_thanh"
     price_col = str(data.get("price_col", "R") or "").upper() if uses_price_rules else ""
     output_col = data.get("output_col", "M").upper()
     invoice_status_col = str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper()
@@ -1391,19 +3034,54 @@ def process_workbook(path, out, data):
     price_rules = (data.get("price_group_rules") or {}) if uses_price_rules else {}
     price_range_rules = (data.get("price_range_rules") or {}) if uses_price_rules else {}
     manual_code_overrides = data.get("manual_code_overrides") or {}
+    vietmax_comparison_scope = normalize_vietmax_comparison_scope(data.get("comparison_scope") or data.get("vietmax_ban_ra_comparison_scope"))
+    uses_vietmax_sales = effective_profile == "vietmax_ban_ra"
+    uses_vietmax_purchase = effective_profile == "vietmax_mua_vao"
+    vietmax_purchase_match_rows = list(data.get("vietmax_ban_ra_purchase_matches") or []) if uses_vietmax_sales else []
+    vietmax_purchase_matches = normalize_vietmax_ban_ra_purchase_matches(vietmax_purchase_match_rows, vietmax_comparison_scope) if uses_vietmax_sales else {}
+    vietmax_sales_internal_merges = normalize_vietmax_internal_merges(data.get("vietmax_ban_ra_sales_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_sales else {}
+    vietmax_purchase_internal_merges = normalize_vietmax_internal_merges(data.get("vietmax_mua_vao_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_purchase else {}
     prefix_map, selected_products = validate_payload(data)
     rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values)
+    processed_purchase_path = raw_text(data.get("vietmax_processed_purchase_path"))
+    if uses_vietmax_sales and processed_purchase_path:
+        processed_purchase_products = vietmax_purchase_products_from_workbook(
+            processed_purchase_path,
+            price_col=data.get("purchase_price_col") or "P",
+            comparison_scope=vietmax_comparison_scope,
+            require_existing_code=True,
+        )
+        sales_products_for_khh = []
+        for row in rows:
+            sales_row = {
+                "sales_product": row.get("product", ""),
+                "sales_unit": row.get("unit", ""),
+                "invoice_no": row.get("invoice_no", ""),
+                "invoice_date": row.get("invoice_date", ""),
+                "sales_company": row.get("company", ""),
+                "sales_mst": row.get("mst", ""),
+            }
+            add_vietmax_company_identity(sales_row, "sales", row.get("company", ""), row.get("mst", ""))
+            sales_products_for_khh.append(sales_row)
+        exact_khh_matches = build_vietmax_khh_exact_purchase_matches(sales_products_for_khh, processed_purchase_products, vietmax_comparison_scope)
+        if exact_khh_matches:
+            vietmax_purchase_match_rows = vietmax_purchase_match_rows + exact_khh_matches
+            vietmax_purchase_matches = normalize_vietmax_ban_ra_purchase_matches(vietmax_purchase_match_rows, vietmax_comparison_scope)
 
     occupied = {}
-    for r in rows:
+    for row_index, r in enumerate(rows):
+        report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang kiểm tra quy tắc giá")
         mst = r["mst"]
         prod = r["product"]
         if (include_company_prefix and mst not in prefix_map) or prod not in selected_products.get(mst, set()):
             continue
         key = product_key(mst, prod)
+        purchase_merge_key = vietmax_internal_merge_lookup_key(prod, r.get("company"), mst, comparison_scope=vietmax_comparison_scope) if uses_vietmax_purchase else ""
+        purchase_merge = vietmax_purchase_internal_merges.get(purchase_merge_key) if purchase_merge_key else None
+        effective_purchase_prod = raw_text(purchase_merge.get("similar_product")) if purchase_merge else prod
         base_code = str(manual_code_overrides.get(key) or "").strip()
         if not base_code:
-            base_code = make_code(mst, prod, 1, prefix_map, profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
+            base_code = make_code(mst, effective_purchase_prod, 1, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(base_code)
         if not rule:
             continue
@@ -1412,7 +3090,9 @@ def process_workbook(path, out, data):
             occupied.setdefault(key, set()).add(group)
 
     processed_row_indexes = set()
-    for row in rows:
+    vietmax_purchase_match_row_indexes = set()
+    for row_index, row in enumerate(rows):
+        report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang tạo mã VT cho dòng xử lý")
         i = row["excel_row"] - 1
         mst = row["mst"]
         prod = row["product"]
@@ -1420,15 +3100,35 @@ def process_workbook(path, out, data):
             continue
         key = product_key(mst, prod)
         qty = cell(df, i, qi) if qi is not None else 1
+        purchase_merge_key = vietmax_internal_merge_lookup_key(prod, row.get("company"), mst, comparison_scope=vietmax_comparison_scope) if uses_vietmax_purchase else ""
+        purchase_merge = vietmax_purchase_internal_merges.get(purchase_merge_key) if purchase_merge_key else None
+        purchase_effective_prod = raw_text(purchase_merge.get("similar_product")) if purchase_merge else prod
+        sales_merge_key = vietmax_internal_merge_lookup_key(prod, row.get("company"), mst, comparison_scope=vietmax_comparison_scope)
+        sales_merge = vietmax_sales_internal_merges.get(sales_merge_key) if sales_merge_key else None
+        effective_prod = raw_text(sales_merge.get("similar_product")) if sales_merge else purchase_effective_prod
+        same_company_match_key = vietmax_purchase_match_lookup_key(effective_prod, row.get("company"), mst, VIETMAX_COMPARISON_SCOPE_SAME_COMPANY)
+        matched_purchase_match = vietmax_purchase_matches.get(same_company_match_key) if same_company_match_key else None
+        if not matched_purchase_match and vietmax_comparison_scope != VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+            matched_purchase_match = vietmax_purchase_matches.get(vietmax_ban_ra_match_key(effective_prod))
+        matched_purchase_code = raw_text(matched_purchase_match.get("purchase_code")) if matched_purchase_match else ""
         code = str(manual_code_overrides.get(key) or "").strip()
         if not code:
-            code = make_code(mst, prod, qty, prefix_map, profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
+            code = make_code(mst, effective_prod, qty, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(code)
         if code and rule and pri is not None:
             code += price_group_suffix(parse_price(cell(df, i, pri)), rule, occupied.get(key))
         if code:
             df.iat[i, oi] = code
+            if purchase_merge:
+                df.iat[i, pi] = purchase_effective_prod
+                similar_unit = raw_text(purchase_merge.get("similar_unit"))
+                unit_index = pi + 1
+                if similar_unit and unit_index < df.shape[1]:
+                    df.iat[i, unit_index] = similar_unit
             processed_row_indexes.add(i)
+            if matched_purchase_match:
+                vietmax_purchase_match_row_indexes.add(i)
+                apply_vietmax_match_conversion_to_row(df, i, qi, pi + 1, matched_purchase_match)
 
     header_index = None
     for i in range(len(df)):
@@ -1441,7 +3141,8 @@ def process_workbook(path, out, data):
     if header_index is None:
         header_index = min(processed_row_indexes, default=len(df)) - 1
 
-    df = apply_inventory_pairs(df, header_index, processed_row_indexes, data)
+    df = apply_inventory_pairs(df, header_index, processed_row_indexes, data, excluded_row_indexes=vietmax_purchase_match_row_indexes)
+    df = apply_vietmax_ban_ra_match_inventory(df, header_index, vietmax_purchase_match_row_indexes)
 
     keep_indexes = [
         i for i in range(len(df))
@@ -1449,8 +3150,12 @@ def process_workbook(path, out, data):
     ]
     df = df.iloc[keep_indexes].reset_index(drop=True)
 
+    if progress_callback:
+        progress_callback(1, 2, "Đang ghi file Excel chính")
     with pd.ExcelWriter(out, engine="openpyxl") as w:
         df.to_excel(w, sheet_name=sheet, index=False, header=False)
+    if progress_callback:
+        progress_callback(2, 2, "Đã ghi file Excel chính")
     return df
 
 
@@ -1488,7 +3193,7 @@ def processed_inventory_column_indexes(processed_df, output_code_index):
     return {"tk_vat_tu": labels["tk vat tu"], "ma_kho": labels["ma kho"]}
 
 
-def create_up_ban_ra_workbook(processed_df):
+def create_up_ban_ra_workbook(processed_df, progress_callback=None):
     from openpyxl import load_workbook
 
     template_path = RESOURCE_DIR / "mau HD ban ra.xlsx"
@@ -1512,6 +3217,7 @@ def create_up_ban_ra_workbook(processed_df):
     inventory_indexes = processed_inventory_column_indexes(processed_df, source_indexes["L"])
     output_row = 2
     for row in range(len(processed_df)):
+        report_loop_progress(progress_callback, row + 1, len(processed_df), "Đang dựng file nhập kho", interval=200)
         code = raw_text(cell(processed_df, row, source_indexes["L"]))
         invoice_no = raw_text(cell(processed_df, row, source_indexes["C"]))
         quantity = parse_price(cell(processed_df, row, source_indexes["O"]))
@@ -1551,7 +3257,11 @@ def create_up_ban_ra_workbook(processed_df):
         output_row += 1
 
     stream = BytesIO()
+    if progress_callback:
+        progress_callback(1, 2, "Đang lưu bộ nhớ file nhập kho")
     wb.save(stream)
+    if progress_callback:
+        progress_callback(2, 2, "Đã tạo file nhập kho")
     stream.seek(0)
     return stream
 
@@ -1577,7 +3287,7 @@ def preview_data(df):
     return [{col: str(val) if val != "" else "" for col, val in row.items()} for _, row in view.iterrows()]
 
 
-def invoice_status_options(df, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, skip_statuses=None):
+def invoice_status_options(df, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, skip_statuses=None, progress_callback=None):
     status_col = str(invoice_status_col or "").strip().upper()
     if not status_col:
         return []
@@ -1587,6 +3297,7 @@ def invoice_status_options(df, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, sk
     counts = Counter()
     display_values = {}
     for i in range(len(df)):
+        report_loop_progress(progress_callback, i + 1, len(df), "Đang đọc trạng thái hóa đơn")
         value = raw_text(cell(df, i, status_index))
         if not value:
             continue
