@@ -309,7 +309,7 @@ export function VietmaxApp() {
 
   function resetWorkflow() {
     updateWorkflow(profile, initialWorkflowState());
-    setStatus(profile === 'vietmax' ? 'Đã làm lại. Hãy tải file mua vào Vietmax từ stage 1.' : `Đã làm lại shell ${selectedProfile.label}.`);
+    setStatus(profile === 'vietmax' ? 'Đã làm lại. Hãy tải file mua vào Vietmax từ stage 1.' : `Đã làm lại profile ${selectedProfile.label}.`);
   }
 
   function canEnterStage(target: StageId) {
@@ -1213,7 +1213,7 @@ export function VietmaxApp() {
 
   function changeProfile(nextProfile: ProfileKey) {
     setProfile(nextProfile);
-    setStatus(`Đang xem shell ${profiles.find((item) => item.key === nextProfile)?.label ?? nextProfile}. Dữ liệu profile khác vẫn được giữ.`);
+    setStatus(`Đang xem profile ${profiles.find((item) => item.key === nextProfile)?.label ?? nextProfile}. Dữ liệu profile khác vẫn được giữ.`);
   }
 
   function updatePurchaseReviewScope(scope: 'all' | 'company') {
@@ -1459,7 +1459,7 @@ function StageNavigation({ stages, stage, busy, canEnterStage, goToStage }: { st
 
   return (
     <div className="stage-groups" aria-label="Stage navigation">
-      <StageGroup title="PySide shell" stages={shellStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
+      <StageGroup title="Profile" stages={shellStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
     </div>
   );
 }
@@ -1491,7 +1491,7 @@ function phaseLabel(phase: StagePhase) {
   if (phase === 'sales') return 'Bán ra';
   if (phase === 'inventory') return 'Tồn kho';
   if (phase === 'price') return 'Lọc đơn giá';
-  return 'PySide shell';
+  return 'Profile';
 }
 
 function UploadStage({ title, summary, disabled, onUpload }: { title: string; summary: UploadSummary | null; disabled: boolean; onUpload: (file: File | undefined) => void }) {
@@ -2210,12 +2210,36 @@ function LoadingStage({ title, detail, progress }: { title: string; detail: stri
 
 function LegacyProfileWorkspace({ profile, label, licenseReady }: { profile: ProfileKey; label: string; licenseReady: boolean }) {
   if (!licenseReady) {
-    return <PlaceholderStage title={`${label}: cần license`} detail="Kích hoạt license trước khi mở workflow cũ cho profile này." />;
+    return <PlaceholderStage title={`${label}: cần license`} detail="Kích hoạt license trước khi mở workflow profile này." />;
   }
-  const src = `/legacy/?profile=${encodeURIComponent(profile)}&embedded=1`;
+  const profilePlan: Record<Exclude<ProfileKey, 'vietmax'>, { title: string; detail: string; steps: string[] }> = {
+    cao_thanh: {
+      title: 'Cao Thành',
+      detail: 'Workflow bán ra và lọc đơn giá sẽ được migrate vào React. Màn hình cũ đã tắt để tránh mở lặp app trong app.',
+      steps: ['Tải file bán ra', 'Chọn cột và công ty', 'Lọc đơn giá', 'Xuất file'],
+    },
+    son_phuong: {
+      title: 'Sơn Phương',
+      detail: 'Profile đang chờ migrate workflow riêng sang React. Dữ liệu Vietmax và profile khác vẫn được giữ riêng.',
+      steps: ['Xác nhận luồng xử lý cũ', 'Map cột', 'Review mã', 'Xuất file'],
+    },
+    quang_thinh: {
+      title: 'Quang Thịnh',
+      detail: 'Profile đang chờ migrate workflow riêng sang React. Màn hình này không còn nhúng lại app chính.',
+      steps: ['Xác nhận luồng xử lý cũ', 'Map cột', 'Review mã', 'Xuất file'],
+    },
+  };
+  const plan = profilePlan[profile as Exclude<ProfileKey, 'vietmax'>];
   return (
-    <div className="legacy-profile-workspace">
-      <iframe title={`${label} legacy workflow`} src={src} />
+    <div className="legacy-profile-workspace native-profile-workspace">
+      <section className="profile-migration-card">
+        <span className="upload-step-badge">{plan.title}</span>
+        <h3>{label}</h3>
+        <p>{plan.detail}</p>
+        <div className="profile-migration-steps" aria-label={`${label} migration steps`}>
+          {plan.steps.map((step, index) => <div key={step}><strong>{index + 1}</strong><span>{step}</span></div>)}
+        </div>
+      </section>
     </div>
   );
 }

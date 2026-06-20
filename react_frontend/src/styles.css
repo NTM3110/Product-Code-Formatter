@@ -162,7 +162,14 @@ th { position: sticky; top: 0; z-index: 1; background: var(--color-table-head); 
 .stage-body { height: 100%; min-height: 0; padding: 12px; overflow: auto; }
 .stage-body.legacy-stage-body { padding: 0; overflow: hidden; }
 .legacy-profile-workspace { height: 100%; min-height: 0; display: grid; }
-.legacy-profile-workspace iframe { width: 100%; height: 100%; min-height: 0; border: 0; background: white; }
+.native-profile-workspace { place-items: center; padding: 24px; overflow: auto; }
+.profile-migration-card { width: min(760px, 100%); display: grid; justify-items: center; gap: 14px; padding: 28px; border: 1px solid var(--color-line); border-radius: 16px; background: var(--color-surface); text-align: center; box-shadow: 0 10px 28px rgba(26, 74, 120, .08); }
+.profile-migration-card h3, .profile-migration-card p { margin: 0; }
+.profile-migration-card p { color: var(--color-muted); line-height: 1.5; }
+.profile-migration-steps { width: 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.profile-migration-steps div { min-width: 0; display: grid; gap: 6px; padding: 12px; border: 1px solid var(--color-line); border-radius: 12px; background: var(--color-surface-soft); }
+.profile-migration-steps strong { color: var(--color-primary-strong); font-size: 1.1rem; }
+.profile-migration-steps span { color: var(--color-text); font-weight: 800; }
 .center-stage { min-height: 100%; display: grid; align-content: start; justify-items: center; gap: 14px; padding-top: 8px; text-align: center; }
 .upload-step-badge { display: inline-grid; place-items: center; min-width: 76px; min-height: 26px; padding: 0 12px; border-radius: 999px; background: var(--color-primary-soft); color: var(--color-primary-strong); font-weight: 900; letter-spacing: .04em; }
 .description { margin: 0; color: var(--color-muted); line-height: 1.45; }
