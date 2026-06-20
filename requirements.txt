@@ -6,3 +6,8 @@ pystray
 Pillow
 flask-cors
 PySide6
+reportlab
+fastapi
+uvicorn
+python-multipart
+pywebview

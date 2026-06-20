@@ -1,10 +1,10 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { activateLicense, analyzeVietmaxCompanies, createPurchaseReview, createSalesMatches, downloadInventoryAllocationReport, exportMatches, getInventoryAllocationJob, getLicenseStatus, previewVietmaxProductCodes, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel } from '../api';
-import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, LicenseStatus, MatchRow, ReviewProduct, ReviewRow, UploadSummary } from '../types';
-import { InventoryAllocationStage } from './InventoryAllocationStage';
+import { activateLicense, analyzeVietmaxCompanies, createPurchaseReview, createSalesMatches, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, inspectProcessedVietmaxFile, previewVietmaxProductCodes, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel } from '../api';
+import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, LicenseStatus, MatchRow, OperationProgress, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from '../types';
+import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
 
 type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax';
-type StageId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+type StageId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14;
 type StagePhase = 'purchase' | 'sales' | 'generic' | 'price' | 'inventory';
 
 type StageDefinition = {
@@ -14,19 +14,21 @@ type StageDefinition = {
   short: string;
 };
 
-type CustomPrefixOption = {
-  name: string;
-  formula: string;
-  chars: number;
-  mstDigits?: number;
-};
+type PrefixPresetStrategy = 'last_2_words' | 'last_3_mst' | '2_words_mst';
+type PrefixStrategyValues = Record<PrefixPresetStrategy, Record<string, string>>;
+
+function isStageId(value: unknown): value is StageId {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 14;
+}
 
 type WorkflowState = {
   stage: StageId;
   purchaseFile: UploadSummary | null;
   processedPurchaseSavedName: string;
+  processedPurchaseStats: ProcessedFileStats | null;
   salesFile: UploadSummary | null;
   processedSalesSavedName: string;
+  processedSalesStats: ProcessedFileStats | null;
   openingStockFile: File | null;
   inventoryAllocationConfig: InventoryAllocationConfig;
   inventoryAllocationJob: InventoryAllocationJob | null;
@@ -54,9 +56,11 @@ type WorkflowState = {
   defaultInventoryPairId: string;
   inventoryPairRules: InventoryRule[];
   includeCompanyPrefix: boolean;
-  prefixStrategy: string;
+  purchasePrefixStrategy: PrefixPresetStrategy;
+  salesPrefixStrategy: PrefixPresetStrategy;
   prefixMstDigits: number;
-  customPrefixOptions: CustomPrefixOption[];
+  purchasePrefixStrategyValues: PrefixStrategyValues;
+  salesPrefixStrategyValues: PrefixStrategyValues;
   purchaseReviewScope: 'all' | 'company';
   salesReviewScope: 'all' | 'company';
 };
@@ -99,21 +103,19 @@ const vietmaxStages: StageDefinition[] = [
   { id: 10, label: 'Review Mã VT', phase: 'sales', short: 'Review bán ra' },
   { id: 11, label: 'Tạo file bán ra', phase: 'sales', short: 'Tạo bán ra' },
   { id: 12, label: 'Phân bổ tồn kho', phase: 'inventory', short: 'Phân bổ' },
+  { id: 13, label: 'Xem báo cáo tồn kho', phase: 'inventory', short: 'Báo cáo' },
+  { id: 14, label: 'Xuất file phân bổ', phase: 'inventory', short: 'Xuất file' },
 ];
 
 const commonProfileStages: StageDefinition[] = [
-  { id: 1, label: 'Tải file', phase: 'generic', short: 'Tải file' },
-  { id: 2, label: 'Khớp HD mua vào', phase: 'generic', short: 'Khớp HD' },
-  { id: 3, label: 'Chọn cột / preview / trạng thái', phase: 'generic', short: 'Chọn cột' },
-  { id: 4, label: 'Công ty & prefix', phase: 'generic', short: 'Công ty' },
-  { id: 5, label: 'Review Mã VT', phase: 'generic', short: 'Review Mã VT' },
+  { id: 1, label: 'Workflow cũ đầy đủ', phase: 'generic', short: 'Workflow cũ' },
 ];
 
-const priceProfileStage: StageDefinition = { id: 6, label: 'Lọc đơn giá', phase: 'price', short: 'Lọc đơn giá' };
+const priceProfileStage: StageDefinition = { id: 1, label: 'Workflow Cao Thành bán ra', phase: 'price', short: 'Cao Thành' };
 
 function stagesForProfile(profile: ProfileKey): StageDefinition[] {
   if (profile === 'vietmax') return vietmaxStages;
-  if (profile === 'cao_thanh') return [...commonProfileStages, priceProfileStage];
+  if (profile === 'cao_thanh') return [priceProfileStage];
   return commonProfileStages;
 }
 
@@ -122,8 +124,10 @@ function initialWorkflowState(): WorkflowState {
     stage: 1,
     purchaseFile: null,
     processedPurchaseSavedName: '',
+    processedPurchaseStats: null,
     salesFile: null,
     processedSalesSavedName: '',
+    processedSalesStats: null,
     openingStockFile: null,
     inventoryAllocationConfig: defaultInventoryAllocationConfig(),
     inventoryAllocationJob: null,
@@ -151,13 +155,11 @@ function initialWorkflowState(): WorkflowState {
     defaultInventoryPairId: '',
     inventoryPairRules: [],
     includeCompanyPrefix: false,
-    prefixStrategy: 'last_2_words',
+    purchasePrefixStrategy: 'last_2_words',
+    salesPrefixStrategy: 'last_2_words',
     prefixMstDigits: 3,
-    customPrefixOptions: [
-      { name: 'Custom 1', formula: 'initials', chars: 2, mstDigits: 3 },
-      { name: 'Custom 2', formula: 'mst', chars: 3, mstDigits: 3 },
-      { name: 'Custom 3', formula: 'initials-mst', chars: 2, mstDigits: 3 },
-    ],
+    purchasePrefixStrategyValues: emptyPrefixStrategyValues(),
+    salesPrefixStrategyValues: emptyPrefixStrategyValues(),
     purchaseReviewScope: 'all',
     salesReviewScope: 'company',
   };
@@ -206,12 +208,16 @@ function defaultInventoryAllocationConfig(): InventoryAllocationConfig {
   };
 }
 
+function inventoryAllocationProfileFor(profile: ProfileKey) {
+  return profile === 'son_phuong' ? 'son_phuong' : 'yen_thanh';
+}
+
 function salesOutputInvalidation(): Partial<WorkflowState> {
-  return { processedSalesSavedName: '', inventoryAllocationJob: null, inventoryAllocationResult: null };
+  return { processedSalesSavedName: '', processedSalesStats: null, inventoryAllocationJob: null, inventoryAllocationResult: null };
 }
 
 function purchaseOutputInvalidation(): Partial<WorkflowState> {
-  return { processedPurchaseSavedName: '', matches: [], salesMatchGenerated: false, ...salesOutputInvalidation() };
+  return { processedPurchaseSavedName: '', processedPurchaseStats: null, matches: [], salesMatchGenerated: false, ...salesOutputInvalidation() };
 }
 
 export function VietmaxApp() {
@@ -221,9 +227,10 @@ export function VietmaxApp() {
   const [licenseForm, setLicenseForm] = useState(initialLicenseForm);
   const [status, setStatus] = useState('Chọn profile và bắt đầu theo từng stage. Dữ liệu được giữ khi chuyển stage, chỉ xóa khi bấm Làm lại.');
   const [busy, setBusy] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState<OperationProgress | null>(null);
 
   const workflow = workflows[profile];
-  const { stage, purchaseFile, processedPurchaseSavedName, salesFile, processedSalesSavedName, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, salesCompanyRows, selectedSalesCompanyIndex, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewGenerated, salesReviewGenerated, matches, salesMatchGenerated, salesMatchRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix, prefixStrategy, prefixMstDigits, customPrefixOptions, purchaseReviewScope, salesReviewScope } = workflow;
+  const { stage, purchaseFile, processedPurchaseSavedName, processedPurchaseStats, salesFile, processedSalesSavedName, processedSalesStats, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, salesCompanyRows, selectedSalesCompanyIndex, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewGenerated, salesReviewGenerated, matches, salesMatchGenerated, salesMatchRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix, purchasePrefixStrategy, salesPrefixStrategy, prefixMstDigits, purchasePrefixStrategyValues, salesPrefixStrategyValues, purchaseReviewScope, salesReviewScope } = workflow;
   const selectedProfile = profiles.find((item) => item.key === profile) ?? profiles[0];
   const licenseReady = Boolean(license?.activated && (profile !== 'vietmax' || license.vietmax_allowed));
   const visibleStages = useMemo(() => stagesForProfile(profile), [profile]);
@@ -245,34 +252,60 @@ export function VietmaxApp() {
   }, []);
 
   useEffect(() => {
-    if (profile === 'vietmax' && stage === 3 && purchaseFile && !companyRows.length && !busy) {
+    if (profile === 'vietmax' && (stage === 3 || stage === 4) && purchaseFile && !companyRows.length && !busy) {
       void loadCompanies();
     }
   }, [profile, stage, purchaseFile, companyRows.length, busy]);
 
   useEffect(() => {
-    if (profile === 'vietmax' && stage === 9 && salesFile && !salesCompanyRows.length && !busy) {
+    if (profile === 'vietmax' && (stage === 9 || stage === 10) && salesFile && !salesCompanyRows.length && !busy) {
       void loadSalesCompanies();
     }
   }, [profile, stage, salesFile, salesCompanyRows.length, busy]);
 
   useEffect(() => {
     if (profile === 'vietmax' && stage === 4 && purchaseFile && companyRows.length && !purchaseReviewGenerated && !busy) {
+      if (companyRows.some(hasCompanyDraftChanges)) {
+        applyCompanyAndProductChoices(4);
+        return;
+      }
       void runPurchaseReview();
     }
   }, [profile, stage, purchaseFile, companyRows.length, purchaseReviewGenerated, busy]);
 
   useEffect(() => {
     if (profile === 'vietmax' && stage === 10 && salesFile && salesCompanyRows.length && !salesReviewGenerated && !busy) {
+      if (salesCompanyRows.some(hasCompanyDraftChanges)) {
+        applySalesCompanyAndProductChoices(10);
+        return;
+      }
       void runSalesReview();
     }
   }, [profile, stage, salesFile, salesCompanyRows.length, salesReviewGenerated, busy]);
 
-  function updateCustomPrefix(index: number, option: CustomPrefixOption) {
-    const nextOptions = [...customPrefixOptions];
-    nextOptions[index] = option;
-    updateWorkflow(profile, { customPrefixOptions: nextOptions });
-  }
+  useEffect(() => {
+    if (profile === 'vietmax' && stage === 5 && purchaseFile && !processedPurchaseSavedName && !busy) {
+      void prepareProcessedPurchaseCache();
+    }
+  }, [profile, stage, purchaseFile, processedPurchaseSavedName, busy]);
+
+  useEffect(() => {
+    if (profile === 'vietmax' && stage === 11 && salesFile && !processedSalesSavedName && !busy) {
+      void prepareProcessedSalesCache();
+    }
+  }, [profile, stage, salesFile, processedSalesSavedName, busy]);
+
+  useEffect(() => {
+    if (profile === 'vietmax' && processedPurchaseSavedName && !processedPurchaseStats && !busy) {
+      void refreshProcessedFileStats('purchase', processedPurchaseSavedName);
+    }
+  }, [profile, processedPurchaseSavedName, processedPurchaseStats, busy]);
+
+  useEffect(() => {
+    if (profile === 'vietmax' && processedSalesSavedName && !processedSalesStats && !busy) {
+      void refreshProcessedFileStats('sales', processedSalesSavedName);
+    }
+  }, [profile, processedSalesSavedName, processedSalesStats, busy]);
 
   function resetWorkflow() {
     updateWorkflow(profile, initialWorkflowState());
@@ -284,9 +317,11 @@ export function VietmaxApp() {
     if (profile !== 'vietmax') return licenseReady || target === 1;
     if (!licenseReady) return target === 1;
     if (target <= 2) return true;
-    if (target <= 6) return Boolean(purchaseFile);
-    if (target <= 11) return Boolean(salesFile);
-    return Boolean(processedPurchaseSavedName && processedSalesSavedName);
+    if (target === 6 || target === 12) return true;
+    if (target <= 5) return Boolean(purchaseFile);
+    if (target <= 11) return Boolean(salesFile && (purchaseFile || processedPurchaseSavedName));
+    if (target === 13 || target === 14) return Boolean(inventoryAllocationResult?.job_id || inventoryAllocationJob?.result?.job_id);
+    return true;
   }
 
   function goToStage(target: StageId) {
@@ -316,12 +351,24 @@ export function VietmaxApp() {
       void prepareProcessedPurchaseCache(next.id);
       return;
     }
-    if (stage === 8 && salesFile && processedPurchaseSavedName && !matches.length) {
+    if (stage === 6 && salesFile && !purchaseFile && !processedPurchaseSavedName) {
+      setStatus('Cần tải file mua vào đã xử lý trước khi đi tiếp các stage bán ra.');
+      return;
+    }
+    if (stage === 8 && salesFile && (processedPurchaseSavedName || purchaseFile) && !matches.length && !salesMatchGenerated) {
       void runSalesMatch();
       return;
     }
     if (stage === 10 && salesFile && !salesReviewGenerated) {
       void runSalesReview();
+      return;
+    }
+    if (stage === 11 && salesFile && !processedSalesSavedName) {
+      void prepareProcessedSalesCache(next.id);
+      return;
+    }
+    if (stage === 12 && !inventoryAllocationResult?.job_id && !inventoryAllocationJob?.result?.job_id) {
+      void runInventoryAllocation(next.id);
       return;
     }
     goToStage(next.id);
@@ -405,6 +452,86 @@ export function VietmaxApp() {
     }
   }
 
+  async function uploadProcessed(kind: 'purchase' | 'sales', file: File | undefined) {
+    if (!file) return;
+    const targetProfile = profile;
+    setBusy(true);
+    setStatus(`Đang tải file ${kind === 'purchase' ? 'mua vào' : 'bán ra'} đã xử lý...`);
+    try {
+      const summary = await uploadExcel(file);
+      const stats = await inspectProcessedVietmaxFile(summary.saved_name, kind);
+      if (kind === 'purchase') {
+        updateWorkflow(targetProfile, {
+          processedPurchaseSavedName: summary.saved_name,
+          processedPurchaseStats: stats,
+          purchaseFile: purchaseFile ?? summary,
+          matches: [],
+          salesMatchGenerated: false,
+          salesCompanyRows: [],
+          selectedSalesCompanyIndex: -1,
+          salesProductPreviewCodes: {},
+          salesProductCodeOverrides: {},
+          salesReviewRows: [],
+          salesReviewGenerated: false,
+          ...salesOutputInvalidation(),
+        });
+      } else {
+        updateWorkflow(targetProfile, {
+          processedSalesSavedName: summary.saved_name,
+          processedSalesStats: stats,
+          salesFile: salesFile ?? summary,
+          inventoryAllocationJob: null,
+          inventoryAllocationResult: null,
+        });
+      }
+      setStatus(`Đã tải ${summary.original_name}. ${processedStatsSentence(stats)}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshProcessedFileStats(kind: 'purchase' | 'sales', savedName: string) {
+    try {
+      const stats = await inspectProcessedVietmaxFile(savedName, kind);
+      if (kind === 'purchase') updateWorkflow(profile, { processedPurchaseStats: stats });
+      else updateWorkflow(profile, { processedSalesStats: stats });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function beginProgress(label: string) {
+    const operationId = `op_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    let stopped = false;
+    setLoadingProgress({ operation_id: operationId, status: 'running', done: 0, total: 1, percent: 0, label });
+    setStatus(formatOperationStatus({ operation_id: operationId, status: 'running', done: 0, total: 1, percent: 0, label }, label));
+    const poll = async () => {
+      while (!stopped) {
+        await sleep(250);
+        if (stopped) break;
+        try {
+          const progress = await getOperationProgress(operationId);
+          if (!stopped) {
+            setLoadingProgress(progress);
+            if (progress.status !== 'missing') setStatus(formatOperationStatus(progress, label));
+          }
+          if (progress.status === 'complete' || progress.status === 'error') break;
+        } catch {
+          // Keep the visible loading state even if a single poll misses the backend.
+        }
+      }
+    };
+    void poll();
+    return {
+      operationId,
+      stop: () => {
+        stopped = true;
+      },
+    };
+  }
+
   async function runPurchaseReview() {
     if (!purchaseFile) return;
     const dirtyCompanies = companyRows.filter(hasCompanyDraftChanges);
@@ -416,24 +543,29 @@ export function VietmaxApp() {
     const targetProfile = profile;
     const targetPurchaseFile = purchaseFile;
     const scope = purchaseReviewScope === 'company' ? 'same_company' : 'all_companies';
+    const progress = beginProgress('Đang chuẩn bị review Mã VT mua vào');
     setBusy(true);
     setStatus('Đang tạo review Mã VT mua vào bằng logic Vietmax...');
     try {
-      const result = await createPurchaseReview(targetPurchaseFile.saved_name, scope, wordRules, repeatedPhraseRemovals, reviewProducts);
+      const result = await createPurchaseReview(targetPurchaseFile.saved_name, scope, wordRules, repeatedPhraseRemovals, reviewProducts, progress.operationId);
       updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), purchaseReviewRows: normalizeReviewRows(result.review_rows as ReviewRow[]), purchaseReviewGenerated: true, stage: 4 });
       setStatus(`Đã tạo ${result.review_rows.length} dòng review Mã VT mua vào. Chỉ dòng được tick ở cột Dùng và lựa chọn Dùng mã sẽ được áp dụng khi xử lý.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
+      progress.stop();
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
 
-  function applyProcessedPurchaseCache(targetProfile: ProfileKey, processedSavedName: string) {
-    if (!processedSavedName) return;
+  async function applyProcessedPurchaseCache(targetProfile: ProfileKey, processedSavedName: string) {
+    if (!processedSavedName) return null;
+    const stats = await inspectProcessedVietmaxFile(processedSavedName, 'purchase');
     updateWorkflow(targetProfile, {
       ...salesOutputInvalidation(),
       processedPurchaseSavedName: processedSavedName,
+      processedPurchaseStats: stats,
       matches: [],
       salesMatchGenerated: false,
       salesCompanyRows: [],
@@ -443,6 +575,7 @@ export function VietmaxApp() {
       salesReviewRows: [],
       salesReviewGenerated: false,
     });
+    return stats;
   }
 
   async function prepareProcessedPurchaseCache(nextStage?: StageId) {
@@ -458,9 +591,38 @@ export function VietmaxApp() {
     try {
       const result = await processVietmaxPurchase(targetPurchaseFile.saved_name, targetPurchaseFile.original_name, buildPurchaseProcessPayload(workflow));
       if (!result.processedSavedName) throw new Error('Không tạo được cache file mua vào đã xử lý.');
-      applyProcessedPurchaseCache(targetProfile, result.processedSavedName);
-      setStatus('Đã tạo cache file mua vào đã xử lý. Stage khớp mua/bán có thể dùng file này dù bạn chưa xuất Excel.');
+      const stats = await applyProcessedPurchaseCache(targetProfile, result.processedSavedName);
+      setStatus(`Đã tạo cache file mua vào đã xử lý. ${processedStatsSentence(stats)}`);
       if (nextStage) updateWorkflow(targetProfile, { stage: nextStage });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function prepareProcessedSalesCache(nextStage?: StageId) {
+    if (!salesFile) return;
+    if (processedSalesSavedName) {
+      if (nextStage) goToStage(nextStage);
+      return;
+    }
+    const targetProfile = profile;
+    const targetSalesFile = salesFile;
+    setBusy(true);
+    setStatus('Đang tạo cache file bán ra đã xử lý để xuất nhanh và dùng cho phân bổ tồn kho...');
+    try {
+      const result = await processVietmaxPurchase(targetSalesFile.saved_name, targetSalesFile.original_name, buildSalesProcessPayload(workflow));
+      if (!result.processedSavedName) throw new Error('Không tạo được cache file bán ra đã xử lý.');
+      const stats = await inspectProcessedVietmaxFile(result.processedSavedName, 'sales');
+      updateWorkflow(targetProfile, {
+        processedSalesSavedName: result.processedSavedName,
+        processedSalesStats: stats,
+        inventoryAllocationJob: null,
+        inventoryAllocationResult: null,
+        ...(nextStage ? { stage: nextStage } : {}),
+      });
+      setStatus(`Đã tạo cache file bán ra đã xử lý. ${processedStatsSentence(stats)}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -474,6 +636,7 @@ export function VietmaxApp() {
     const targetSalesFile = salesFile;
     const targetPurchaseFile = purchaseFile;
     let targetProcessedPurchase = processedPurchaseSavedName;
+    const progress = beginProgress(targetProcessedPurchase ? 'Đang chuẩn bị khớp mua vào / bán ra' : 'Đang chuẩn bị cache file mua vào đã xử lý');
     setBusy(true);
     setStatus(targetProcessedPurchase ? 'Đang khớp bán ra với file mua vào đã xử lý KHH/152...' : 'Đang chuẩn bị cache file mua vào đã xử lý trước khi khớp mua/bán...');
     try {
@@ -482,10 +645,10 @@ export function VietmaxApp() {
         const purchaseResult = await processVietmaxPurchase(targetPurchaseFile.saved_name, targetPurchaseFile.original_name, buildPurchaseProcessPayload(workflow));
         targetProcessedPurchase = purchaseResult.processedSavedName;
         if (!targetProcessedPurchase) throw new Error('Không tạo được cache file mua vào đã xử lý.');
-        applyProcessedPurchaseCache(targetProfile, targetProcessedPurchase);
+        await applyProcessedPurchaseCache(targetProfile, targetProcessedPurchase);
         setStatus('Đã tạo cache mua vào. Đang khớp bán ra với file mua vào đã xử lý KHH/152...');
       }
-      const result = await createSalesMatches(targetSalesFile.saved_name, targetProcessedPurchase, comparisonScope);
+      const result = await createSalesMatches(targetSalesFile.saved_name, targetProcessedPurchase, comparisonScope, progress.operationId);
       const savedRules = result.match_rules?.length ? result.match_rules : salesMatchRules;
       const nextMatches = applySalesMatchRules(result.matches, savedRules, comparisonScope);
       const mismatchCount = nextMatches.filter(hasUnitMismatch).length;
@@ -494,6 +657,8 @@ export function VietmaxApp() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
+      progress.stop();
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
@@ -552,7 +717,7 @@ export function VietmaxApp() {
   function saveMatchChoices() {
     const nextWorkflow = { ...workflow, salesMatchRules: buildSalesMatchRules(workflow) };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã lưu cấu hình khớp mua/bán theo công ty, hàng hóa và công thức quy đổi ĐVT.');
+    void saveWorkflowConfig(nextWorkflow, 'Đã lưu cấu hình khớp mua/bán theo công ty, hàng hóa và công thức quy đổi ĐVT.', 'sales');
   }
 
   function updateReviewRow(index: number, update: Partial<ReviewRow>) {
@@ -588,13 +753,13 @@ export function VietmaxApp() {
   function applyReviewChoices() {
     const nextWorkflow = { ...workflow, ...purchaseOutputInvalidation(), purchaseReviewRows };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn Review Mã VT vào cấu hình.');
+    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn Review Mã VT vào cấu hình.', 'purchase');
   }
 
   function applySalesReviewChoices() {
     const nextWorkflow = { ...workflow, ...salesOutputInvalidation(), salesReviewRows };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn Review bán ra. Các dòng được tick sẽ được tính vào file bán ra khi xuất.');
+    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn Review bán ra. Các dòng được tick sẽ được tính vào file bán ra khi xuất.', 'sales');
   }
 
   async function loadCompanies() {
@@ -614,8 +779,13 @@ export function VietmaxApp() {
         committed_prefix: company.committed_prefix ?? company.value ?? '',
         selected_product_names: company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name),
       }));
-      const previewCodes = await loadProductPreviewCodes(nextCompanies, savedWordRules, savedRepeatedPhrases);
-      updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), companyRows: nextCompanies, selectedCompanyIndex: firstDisplayedCompanyIndex(nextCompanies), productPreviewCodes: previewCodes, productCodeOverrides: {}, wordRules: savedWordRules, repeatedPhraseRemovals: savedRepeatedPhrases, inventoryPairs: savedInventoryPairs, useDefaultInventoryPair: result.use_default_inventory_pair ?? useDefaultInventoryPair, defaultInventoryPairId: result.default_inventory_pair_id ?? defaultInventoryPairId, inventoryPairRules: result.inventory_pair_rules ?? inventoryPairRules, purchaseReviewRows: [], purchaseReviewGenerated: false });
+      const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || purchasePrefixStrategy);
+      const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
+      const loadedPrefixValues = normalizePrefixStrategyValues(result.prefix_strategy_values, purchasePrefixStrategyValues);
+      const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits);
+      const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, nextPrefixValues, true);
+      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases);
+      updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), companyRows: displayCompanies, selectedCompanyIndex: firstDisplayedCompanyIndex(displayCompanies), productPreviewCodes: previewCodes, productCodeOverrides: {}, wordRules: savedWordRules, repeatedPhraseRemovals: savedRepeatedPhrases, inventoryPairs: savedInventoryPairs, useDefaultInventoryPair: result.use_default_inventory_pair ?? useDefaultInventoryPair, defaultInventoryPairId: result.default_inventory_pair_id ?? defaultInventoryPairId, inventoryPairRules: result.inventory_pair_rules ?? inventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, purchasePrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, purchasePrefixStrategyValues: nextPrefixValues, purchaseReviewRows: [], purchaseReviewGenerated: false });
       setStatus(`Đã tải ${result.company_count} công ty, ${result.rows_to_process} dòng mua vào. Chọn một dòng công ty để xem hàng hóa và Mã VT preview.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -631,6 +801,8 @@ export function VietmaxApp() {
     setStatus('Đang tải danh sách công ty và hàng hóa bán ra...');
     try {
       const result = await analyzeVietmaxCompanies(salesFile.saved_name, 'sales');
+      const savedWordRules = result.word_rules ?? wordRules;
+      const savedRepeatedPhrases = result.repeated_phrase_removals ?? repeatedPhraseRemovals;
       const savedInventoryPairs = result.inventory_pairs?.length ? result.inventory_pairs : inventoryPairs;
       const khhMatchedKeys = confirmedSalesMatchKeys(matches, comparisonScope);
       const nextCompanies = result.companies.map((company) => ({
@@ -643,8 +815,13 @@ export function VietmaxApp() {
         ...company,
         selected_product_names: (company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name)).filter((name) => company.all_products.some((product) => product.name === name)),
       })).filter((company) => company.all_products.length);
-      const previewCodes = await loadProductPreviewCodes(nextCompanies, wordRules, repeatedPhraseRemovals, 'sales');
-      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: nextCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(nextCompanies), salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: {}, salesMatchRules: result.sales_match_rules ?? salesMatchRules, inventoryPairs: savedInventoryPairs, useDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : useDefaultInventoryPair, defaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : defaultInventoryPairId, inventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : inventoryPairRules, salesReviewRows: [], salesReviewGenerated: false });
+      const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || salesPrefixStrategy);
+      const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
+      const loadedPrefixValues = normalizePrefixStrategyValues(result.prefix_strategy_values, salesPrefixStrategyValues);
+      const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits);
+      const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, nextPrefixValues, true);
+      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases, 'sales');
+      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: displayCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies), salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: {}, wordRules: savedWordRules, repeatedPhraseRemovals: savedRepeatedPhrases, salesMatchRules: result.sales_match_rules ?? salesMatchRules, inventoryPairs: savedInventoryPairs, useDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : useDefaultInventoryPair, defaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : defaultInventoryPairId, inventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : inventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, salesPrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, salesPrefixStrategyValues: nextPrefixValues, salesReviewRows: [], salesReviewGenerated: false });
       setStatus(`Đã tải ${nextCompanies.length} công ty bán ra còn lại sau KHH/152. Chọn công ty/hàng hóa rồi áp dụng trước khi review bán ra.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -670,38 +847,50 @@ export function VietmaxApp() {
     });
   }
 
-  function applyCompanyAndProductChoices() {
+  function applyCompanyAndProductChoices(nextStage?: unknown) {
+    const targetStage = isStageId(nextStage) ? nextStage : undefined;
+    const activeStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
+    const nextPrefixValues = rememberManualPrefixValues(purchasePrefixStrategyValues, activeStrategy, companyRows, prefixMstDigits);
     const nextCompanyRows = sortAppliedCompanyRows(companyRows.map((company) => {
       const process = company.pending_process ?? company.process ?? true;
-      return { ...company, process, pending_process: process, committed_prefix: company.value || '' };
+      return { ...company, value: normalizePrefixValue(company.value), process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
     }));
     const nextWorkflow = {
       ...workflow,
       ...purchaseOutputInvalidation(),
       companyRows: nextCompanyRows,
+      purchasePrefixStrategyValues: nextPrefixValues,
       selectedCompanyIndex: firstDisplayedCompanyIndex(nextCompanyRows),
       purchaseReviewRows: [],
       purchaseReviewGenerated: false,
+      ...(targetStage ? { stage: targetStage } : {}),
     };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa vào cấu hình. Review Mã VT sẽ tạo lại theo lựa chọn mới.');
+    scrollStageBodyToTop();
+    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa vào cấu hình. Review Mã VT sẽ tạo lại theo lựa chọn mới.', 'purchase');
   }
 
-  function applySalesCompanyAndProductChoices() {
+  function applySalesCompanyAndProductChoices(nextStage?: unknown) {
+    const targetStage = isStageId(nextStage) ? nextStage : undefined;
+    const activeStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
+    const nextPrefixValues = rememberManualPrefixValues(salesPrefixStrategyValues, activeStrategy, salesCompanyRows, prefixMstDigits);
     const nextSalesCompanyRows = sortAppliedCompanyRows(salesCompanyRows.map((company) => {
       const process = company.pending_process ?? company.process ?? true;
-      return { ...company, process, pending_process: process, committed_prefix: company.value || '' };
+      return { ...company, value: normalizePrefixValue(company.value), process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
     }));
     const nextWorkflow = {
       ...workflow,
       ...salesOutputInvalidation(),
       salesCompanyRows: nextSalesCompanyRows,
+      salesPrefixStrategyValues: nextPrefixValues,
       selectedSalesCompanyIndex: firstDisplayedCompanyIndex(nextSalesCompanyRows),
       salesReviewRows: [],
       salesReviewGenerated: false,
+      ...(targetStage ? { stage: targetStage } : {}),
     };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa bán ra. Review bán ra sẽ tạo lại theo lựa chọn mới.');
+    scrollStageBodyToTop();
+    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa bán ra. Review bán ra sẽ tạo lại theo lựa chọn mới.', 'sales');
   }
 
   function selectCompany(index: number) {
@@ -787,16 +976,26 @@ export function VietmaxApp() {
   }
 
   function updateCompanyPrefix(index: number, value: string) {
+    const company = companyRows[index];
+    if (!company) return;
+    const activeStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
+    const nextValue = value;
     updateWorkflow(profile, {
       selectedCompanyIndex: index,
-      companyRows: companyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, value: value.toUpperCase() } : company)),
+      companyRows: companyRows.map((row, rowIndex) => (rowIndex === index ? { ...row, value: nextValue } : row)),
+      purchasePrefixStrategyValues: rememberPrefixEdit(purchasePrefixStrategyValues, activeStrategy, company, nextValue, prefixMstDigits),
     });
   }
 
   function updateSalesCompanyPrefix(index: number, value: string) {
+    const company = salesCompanyRows[index];
+    if (!company) return;
+    const activeStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
+    const nextValue = value;
     updateWorkflow(profile, {
       selectedSalesCompanyIndex: index,
-      salesCompanyRows: salesCompanyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, value: value.toUpperCase() } : company)),
+      salesCompanyRows: salesCompanyRows.map((row, rowIndex) => (rowIndex === index ? { ...row, value: nextValue } : row)),
+      salesPrefixStrategyValues: rememberPrefixEdit(salesPrefixStrategyValues, activeStrategy, company, nextValue, prefixMstDigits),
     });
   }
 
@@ -811,15 +1010,42 @@ export function VietmaxApp() {
     });
   }
 
-  function updatePrefixStrategy(strategy: string) {
+  function updatePrefixMstDigits(digits: number) {
+    const nextDigits = clampPrefixMstDigits(digits);
+    const activeStrategy = normalizedPrefixStrategy(stage === 9 ? salesPrefixStrategy : purchasePrefixStrategy);
+    const nextWorkflow: Partial<WorkflowState> = { prefixMstDigits: nextDigits };
+    if (activeStrategy !== 'last_2_words') {
+      if (stage === 3) {
+        const rememberedValues = rememberManualPrefixValues(purchasePrefixStrategyValues, activeStrategy, companyRows, prefixMstDigits);
+        nextWorkflow.purchasePrefixStrategyValues = rememberedValues;
+        nextWorkflow.companyRows = applyPrefixStrategyRows(companyRows, activeStrategy, nextDigits, rememberedValues);
+      }
+      if (stage === 9) {
+        const rememberedValues = rememberManualPrefixValues(salesPrefixStrategyValues, activeStrategy, salesCompanyRows, prefixMstDigits);
+        nextWorkflow.salesPrefixStrategyValues = rememberedValues;
+        nextWorkflow.salesCompanyRows = applyPrefixStrategyRows(salesCompanyRows, activeStrategy, nextDigits, rememberedValues);
+      }
+    }
+    updateWorkflow(profile, nextWorkflow);
+  }
+
+  function applyPurchasePrefixPreset(strategy: PrefixPresetStrategy) {
+    const currentStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
+    const rememberedValues = rememberManualPrefixValues(purchasePrefixStrategyValues, currentStrategy, companyRows, prefixMstDigits);
     updateWorkflow(profile, {
-      prefixStrategy: strategy,
+      purchasePrefixStrategy: strategy,
+      purchasePrefixStrategyValues: rememberedValues,
+      companyRows: applyPrefixStrategyRows(companyRows, strategy, prefixMstDigits, rememberedValues),
     });
   }
 
-  function updatePrefixMstDigits(digits: number) {
+  function applySalesPrefixPreset(strategy: PrefixPresetStrategy) {
+    const currentStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
+    const rememberedValues = rememberManualPrefixValues(salesPrefixStrategyValues, currentStrategy, salesCompanyRows, prefixMstDigits);
     updateWorkflow(profile, {
-      prefixMstDigits: Math.max(1, Math.min(10, digits)),
+      salesPrefixStrategy: strategy,
+      salesPrefixStrategyValues: rememberedValues,
+      salesCompanyRows: applyPrefixStrategyRows(salesCompanyRows, strategy, prefixMstDigits, rememberedValues),
     });
   }
 
@@ -829,8 +1055,12 @@ export function VietmaxApp() {
     setStatus('Đang cập nhật Mã VT preview bán ra...');
     try {
       const previewCodes = await loadProductPreviewCodes(salesCompanyRows, wordRules, repeatedPhraseRemovals, 'sales');
-      updateWorkflow(profile, { ...salesOutputInvalidation(), salesProductPreviewCodes: previewCodes, salesReviewRows: [], salesReviewGenerated: false });
-      setStatus('Đã cập nhật Mã VT preview bán ra.');
+      const nextWorkflow = { ...workflow, ...salesOutputInvalidation(), salesProductPreviewCodes: previewCodes, salesReviewRows: [], salesReviewGenerated: false };
+      updateWorkflow(profile, nextWorkflow);
+      for (const payload of buildConfigPayloads(nextWorkflow, 'sales')) {
+        await saveVietmaxConfig(payload);
+      }
+      setStatus('Đã cập nhật Mã VT preview bán ra và lưu cấu hình bán ra.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -847,24 +1077,27 @@ export function VietmaxApp() {
     }
     const reviewProducts = buildSalesReviewProducts(workflow);
     const scope = workflow.salesReviewScope === 'company' ? 'same_company' : 'all_companies';
+    const progress = beginProgress('Đang chuẩn bị review Mã VT bán ra');
     setBusy(true);
     setStatus('Đang tạo review Mã VT bán ra theo công ty/hàng hóa đã chọn...');
     try {
-      const result = await createPurchaseReview(salesFile.saved_name, scope, wordRules, repeatedPhraseRemovals, reviewProducts as ReviewProduct[]);
+      const result = await createPurchaseReview(salesFile.saved_name, scope, wordRules, repeatedPhraseRemovals, reviewProducts as ReviewProduct[], progress.operationId, 'sales');
       updateWorkflow(profile, { ...salesOutputInvalidation(), salesReviewRows: normalizeReviewRows(result.review_rows as ReviewRow[]), salesReviewGenerated: true, stage: 10 });
       setStatus(`Đã tạo ${result.review_rows.length} dòng Review bán ra. Chỉ dòng được tick mới gộp khi xuất file bán ra.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
+      progress.stop();
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
 
-  async function saveWorkflowConfig(targetWorkflow: WorkflowState, successMessage = 'Đã lưu cấu hình hiện tại.') {
+  async function saveWorkflowConfig(targetWorkflow: WorkflowState, successMessage = 'Đã lưu cấu hình hiện tại.', phase: 'purchase' | 'sales' | 'all' = 'all') {
     setBusy(true);
     setStatus('Đang lưu cấu hình...');
     try {
-      for (const payload of buildConfigPayloads(targetWorkflow)) {
+      for (const payload of buildConfigPayloads(targetWorkflow, phase)) {
         await saveVietmaxConfig(payload);
       }
       setStatus(successMessage);
@@ -876,7 +1109,7 @@ export function VietmaxApp() {
   }
 
   function saveCurrentConfig() {
-    void saveWorkflowConfig(workflow);
+    void saveWorkflowConfig(workflow, 'Đã lưu cấu hình hiện tại.', stage >= 6 ? 'sales' : 'purchase');
   }
 
   async function refreshProductPreviews() {
@@ -887,7 +1120,7 @@ export function VietmaxApp() {
       const previewCodes = await loadProductPreviewCodes(companyRows, wordRules, repeatedPhraseRemovals);
       const nextWorkflow = { ...workflow, ...purchaseOutputInvalidation(), productPreviewCodes: previewCodes, purchaseReviewRows: [], purchaseReviewGenerated: false };
       updateWorkflow(profile, nextWorkflow);
-      for (const payload of buildConfigPayloads(nextWorkflow)) {
+      for (const payload of buildConfigPayloads(nextWorkflow, 'purchase')) {
         await saveVietmaxConfig(payload);
       }
       setStatus('Đã cập nhật Mã VT preview và lưu cấu hình.');
@@ -901,38 +1134,51 @@ export function VietmaxApp() {
   function updateWordRule(index: number, field: 'from' | 'to', value: string) {
     const entries = Object.entries(wordRules);
     entries[index] = field === 'from' ? [value, entries[index]?.[1] || ''] : [entries[index]?.[0] || '', value];
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), wordRules: Object.fromEntries(entries.filter(([from]) => from.trim())), purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
+    const invalidation = stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
+    updateWorkflow(profile, { ...invalidation, wordRules: Object.fromEntries(entries.filter(([from]) => from.trim())), purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
   }
 
   function addWordRule() {
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), wordRules: { ...wordRules, '': '' }, purchaseReviewGenerated: false, salesReviewGenerated: false });
+    const invalidation = stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
+    updateWorkflow(profile, { ...invalidation, wordRules: { ...wordRules, '': '' }, purchaseReviewGenerated: false, salesReviewGenerated: false });
   }
 
   function updateRepeatedPhrase(index: number, value: string) {
     const next = repeatedPhraseRemovals.slice();
     next[index] = value;
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), repeatedPhraseRemovals: next.filter((item, rowIndex) => item.trim() || rowIndex === index), purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
+    const invalidation = stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
+    updateWorkflow(profile, { ...invalidation, repeatedPhraseRemovals: next.filter((item, rowIndex) => item.trim() || rowIndex === index), purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
   }
 
   function addRepeatedPhrase() {
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), repeatedPhraseRemovals: [...repeatedPhraseRemovals, ''], purchaseReviewGenerated: false, salesReviewGenerated: false });
+    const invalidation = stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
+    updateWorkflow(profile, { ...invalidation, repeatedPhraseRemovals: [...repeatedPhraseRemovals, ''], purchaseReviewGenerated: false, salesReviewGenerated: false });
   }
 
   function removeRepeatedPhrase(index: number) {
     const next = repeatedPhraseRemovals.slice();
     next.splice(index, 1);
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), repeatedPhraseRemovals: next, purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
+    const invalidation = stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
+    updateWorkflow(profile, { ...invalidation, repeatedPhraseRemovals: next, purchaseReviewRows: [], salesReviewRows: [], purchaseReviewGenerated: false, salesReviewGenerated: false });
   }
 
   async function downloadProcessedPurchase() {
     if (!purchaseFile) return;
     setBusy(true);
-      setStatus('Đang tạo file mua vào đã xử lý Mã VT...');
+    setStatus(processedPurchaseSavedName ? 'Đang mở file mua vào đã xử lý từ cache...' : 'Đang tạo file mua vào đã xử lý Mã VT...');
     try {
-      const result = await processVietmaxPurchase(purchaseFile.saved_name, purchaseFile.original_name, buildPurchaseProcessPayload(workflow));
-      const saved = await saveBlob(result.blob, purchaseFile.original_name.replace(/\.(xlsx|xlsm)$/i, '_fdi.xlsx'));
-      if (result.processedSavedName) applyProcessedPurchaseCache(profile, result.processedSavedName);
-      setStatus(saved ? 'Đã xuất và lưu cache file mua vào đã xử lý. Bán ra sẽ dùng file này cho KHH/152.' : 'Đã tạo cache file mua vào đã xử lý, nhưng bạn đã hủy lưu bản xuất. Bán ra vẫn dùng cache này cho KHH/152.');
+      let savedName = processedPurchaseSavedName;
+      let stats = processedPurchaseStats;
+      if (!savedName) {
+        const result = await processVietmaxPurchase(purchaseFile.saved_name, purchaseFile.original_name, buildPurchaseProcessPayload(workflow));
+        savedName = result.processedSavedName;
+        if (!savedName) throw new Error('Không tạo được cache file mua vào đã xử lý.');
+        stats = await applyProcessedPurchaseCache(profile, savedName);
+      }
+      const blob = await downloadCachedFile(savedName);
+      const saved = await saveBlob(blob, purchaseFile.original_name.replace(/\.(xlsx|xlsm)$/i, '_fdi.xlsx'));
+      const suffix = processedStatsSentence(stats);
+      setStatus(saved ? `Đã xuất file mua vào đã xử lý từ cache. ${suffix}` : `Đã hủy lưu file mua vào; cache vẫn được giữ. ${suffix}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -943,12 +1189,21 @@ export function VietmaxApp() {
   async function downloadProcessedSales() {
     if (!salesFile) return;
     setBusy(true);
-      setStatus('Đang tạo file bán ra đã xử lý Mã VT...');
+    setStatus(processedSalesSavedName ? 'Đang mở file bán ra đã xử lý từ cache...' : 'Đang tạo file bán ra đã xử lý Mã VT...');
     try {
-      const result = await processVietmaxPurchase(salesFile.saved_name, salesFile.original_name, buildSalesProcessPayload(workflow));
-      const saved = await saveBlob(result.blob, salesFile.original_name.replace(/\.(xlsx|xlsm)$/i, '_fdi.xlsx'));
-      if (result.processedSavedName) updateWorkflow(profile, { processedSalesSavedName: result.processedSavedName, inventoryAllocationJob: null, inventoryAllocationResult: null });
-      setStatus(saved ? 'Đã xuất và lưu cache file bán ra đã xử lý. Có thể tiếp tục sang Stage 12 phân bổ tồn kho.' : 'Đã tạo cache file bán ra đã xử lý, nhưng bạn đã hủy lưu bản xuất. Stage 12 vẫn dùng cache này.');
+      let savedName = processedSalesSavedName;
+      let stats = processedSalesStats;
+      if (!savedName) {
+        const result = await processVietmaxPurchase(salesFile.saved_name, salesFile.original_name, buildSalesProcessPayload(workflow));
+        savedName = result.processedSavedName;
+        if (!savedName) throw new Error('Không tạo được cache file bán ra đã xử lý.');
+        stats = await inspectProcessedVietmaxFile(savedName, 'sales');
+        updateWorkflow(profile, { processedSalesSavedName: savedName, processedSalesStats: stats, inventoryAllocationJob: null, inventoryAllocationResult: null });
+      }
+      const blob = await downloadCachedFile(savedName);
+      const saved = await saveBlob(blob, salesFile.original_name.replace(/\.(xlsx|xlsm)$/i, '_fdi.xlsx'));
+      const suffix = processedStatsSentence(stats);
+      setStatus(saved ? `Đã xuất file bán ra đã xử lý từ cache. ${suffix}` : `Đã hủy lưu file bán ra; cache vẫn được giữ. ${suffix}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -981,27 +1236,34 @@ export function VietmaxApp() {
     updateWorkflow(profile, { openingStockFile: file, inventoryAllocationJob: null, inventoryAllocationResult: null });
   }
 
-  async function runInventoryAllocation() {
-    if (!processedPurchaseSavedName || !processedSalesSavedName || !salesFile) {
-      setStatus('Cần xuất file mua vào và bán ra trước khi phân bổ tồn kho.');
+  async function runInventoryAllocation(nextStage?: StageId) {
+    if (!processedPurchaseSavedName || !processedSalesSavedName) {
+      setStatus('Cần tải hoặc tạo cả file mua vào và bán ra đã xử lý trước khi phân bổ tồn kho.');
       return;
     }
     const targetProfile = profile;
     setBusy(true);
     setStatus('Đang gửi dữ liệu phân bổ tồn kho...');
+    updateWorkflow(targetProfile, {
+      inventoryAllocationJob: { status: 'queued', progress: 0, done: 0, total: 0, label: 'Đang chuẩn bị phân bổ tồn kho...' },
+      inventoryAllocationResult: null,
+    });
     try {
-      const started = await startInventoryAllocation({ purchaseSavedName: processedPurchaseSavedName, salesSavedName: processedSalesSavedName, salesOriginalName: salesFile.original_name, openingFile: openingStockFile, config: inventoryAllocationConfig });
-      let nextJob: InventoryAllocationJob = { status: 'queued', progress: 0, label: 'Đã gửi dữ liệu. Đang chờ backend xử lý...' };
+      const allocationConfig = { ...inventoryAllocationConfig, policy: { ...inventoryAllocationConfig.policy, company_profile: inventoryAllocationProfileFor(targetProfile) } };
+      const started = await startInventoryAllocation({ purchaseSavedName: processedPurchaseSavedName, salesSavedName: processedSalesSavedName, salesOriginalName: salesFile?.original_name || 'ban_ra_da_xu_ly.xlsx', openingFile: openingStockFile, config: allocationConfig });
+      let nextJob: InventoryAllocationJob = { status: 'queued', progress: 0, done: 0, total: 0, label: 'Đã gửi dữ liệu. Đang chờ backend xử lý...' };
       updateWorkflow(targetProfile, { inventoryAllocationJob: nextJob, inventoryAllocationResult: null });
       while (nextJob.status !== 'complete') {
-        await sleep(900);
+        await sleep(500);
         nextJob = await getInventoryAllocationJob(started.analysis_job_id);
         updateWorkflow(targetProfile, { inventoryAllocationJob: nextJob, inventoryAllocationResult: nextJob.result ?? null });
-        setStatus(nextJob.label || 'Đang phân bổ tồn kho...');
+        setStatus(formatInventoryJobStatus(nextJob));
         if (nextJob.status === 'error') throw new Error(nextJob.error || nextJob.label || 'Phân bổ tồn kho thất bại.');
       }
-      setStatus('Đã hoàn tất phân bổ tồn kho. Có thể tải file báo cáo Stage 12.');
+      if (nextStage) updateWorkflow(targetProfile, { stage: nextStage });
+      setStatus('Đã hoàn tất phân bổ tồn kho. Kiểm tra báo cáo trước khi xuất file.');
     } catch (error) {
+      updateWorkflow(targetProfile, { inventoryAllocationJob: null });
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
@@ -1028,7 +1290,7 @@ export function VietmaxApp() {
   function addInventoryPair() {
     const id = `pair-${Date.now()}`;
     updateWorkflow(profile, {
-      ...purchaseOutputInvalidation(),
+      ...inventoryOutputInvalidation(),
       inventoryPairs: [...inventoryPairs, { id, ma_kho: '', tk_vat_tu: '' }],
       defaultInventoryPairId: defaultInventoryPairId || id,
     });
@@ -1036,7 +1298,7 @@ export function VietmaxApp() {
 
   function updateInventoryPair(index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) {
     updateWorkflow(profile, {
-      ...purchaseOutputInvalidation(),
+      ...inventoryOutputInvalidation(),
       inventoryPairs: inventoryPairs.map((pair, rowIndex) => (rowIndex === index ? { ...pair, [field]: value.toUpperCase() } : pair)),
     });
   }
@@ -1045,7 +1307,7 @@ export function VietmaxApp() {
     const removed = inventoryPairs[index];
     const nextPairs = inventoryPairs.filter((_, rowIndex) => rowIndex !== index);
     updateWorkflow(profile, {
-      ...purchaseOutputInvalidation(),
+      ...inventoryOutputInvalidation(),
       inventoryPairs: nextPairs,
       defaultInventoryPairId: removed?.id === defaultInventoryPairId ? (nextPairs[0]?.id || '') : defaultInventoryPairId,
       inventoryPairRules: inventoryPairRules.filter((rule) => rule.pair_id !== removed?.id),
@@ -1053,38 +1315,43 @@ export function VietmaxApp() {
   }
 
   function updateInventoryDefaults(update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) {
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), ...update });
+    updateWorkflow(profile, { ...inventoryOutputInvalidation(), ...update });
   }
 
   function addInventoryRule() {
     updateWorkflow(profile, {
-      ...purchaseOutputInvalidation(),
-      inventoryPairRules: [...inventoryPairRules, { source_col: 'M', operator: 'contains', value: '', pair_id: defaultInventoryPairId || inventoryPairs[0]?.id || '', enabled: true }],
+      ...inventoryOutputInvalidation(),
+      inventoryPairRules: [...inventoryPairRules, { source_col: 'M', operator: 'contains', value: '', pair_id: defaultInventoryPairId || inventoryPairs[0]?.id || '', enabled: true, priority: 1 }],
     });
   }
 
   function updateInventoryRule(index: number, update: Partial<InventoryRule>) {
     updateWorkflow(profile, {
-      ...purchaseOutputInvalidation(),
+      ...inventoryOutputInvalidation(),
       inventoryPairRules: inventoryPairRules.map((rule, rowIndex) => (rowIndex === index ? { ...rule, ...update } : rule)),
     });
   }
 
   function removeInventoryRule(index: number) {
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), inventoryPairRules: inventoryPairRules.filter((_, rowIndex) => rowIndex !== index) });
+    updateWorkflow(profile, { ...inventoryOutputInvalidation(), inventoryPairRules: inventoryPairRules.filter((_, rowIndex) => rowIndex !== index) });
+  }
+
+  function inventoryOutputInvalidation() {
+    return stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
   }
 
   const nextStage = visibleStages[visibleStages.findIndex((item) => item.id === stage) + 1];
+  const nextDisabled = busy || !nextStage || (stage === 12 ? !(processedPurchaseSavedName && processedSalesSavedName) : !canEnterStage(nextStage.id));
 
   return (
     <main className="desktop-shell">
-      <section className={`app-card ${showLicenseBar ? '' : 'compact-flow'}`}>
+      <section className={`app-card ${showLicenseBar ? '' : 'compact-flow'} ${profile !== 'vietmax' ? 'legacy-flow' : ''}`}>
         <header className="app-header">
           <div className="profile-toolbar" aria-label="Company profile controls">
             <label className="profile-dropdown"><span>Công ty áp dụng</span><select value={profile} disabled={busy} onChange={(event) => changeProfile(event.currentTarget.value as ProfileKey)}>{profiles.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</select></label>
             <button type="button" className="btn-secondary" disabled={busy} onClick={saveCurrentConfig}>Lưu cấu hình</button>
           </div>
-          <StageNavigation stages={visibleStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
+          {profile === 'vietmax' && <StageNavigation stages={visibleStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />}
         </header>
 
         <div className="status-strip"><strong>Trạng thái</strong><span>{busy ? 'Đang xử lý... ' : ''}{status}</span></div>
@@ -1109,17 +1376,19 @@ export function VietmaxApp() {
         )}
 
         <section className="stage-frame">
-          <div className="stage-body">
+          <div className={`stage-body ${profile === 'vietmax' ? '' : 'legacy-stage-body'}`}>
             {profile !== 'vietmax' ? renderProfileStage() : renderVietmaxStage()}
           </div>
         </section>
 
-        <footer className="action-bar">
-          <button type="button" className="btn-secondary" disabled={stage === 1 || busy} onClick={goBack}>Quay lại</button>
-          <button type="button" className="btn-danger" disabled={busy} onClick={resetWorkflow}>Làm lại</button>
-          <div className="action-spacer" />
-          <button type="button" disabled={busy || !nextStage || !canEnterStage(nextStage.id)} onClick={goNext}>Tiếp tục</button>
-        </footer>
+        {profile === 'vietmax' && (
+          <footer className="action-bar">
+            <button type="button" className="btn-secondary" disabled={stage === 1 || busy} onClick={goBack}>Quay lại</button>
+            <button type="button" className="btn-danger" disabled={busy} onClick={resetWorkflow}>Làm lại</button>
+            <div className="action-spacer" />
+            <button type="button" disabled={nextDisabled} onClick={goNext}>Tiếp tục</button>
+          </footer>
+        )}
       </section>
     </main>
   );
@@ -1132,47 +1401,43 @@ export function VietmaxApp() {
         return <MappingStage summary={purchaseFile} phase="purchase" scope={comparisonScope} setScope={updateComparisonScope} />;
       case 3:
         if (busy && !companyRows.length) return <LoadingStage title="Đang tải danh sách công ty" detail="Đang đọc workbook và gom công ty/MST/hàng hóa..." />;
-        return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={prefixStrategy} prefixMstDigits={prefixMstDigits} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixStrategyChange={updatePrefixStrategy} onPrefixMstDigitsChange={updatePrefixMstDigits} onApplyPrefixPresetToAll={(strategy) => {
-            updateWorkflow(profile, {
-              companyRows: companyRows.map((company) => ({ ...company, value: computePresetPrefix(company, strategy, prefixMstDigits) })),
-            });
-          }} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={addInventoryPair} onInventoryPairChange={updateInventoryPair} onRemoveInventoryPair={removeInventoryPair} onInventoryDefaultsChange={updateInventoryDefaults} onAddInventoryRule={addInventoryRule} onInventoryRuleChange={updateInventoryRule} onRemoveInventoryRule={removeInventoryRule} />;
+        return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={addInventoryPair} onInventoryPairChange={updateInventoryPair} onRemoveInventoryPair={removeInventoryPair} onInventoryDefaultsChange={updateInventoryDefaults} onAddInventoryRule={addInventoryRule} onInventoryRuleChange={updateInventoryRule} onRemoveInventoryRule={removeInventoryRule} />;
       case 4:
-        if (busy) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." />;
-        return <ReviewStage rows={purchaseReviewRows} onRun={runPurchaseReview} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title="Review Mã VT mua vào" empty="Tạo danh sách review sau khi chọn cột và công ty. Backend dùng logic Vietmax từ mã vietmax.xlsx; khác biệt chỉ do hoa/thường hoặc khoảng trắng sẽ không xuất hiện ở đây." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
+        if (busy || !purchaseReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." progress={loadingProgress} />;
+        return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title="Review Mã VT mua vào" empty="Không có dòng Mã VT cần review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
       case 5:
         if (busy) return <LoadingStage title="Đang tạo file mua vào" detail="Đang xử lý workbook và tạo cache file mua vào để dùng cho các stage bán ra..." />;
         return <ProcessStage title="Tạo file mua vào" detail="Xuất file mua vào bằng logic Vietmax. Chỉ các công ty/hàng hóa đã chọn và các dòng Review Mã VT được tick mới tạo manual override. File đã xử lý sẽ được cache để dùng cho các stage bán ra." buttonLabel="Xuất file mua vào" disabled={busy || !purchaseFile} onProcess={downloadProcessedPurchase} />;
       case 6:
-        return <UploadStage title="HD bán ra" summary={salesFile} disabled={busy || !licenseReady} onUpload={(file) => upload('sales', file)} />;
+        return <SalesEntryStage salesFile={salesFile} processedPurchaseReady={Boolean(processedPurchaseSavedName)} processedPurchaseStats={processedPurchaseStats} disabled={busy || !licenseReady} onSalesUpload={(file) => upload('sales', file)} onProcessedPurchaseUpload={(file) => uploadProcessed('purchase', file)} />;
       case 7:
         return <MappingStage summary={salesFile} phase="sales" scope={comparisonScope} setScope={updateComparisonScope} />;
       case 8:
-        if (busy) return <LoadingStage title="Đang khớp mua vào / bán ra" detail={processedPurchaseSavedName ? 'Đang so sánh hàng bán ra với file mua vào đã xử lý và áp dụng cấu hình khớp đã lưu...' : 'Đang tạo cache mua vào rồi khớp với file bán ra...'} />;
-        return <MatchStage rows={matches} disabled={!salesFile || busy} onRun={runSalesMatch} onSave={saveMatchChoices} onToggle={toggleMatch} onBulkToggle={bulkToggleMatches} onConversionChange={updateMatchConversion} autoRun={Boolean(salesFile) && matches.length === 0 && !busy && !salesMatchGenerated} emptyMessage={processedPurchaseSavedName ? undefined : 'Chưa có cache file mua vào đã xử lý. Ứng dụng sẽ tự tạo cache trước khi khớp mua/bán.'} />;
+        if (busy) return <LoadingStage title="Đang khớp mua vào / bán ra" detail={processedPurchaseSavedName ? 'Đang so sánh hàng bán ra với file mua vào đã xử lý và áp dụng cấu hình khớp đã lưu...' : 'Đang tạo cache mua vào rồi khớp với file bán ra...'} progress={loadingProgress} />;
+        return <MatchStage rows={matches} disabled={!salesFile || busy || (!purchaseFile && !processedPurchaseSavedName)} onRun={runSalesMatch} onSave={saveMatchChoices} onToggle={toggleMatch} onBulkToggle={bulkToggleMatches} onConversionChange={updateMatchConversion} autoRun={Boolean(salesFile && (purchaseFile || processedPurchaseSavedName)) && matches.length === 0 && !busy} emptyMessage={processedPurchaseSavedName || purchaseFile ? undefined : 'Cần tải file mua vào đã xử lý trước khi khớp mua/bán.'} />;
       case 9:
         if (busy && !salesCompanyRows.length) return <LoadingStage title="Đang tải danh sách công ty bán ra" detail="Đang lọc các hàng hóa chưa khớp KHH/152 và gom theo công ty..." />;
-        return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={prefixStrategy} prefixMstDigits={prefixMstDigits} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixStrategyChange={updatePrefixStrategy} onPrefixMstDigitsChange={updatePrefixMstDigits} onApplyPrefixPresetToAll={(strategy) => {
-            updateWorkflow(profile, {
-              salesCompanyRows: salesCompanyRows.map((company) => ({ ...company, value: computePresetPrefix(company, strategy, prefixMstDigits) })),
-            });
-          }} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={addInventoryPair} onInventoryPairChange={updateInventoryPair} onRemoveInventoryPair={removeInventoryPair} onInventoryDefaultsChange={updateInventoryDefaults} onAddInventoryRule={addInventoryRule} onInventoryRuleChange={updateInventoryRule} onRemoveInventoryRule={removeInventoryRule} />;
+        return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={salesPrefixStrategy} prefixMstDigits={prefixMstDigits} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onApplyPrefixPresetToAll={applySalesPrefixPreset} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={addInventoryPair} onInventoryPairChange={updateInventoryPair} onRemoveInventoryPair={removeInventoryPair} onInventoryDefaultsChange={updateInventoryDefaults} onAddInventoryRule={addInventoryRule} onInventoryRuleChange={updateInventoryRule} onRemoveInventoryRule={removeInventoryRule} />;
       case 10:
-        if (busy) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." />;
-        return <ReviewStage rows={salesReviewRows} onRun={runSalesReview} onApply={applySalesReviewChoices} disabled={!salesFile || busy} onRowChange={updateSalesReviewRow} onBulkChange={bulkUpdateSalesReviewRows} title="Review Mã VT bán ra" empty="Tạo danh sách review sau khi chọn công ty bán ra. Chỉ hàng hóa/công ty đã chọn mới được đưa vào review và xuất Excel." reviewScope={salesReviewScope} onReviewScopeChange={updateSalesReviewScope} />;
+        if (busy || !salesReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." progress={loadingProgress} />;
+        return <ReviewStage rows={salesReviewRows} onApply={applySalesReviewChoices} disabled={!salesFile || busy} onRowChange={updateSalesReviewRow} onBulkChange={bulkUpdateSalesReviewRows} title="Review Mã VT bán ra" empty="Không có dòng Mã VT bán ra cần review." reviewScope={salesReviewScope} onReviewScopeChange={updateSalesReviewScope} />;
       case 11:
         if (busy) return <LoadingStage title="Đang tạo file bán ra" detail="Đang xử lý workbook bán ra, áp dụng khớp mua vào và lưu cache cho phân bổ tồn kho..." />;
         return <ProcessStage title="Tạo file bán ra" detail="Xuất file bán ra bằng logic Vietmax. Chỉ công ty/hàng hóa đã chọn và dòng Review bán ra được tick mới áp dụng gộp tên hàng." buttonLabel="Xuất file bán ra" disabled={busy || !salesFile} onProcess={downloadProcessedSales} />;
       case 12:
-        if (busy) return <LoadingStage title="Đang phân bổ tồn kho" detail={inventoryAllocationJob?.label || 'Đang chạy phân bổ từ file mua vào và bán ra đã xử lý...'} />;
-        return <InventoryAllocationStage purchaseFile={purchaseFile} salesFile={salesFile} processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} openingStockFile={openingStockFile} config={inventoryAllocationConfig} job={inventoryAllocationJob} result={inventoryAllocationResult} busy={busy} onOpeningStockFileChange={updateOpeningStockFile} onConfigChange={updateInventoryAllocationConfig} onProcess={runInventoryAllocation} onDownload={downloadInventoryReport} />;
+        if (isInventoryAllocationRunning(inventoryAllocationJob)) return <LoadingStage title="Đang phân bổ tồn kho" detail={inventoryAllocationJob?.label || 'Đang chạy phân bổ từ file mua vào và bán ra đã xử lý...'} progress={inventoryJobProgress(inventoryAllocationJob)} />;
+        return <InventoryAllocationStage purchaseFile={purchaseFile} salesFile={salesFile} processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} processedPurchaseStats={processedPurchaseStats} processedSalesStats={processedSalesStats} openingStockFile={openingStockFile} config={inventoryAllocationConfig} busy={busy} onProcessedPurchaseFileChange={(file) => uploadProcessed('purchase', file)} onProcessedSalesFileChange={(file) => uploadProcessed('sales', file)} onOpeningStockFileChange={updateOpeningStockFile} onConfigChange={updateInventoryAllocationConfig} />;
+      case 13:
+        return <InventoryAllocationReportStage result={inventoryAllocationResult ?? inventoryAllocationJob?.result ?? null} busy={busy} />;
+      case 14:
+        return <InventoryAllocationExportStage result={inventoryAllocationResult ?? inventoryAllocationJob?.result ?? null} busy={busy} onDownload={downloadInventoryReport} />;
       default:
         return null;
     }
   }
 
   function renderProfileStage() {
-    return <ProfilePlaceholder profile={selectedProfile.label} stage={currentStage} />;
+    return <LegacyProfileWorkspace profile={profile} label={selectedProfile.label} licenseReady={licenseReady} />;
   }
 }
 
@@ -1247,6 +1512,44 @@ function UploadStage({ title, summary, disabled, onUpload }: { title: string; su
   );
 }
 
+function SalesEntryStage({ salesFile, processedPurchaseReady, processedPurchaseStats, disabled, onSalesUpload, onProcessedPurchaseUpload }: { salesFile: UploadSummary | null; processedPurchaseReady: boolean; processedPurchaseStats: ProcessedFileStats | null; disabled: boolean; onSalesUpload: (file: File | undefined) => void; onProcessedPurchaseUpload: (file: File | undefined) => void }) {
+  return (
+    <div className="skip-entry-stage">
+      <section className="skip-required-panel">
+        <div className="stage-toolbar">
+          <h3>Bỏ qua mua vào</h3>
+          <p>Upload file mua vào đã xử lý trước khi chạy các bước bán ra.</p>
+        </div>
+        <ProcessedFileUpload label="Mua vào đã xử lý" ready={processedPurchaseReady} stats={processedPurchaseStats} disabled={disabled} onUpload={onProcessedPurchaseUpload} />
+      </section>
+      <UploadStage title="HD bán ra" summary={salesFile} disabled={disabled} onUpload={onSalesUpload} />
+    </div>
+  );
+}
+
+function ProcessedFileUpload({ label, ready, stats, disabled, onUpload }: { label: string; ready: boolean; stats: ProcessedFileStats | null; disabled: boolean; onUpload: (file: File | undefined) => void }) {
+  return (
+    <label className={`processed-file-upload ${ready ? 'has-file' : ''}`}>
+      <input className="upload-input" type="file" accept=".xlsx,.xlsm" disabled={disabled} onChange={(event) => onUpload(event.currentTarget.files?.[0])} />
+      <span className="upload-mark">FDI</span>
+      <strong>{ready ? `${label} đã sẵn sàng` : `Chọn ${label}`}</strong>
+      <small>{ready ? 'Có thể dùng file này cho stage sau.' : 'Bắt buộc khi bỏ qua các stage xử lý trước đó.'}</small>
+      <ProcessedStatsSummary stats={stats} />
+      <span className="upload-button">{ready ? `Đổi ${label}` : `Tải ${label}`}</span>
+    </label>
+  );
+}
+
+function ProcessedStatsSummary({ stats }: { stats: ProcessedFileStats | null }) {
+  if (!stats) return <div className="processed-stats muted">Chưa có thống kê file đã xử lý.</div>;
+  return (
+    <div className="processed-stats">
+      <span>Công ty <strong>{formatCount(stats.processed_company_count)} / {formatCount(stats.company_count)}</strong></span>
+      <span>Dòng hàng <strong>{formatCount(stats.processed_product_row_count)} / {formatCount(stats.product_row_count)}</strong></span>
+    </div>
+  );
+}
+
 function MappingStage({ summary, phase, scope, setScope }: { summary: UploadSummary | null; phase: 'purchase' | 'sales'; scope: string; setScope: (value: string) => void }) {
   if (!summary) return <PlaceholderStage title="Chưa có file" detail="Quay lại stage tải file trước khi chọn cột." />;
   const previewKeys = summary.preview.length ? Object.keys(summary.preview[0]) : [];
@@ -1269,7 +1572,7 @@ function MappingStage({ summary, phase, scope, setScope }: { summary: UploadSumm
   );
 }
 
-function ReviewStage({ rows, onRun, onApply, onRowChange, onBulkChange, disabled = false, title = 'Review Mã VT mua vào', empty = 'Chưa có dòng review.', reviewScope = 'all', onReviewScopeChange }: { rows: ReviewRow[]; onRun?: () => void; onApply?: () => void; onRowChange?: (index: number, update: Partial<ReviewRow>) => void; onBulkChange?: (indices: number[], confirmed: boolean) => void; disabled?: boolean; title?: string; empty?: string; reviewScope?: 'all' | 'company'; onReviewScopeChange?: (scope: 'all' | 'company') => void }) {
+function ReviewStage({ rows, onApply, onRowChange, onBulkChange, disabled = false, title = 'Review Mã VT mua vào', empty = 'Chưa có dòng review.', reviewScope = 'all', onReviewScopeChange }: { rows: ReviewRow[]; onApply?: () => void; onRowChange?: (index: number, update: Partial<ReviewRow>) => void; onBulkChange?: (indices: number[], confirmed: boolean) => void; disabled?: boolean; title?: string; empty?: string; reviewScope?: 'all' | 'company'; onReviewScopeChange?: (scope: 'all' | 'company') => void }) {
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const groups = reviewDisplayGroups(rows, reviewScope);
   const dimensionIndices = groups[0]?.rows.map(({ index }) => index) ?? [];
@@ -1309,7 +1612,6 @@ function ReviewStage({ rows, onRun, onApply, onRowChange, onBulkChange, disabled
             </div>
           </div>
           <div className="review-primary-actions">
-            {onRun && <button type="button" disabled={disabled} onClick={onRun}>Tạo danh sách review</button>}
             {onApply && <button type="button" disabled={disabled || !rows.length} onClick={onApply}>Áp dụng Review Mã VT</button>}
           </div>
         </div>
@@ -1352,11 +1654,6 @@ function MatchStage({ rows, disabled, onRun, onSave, onToggle, onBulkToggle, onC
 function ConfigModal({
   isOpen,
   onClose,
-  prefixStrategy,
-  prefixMstDigits,
-  onPrefixStrategyChange,
-  onPrefixMstDigitsChange,
-  onApplyPrefixPreset,
   wordRules,
   repeatedPhrases,
   inventoryPairs,
@@ -1380,11 +1677,6 @@ function ConfigModal({
 }: {
   isOpen: boolean;
   onClose: () => void;
-  prefixStrategy: string;
-  prefixMstDigits: number;
-  onPrefixStrategyChange?: (strategy: string) => void;
-  onPrefixMstDigitsChange?: (digits: number) => void;
-  onApplyPrefixPreset?: (strategy: 'last_2_words' | 'last_3_mst' | '2_words_mst') => void;
   wordRules: Record<string, string>;
   repeatedPhrases: string[];
   inventoryPairs: InventoryPair[];
@@ -1406,45 +1698,21 @@ function ConfigModal({
   onRefreshPreviews?: () => void;
   busy?: boolean;
 }) {
-  const [activeTab, setActiveTab] = useState<'prefix' | 'words' | 'repeat' | 'inventory'>('prefix');
+  const [activeTab, setActiveTab] = useState<'words' | 'repeat' | 'inventory'>('words');
   const wordEntries = Object.entries(wordRules);
-  const activePrefixStrategy = normalizedPrefixStrategy(prefixStrategy);
   if (!isOpen) return null;
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={e => e.stopPropagation()}>
+      <div className="modal-content advanced-config-modal" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <h2>Cấu hình nâng cao</h2>
           <button className="modal-close" onClick={onClose}>×</button>
         </div>
         <div className="modal-body">
           <div className="tab-list">
-            <button className={`tab-button ${activeTab === 'prefix' ? 'active' : ''}`} onClick={() => setActiveTab('prefix')}>Prefix</button>
             <button className={`tab-button ${activeTab === 'words' ? 'active' : ''}`} onClick={() => setActiveTab('words')}>Từ riêng</button>
             <button className={`tab-button ${activeTab === 'repeat' ? 'active' : ''}`} onClick={() => setActiveTab('repeat')}>Từ lặp</button>
             <button className={`tab-button ${activeTab === 'inventory' ? 'active' : ''}`} onClick={() => setActiveTab('inventory')}>Phân kho</button>
-          </div>
-          <div className={`tab-panel ${activeTab === 'prefix' ? 'active' : ''}`}>
-            <div className="stage-toolbar compact-toolbar"><p>Cấu hình prefix công ty</p></div>
-            <div className="prefix-config-panel">
-              <label className="prefix-choice">
-                <input type="radio" name="prefix-mode" checked={activePrefixStrategy === 'last_2_words'} onChange={() => onPrefixStrategyChange?.('last_2_words')} />
-                <span>2 từ</span>
-              </label>
-              <label className="prefix-choice">
-                <input type="radio" name="prefix-mode" checked={activePrefixStrategy === 'last_3_mst'} onChange={() => onPrefixStrategyChange?.('last_3_mst')} />
-                <span>MST</span>
-              </label>
-              <label className="prefix-choice">
-                <input type="radio" name="prefix-mode" checked={activePrefixStrategy === '2_words_mst'} onChange={() => onPrefixStrategyChange?.('2_words_mst')} />
-                <span>2 từ + MST</span>
-              </label>
-              <label className="prefix-mst-length">
-                <span>Số ký tự MST</span>
-                <input type="number" min={1} max={10} value={prefixMstDigits} disabled={activePrefixStrategy === 'last_2_words'} onChange={(event) => onPrefixMstDigitsChange?.(parseInt(event.currentTarget.value) || 3)} />
-              </label>
-            </div>
-            <div className="tab-apply-bar"><button type="button" disabled={busy} onClick={() => { onApplyPrefixPreset?.(activePrefixStrategy); }}>Áp dụng prefix</button></div>
           </div>
           <div className={`tab-panel ${activeTab === 'words' ? 'active' : ''}`}>
             <div className="stage-toolbar compact-toolbar"><p>Quy tắc thay từ</p><button type="button" className="btn-secondary" onClick={onAddWordRule}>Thêm từ</button></div>
@@ -1490,7 +1758,7 @@ type ReviewDisplayGroup = {
   className: string;
 };
 
-function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCodes, productCodeOverrides, wordRules, repeatedPhrases, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, busy, showCompanyPrefixControls = false, includeCompanyPrefix = false, prefixStrategy = 'last_2_words', prefixMstDigits = 3, onIncludeCompanyPrefixChange, onCompanyPrefixChange, onPrefixStrategyChange, onPrefixMstDigitsChange, onApplyPrefixPresetToAll, onCompanySelect, onCompanyChange, onBulkCompanyChange, onProductChange, onProductCodeChange, onApplyChoices, onRefreshPreviews, onWordRuleChange, onAddWordRule, onRepeatedChange, onAddRepeated, onRemoveRepeated, onAddInventoryPair, onInventoryPairChange, onRemoveInventoryPair, onInventoryDefaultsChange, onAddInventoryRule, onInventoryRuleChange, onRemoveInventoryRule }: { companies: CompanyRow[]; selectedCompanyIndex: number; productPreviewCodes: Record<string, string>; productCodeOverrides: Record<string, string>; wordRules: Record<string, string>; repeatedPhrases: string[]; inventoryPairs: InventoryPair[]; useDefaultInventoryPair: boolean; defaultInventoryPairId: string; inventoryPairRules: InventoryRule[]; busy: boolean; showCompanyPrefixControls?: boolean; includeCompanyPrefix?: boolean; prefixStrategy?: string; prefixMstDigits?: number; onIncludeCompanyPrefixChange?: (include: boolean) => void; onCompanyPrefixChange?: (index: number, value: string) => void; onPrefixStrategyChange?: (strategy: string) => void; onPrefixMstDigitsChange?: (digits: number) => void; onApplyPrefixPresetToAll?: (strategy: 'last_2_words' | 'last_3_mst' | '2_words_mst') => void; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onBulkCompanyChange?: (pending: boolean) => void; onProductChange: (companyIndex: number, productName: string, selected: boolean) => void; onProductCodeChange: (companyIndex: number, productName: string, code: string) => void; onApplyChoices: () => void; onRefreshPreviews: () => void; onWordRuleChange: (index: number, field: 'from' | 'to', value: string) => void; onAddWordRule: () => void; onRepeatedChange: (index: number, value: string) => void; onAddRepeated: () => void; onRemoveRepeated: (index: number) => void; onAddInventoryPair: () => void; onInventoryPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void; onRemoveInventoryPair: (index: number) => void; onInventoryDefaultsChange: (update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) => void; onAddInventoryRule: () => void; onInventoryRuleChange: (index: number, update: Partial<InventoryRule>) => void; onRemoveInventoryRule: (index: number) => void }) {
+function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCodes, productCodeOverrides, wordRules, repeatedPhrases, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, busy, showCompanyPrefixControls = false, includeCompanyPrefix = false, prefixStrategy = 'last_2_words', prefixMstDigits = 3, onIncludeCompanyPrefixChange, onCompanyPrefixChange, onPrefixMstDigitsChange, onApplyPrefixPresetToAll, onCompanySelect, onCompanyChange, onBulkCompanyChange, onProductChange, onProductCodeChange, onApplyChoices, onRefreshPreviews, onWordRuleChange, onAddWordRule, onRepeatedChange, onAddRepeated, onRemoveRepeated, onAddInventoryPair, onInventoryPairChange, onRemoveInventoryPair, onInventoryDefaultsChange, onAddInventoryRule, onInventoryRuleChange, onRemoveInventoryRule }: { companies: CompanyRow[]; selectedCompanyIndex: number; productPreviewCodes: Record<string, string>; productCodeOverrides: Record<string, string>; wordRules: Record<string, string>; repeatedPhrases: string[]; inventoryPairs: InventoryPair[]; useDefaultInventoryPair: boolean; defaultInventoryPairId: string; inventoryPairRules: InventoryRule[]; busy: boolean; showCompanyPrefixControls?: boolean; includeCompanyPrefix?: boolean; prefixStrategy?: string; prefixMstDigits?: number; onIncludeCompanyPrefixChange?: (include: boolean) => void; onCompanyPrefixChange?: (index: number, value: string) => void; onPrefixMstDigitsChange?: (digits: number) => void; onApplyPrefixPresetToAll?: (strategy: PrefixPresetStrategy) => void; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onBulkCompanyChange?: (pending: boolean) => void; onProductChange: (companyIndex: number, productName: string, selected: boolean) => void; onProductCodeChange: (companyIndex: number, productName: string, code: string) => void; onApplyChoices: () => void; onRefreshPreviews: () => void; onWordRuleChange: (index: number, field: 'from' | 'to', value: string) => void; onAddWordRule: () => void; onRepeatedChange: (index: number, value: string) => void; onAddRepeated: () => void; onRemoveRepeated: (index: number) => void; onAddInventoryPair: () => void; onInventoryPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void; onRemoveInventoryPair: (index: number) => void; onInventoryDefaultsChange: (update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) => void; onAddInventoryRule: () => void; onInventoryRuleChange: (index: number, update: Partial<InventoryRule>) => void; onRemoveInventoryRule: (index: number) => void }) {
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState({ wordRules: true, repeatedPhrases: true });
   const wordEntries = Object.entries(wordRules);
@@ -1535,23 +1803,14 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
           <label className="inline-check"><input type="checkbox" checked={includeCompanyPrefix} onChange={(event) => onIncludeCompanyPrefixChange?.(event.currentTarget.checked)} /> Dùng prefix công ty</label>
           {includeCompanyPrefix && <>
             <div className="prefix-strategy-row">
-              <label>Chiến lược prefix:</label>
-              <select value={activePrefixStrategy} onChange={(event) => onPrefixStrategyChange?.(event.currentTarget.value)}>
-                <option value="last_2_words">2 chữ cuối (bỏ tỉnh/VN)</option>
-                <option value="last_3_mst">{prefixMstDigits} số cuối MST</option>
-                <option value="2_words_mst">2 chữ + {prefixMstDigits} số MST</option>
-              </select>
-              {(activePrefixStrategy === 'last_3_mst' || activePrefixStrategy === '2_words_mst') && <>
-                <label>Số ký tự MST:</label>
-                <input type="number" min={1} max={10} value={prefixMstDigits} onChange={(event) => onPrefixMstDigitsChange?.(parseInt(event.currentTarget.value) || 3)} />
-              </>}
+              <label>Số ký tự MST:</label>
+              <input type="number" min={1} max={10} value={prefixMstDigits} onChange={(event) => onPrefixMstDigitsChange?.(parseInt(event.currentTarget.value) || 3)} />
             </div>
             <div className="prefix-quick-actions">
-              <button type="button" className="prefix-apply-all-button" disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('last_2_words')}>Áp 2 từ</button>
-              <button type="button" className="prefix-apply-all-button" disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('last_3_mst')}>Áp MST</button>
-              <button type="button" className="prefix-apply-all-button" disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('2_words_mst')}>Áp 2 từ + MST</button>
+              <button type="button" className={`prefix-apply-all-button ${activePrefixStrategy === 'last_2_words' ? 'active' : ''}`} disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('last_2_words')}>Áp 2 từ</button>
+              <button type="button" className={`prefix-apply-all-button ${activePrefixStrategy === 'last_3_mst' ? 'active' : ''}`} disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('last_3_mst')}>Áp MST</button>
+              <button type="button" className={`prefix-apply-all-button ${activePrefixStrategy === '2_words_mst' ? 'active' : ''}`} disabled={busy || !companies.length} onClick={() => onApplyPrefixPresetToAll?.('2_words_mst')}>Áp 2 từ + MST</button>
             </div>
-            <p className="muted">Sửa 3 prefix trong modal Cấu hình nâng cao. Danh sách chỉ sắp lại khi bấm Áp dụng lựa chọn công ty và hàng hóa.</p>
           </>}
         </section>}
       </div>
@@ -1559,11 +1818,6 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
       <ConfigModal 
         isOpen={showConfigModal} 
         onClose={() => setShowConfigModal(false)} 
-        prefixStrategy={activePrefixStrategy}
-        prefixMstDigits={prefixMstDigits}
-        onPrefixStrategyChange={onPrefixStrategyChange}
-        onPrefixMstDigitsChange={onPrefixMstDigitsChange}
-        onApplyPrefixPreset={onApplyPrefixPresetToAll}
         wordRules={wordRules}
         repeatedPhrases={repeatedPhrases}
         inventoryPairs={inventoryPairs}
@@ -1593,7 +1847,7 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
             <div className="company-list-actions">
               <button type="button" className="btn-secondary" disabled={busy || !companies.length} onClick={() => onBulkCompanyChange?.(true)}>Chọn tất cả</button>
               <button type="button" className="btn-secondary" disabled={busy || !companies.length} onClick={() => onBulkCompanyChange?.(false)}>Bỏ chọn tất cả</button>
-              <button type="button" disabled={busy || !companies.length} onClick={onApplyChoices}>Áp dụng lựa chọn công ty và hàng hóa</button>
+              <button type="button" disabled={busy || !companies.length} onClick={() => onApplyChoices()}>Áp dụng lựa chọn công ty và hàng hóa</button>
             </div>
           </div>
           {duplicatePrefixes.length > 0 && (
@@ -1631,12 +1885,13 @@ function CompanyGroupRows({ group, safeSelectedIndex, showPrefix = false, onComp
   return <>{<tr className={`company-section-row ${group.className}`}><td colSpan={showPrefix ? 5 : 4}>{group.title} ({group.rows.length})</td></tr>}{group.rows.map(({ company, index }) => {
     const pending = company.pending_process ?? company.process ?? true;
     const selectedCount = company.selected_product_names.length || company.all_products.length;
-    return <tr key={`${company.mst}-${index}`} className={`big-select-row ${group.className === 'duplicate-section' ? 'duplicate-company-row' : ''} ${index === safeSelectedIndex ? 'selected-row' : ''}`} onClick={() => onCompanySelect(index)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={pending} onChange={(event) => onCompanyChange(index, event.currentTarget.checked)} /></td><td>{company.company}</td><td>{company.mst}</td>{showPrefix && <td onClick={(event) => event.stopPropagation()}><input className="company-prefix-input" value={company.value || ''} onChange={(event) => onCompanyPrefixChange?.(index, event.currentTarget.value)} /></td>}<td>{selectedCount} / {company.all_products.length}</td></tr>;
+    return <tr key={companyRowKey(company, index)} className={`big-select-row ${group.className === 'duplicate-section' ? 'duplicate-company-row' : ''} ${index === safeSelectedIndex ? 'selected-row' : ''}`} onClick={() => onCompanySelect(index)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={pending} onChange={(event) => onCompanyChange(index, event.currentTarget.checked)} /></td><td>{company.company}</td><td>{company.mst}</td>{showPrefix && <td onClick={(event) => event.stopPropagation()}><input className="company-prefix-input" value={company.value || ''} onChange={(event) => onCompanyPrefixChange?.(index, event.currentTarget.value)} /></td>}<td>{selectedCount} / {company.all_products.length}</td></tr>;
   })}</>;
 }
 
 function InventoryPairEditor({ pairs, useDefault, defaultPairId, rules, busy, onAddPair, onPairChange, onRemovePair, onDefaultsChange, onAddRule, onRuleChange, onRemoveRule }: { pairs: InventoryPair[]; useDefault: boolean; defaultPairId: string; rules: InventoryRule[]; busy: boolean; onAddPair: () => void; onPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void; onRemovePair: (index: number) => void; onDefaultsChange: (update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) => void; onAddRule: () => void; onRuleChange: (index: number, update: Partial<InventoryRule>) => void; onRemoveRule: (index: number) => void }) {
   const [collapsed, setCollapsed] = useState(false);
+  const overlapWarnings = inventoryRuleOverlapWarnings(rules);
   return (
     <section className={`inventory-editor ${collapsed ? 'collapsed' : ''}`}>
       <div className="inventory-editor-header">
@@ -1655,7 +1910,8 @@ function InventoryPairEditor({ pairs, useDefault, defaultPairId, rules, busy, on
         </div>
         <div className="inventory-card">
           <div className="inventory-card-title"><span>Quy tắc gán cặp</span><button type="button" className="btn-secondary" disabled={busy || !pairs.length} onClick={onAddRule}>Thêm quy tắc</button></div>
-          <div className="inventory-table-scroll"><table className="inventory-table inventory-rule-table"><thead><tr><th>Bật</th><th>Cột nguồn</th><th>So sánh</th><th>Giá trị</th><th>Cặp gán</th><th></th></tr></thead><tbody>{rules.length ? rules.map((rule, index) => <tr key={`${rule.source_col}-${index}`}><td><input type="checkbox" checked={rule.enabled !== false} onChange={(event) => onRuleChange(index, { enabled: event.currentTarget.checked })} /></td><td><input value={rule.source_col} onChange={(event) => onRuleChange(index, { source_col: event.currentTarget.value.toUpperCase() })} /></td><td><select value={rule.operator || 'contains'} onChange={(event) => onRuleChange(index, { operator: event.currentTarget.value })}><option value="contains">Chứa</option><option value="equals">Bằng</option></select></td><td><input value={rule.value} onChange={(event) => onRuleChange(index, { value: event.currentTarget.value })} /></td><td><select value={rule.pair_id} onChange={(event) => onRuleChange(index, { pair_id: event.currentTarget.value })}><option value="">Chọn cặp</option>{pairs.map((pair) => <option key={pair.id} value={pair.id}>{pairLabel(pair)}</option>)}</select></td><td><button type="button" className="btn-secondary compact-table-button" disabled={busy} onClick={() => onRemoveRule(index)}>Xóa</button></td></tr>) : <tr><td colSpan={6} className="muted">Không có quy tắc. Nếu không bật mặc định, dòng không khớp sẽ để trống Mã kho/TK vật tư.</td></tr>}</tbody></table></div>
+          {overlapWarnings.length > 0 && <div className="inventory-rule-warning"><strong>Cảnh báo quy tắc chồng chữ</strong>{overlapWarnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
+          <div className="inventory-table-scroll"><table className="inventory-table inventory-rule-table"><thead><tr><th>Bật</th><th>Ưu tiên</th><th>Cột nguồn</th><th>So sánh</th><th>Giá trị</th><th>Cặp gán</th><th></th></tr></thead><tbody>{rules.length ? rules.map((rule, index) => <tr key={`${rule.source_col}-${index}`}><td><input type="checkbox" checked={rule.enabled !== false} onChange={(event) => onRuleChange(index, { enabled: event.currentTarget.checked })} /></td><td><input className="priority-input" type="number" value={rule.priority ?? 0} onChange={(event) => onRuleChange(index, { priority: Number(event.currentTarget.value) || 0 })} /></td><td><input value={rule.source_col} onChange={(event) => onRuleChange(index, { source_col: event.currentTarget.value.toUpperCase() })} /></td><td><select value={rule.operator || 'contains'} onChange={(event) => onRuleChange(index, { operator: event.currentTarget.value })}><option value="contains">Chứa</option><option value="equals">Bằng</option></select></td><td><input value={rule.value} onChange={(event) => onRuleChange(index, { value: event.currentTarget.value })} /></td><td><select value={rule.pair_id} onChange={(event) => onRuleChange(index, { pair_id: event.currentTarget.value })}><option value="">Chọn cặp</option>{pairs.map((pair) => <option key={pair.id} value={pair.id}>{pairLabel(pair)}</option>)}</select></td><td><button type="button" className="btn-secondary compact-table-button" disabled={busy} onClick={() => onRemoveRule(index)}>Xóa</button></td></tr>) : <tr><td colSpan={7} className="muted">Không có quy tắc. Nếu không bật mặc định, dòng không khớp sẽ để trống Mã kho/TK vật tư.</td></tr>}</tbody></table></div>
         </div>
       </div>}
     </section>
@@ -1666,7 +1922,137 @@ function pairLabel(pair: InventoryPair) {
   return `${pair.ma_kho || 'Mã kho?'} / ${pair.tk_vat_tu || 'TK?'}`;
 }
 
-function computeCustomPrefix(company: CompanyRow, option: CustomPrefixOption): string {
+function normalizedInventoryRuleValue(value: string) {
+  return simpleMatchText(value);
+}
+
+function inventoryRulePriorityValue(rule: InventoryRule) {
+  return Number.isFinite(Number(rule.priority)) ? Number(rule.priority) : 0;
+}
+
+function inventoryRuleOverlapWarnings(rules: InventoryRule[]) {
+  const warnings: string[] = [];
+  const activeRules = rules
+    .map((rule, index) => ({ rule, index, value: normalizedInventoryRuleValue(rule.value) }))
+    .filter((item) => item.rule.enabled !== false && item.rule.operator !== 'equals' && item.rule.source_col.trim() && item.value);
+  for (let i = 0; i < activeRules.length; i += 1) {
+    for (let j = i + 1; j < activeRules.length; j += 1) {
+      const left = activeRules[i];
+      const right = activeRules[j];
+      if (left.rule.source_col.trim().toUpperCase() !== right.rule.source_col.trim().toUpperCase()) continue;
+      if (left.value !== right.value && !left.value.includes(right.value) && !right.value.includes(left.value)) continue;
+      const leftPriority = inventoryRulePriorityValue(left.rule);
+      const rightPriority = inventoryRulePriorityValue(right.rule);
+      const winner = leftPriority === rightPriority ? `rule #${Math.min(left.index, right.index) + 1} do đứng trước` : `rule ưu tiên ${Math.max(leftPriority, rightPriority)}`;
+      warnings.push(`Rule #${left.index + 1} "${left.rule.value}" chồng với rule #${right.index + 1} "${right.rule.value}" trên cột ${left.rule.source_col}. Dòng khớp cả hai sẽ dùng ${winner}.`);
+    }
+  }
+  return warnings.slice(0, 5);
+}
+
+function emptyPrefixStrategyValues(): PrefixStrategyValues {
+  return {
+    last_2_words: {},
+    last_3_mst: {},
+    '2_words_mst': {},
+  };
+}
+
+function companyRowKey(company: CompanyRow, fallbackIndex = 0): string {
+  return company.safe_id || `${company.mst || 'no-mst'}-${company.company || 'company'}-${fallbackIndex}`;
+}
+
+function prefixMemoryKey(company: CompanyRow): string {
+  return company.mst || company.safe_id || company.company;
+}
+
+function clampPrefixMstDigits(value: unknown): number {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return 3;
+  return Math.max(1, Math.min(10, Math.trunc(numberValue)));
+}
+
+function normalizePrefixStrategyValues(raw: Record<string, Record<string, string>> | undefined, fallback?: PrefixStrategyValues): PrefixStrategyValues {
+  const next = emptyPrefixStrategyValues();
+  const source = raw && typeof raw === 'object' ? raw : fallback;
+  (Object.keys(next) as PrefixPresetStrategy[]).forEach((strategy) => {
+    const values = source?.[strategy];
+    if (!values || typeof values !== 'object') return;
+    next[strategy] = Object.fromEntries(
+      Object.entries(values)
+        .filter(([key, value]) => key && value != null)
+        .map(([key, value]) => [key, normalizePrefixValue(value)]),
+    );
+  });
+  return next;
+}
+
+function normalizePrefixValue(value: unknown): string {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function rememberPrefixEdit(values: PrefixStrategyValues, strategy: PrefixPresetStrategy, company: CompanyRow, value: string, mstDigits: number): PrefixStrategyValues {
+  const next = rememberManualPrefixValues(values, strategy, [company], mstDigits, { [prefixMemoryKey(company)]: value });
+  return next;
+}
+
+function rememberManualPrefixValues(values: PrefixStrategyValues, strategy: PrefixPresetStrategy, rows: CompanyRow[], mstDigits: number, overrides: Record<string, string> = {}): PrefixStrategyValues {
+  const next = {
+    ...emptyPrefixStrategyValues(),
+    ...values,
+    [strategy]: { ...(values[strategy] ?? {}) },
+  };
+  rows.forEach((company) => {
+    const key = prefixMemoryKey(company);
+    const value = normalizePrefixValue(Object.prototype.hasOwnProperty.call(overrides, key) ? overrides[key] : company.value);
+    const computed = normalizePrefixValue(computePresetPrefix(company, strategy, mstDigits));
+    if (value === computed) {
+      delete next[strategy][key];
+    } else {
+      next[strategy][key] = value;
+    }
+  });
+  return next;
+}
+
+function seedLoadedPrefixValues(values: PrefixStrategyValues, strategy: PrefixPresetStrategy, rows: CompanyRow[], mstDigits: number): PrefixStrategyValues {
+  const next = {
+    ...emptyPrefixStrategyValues(),
+    ...values,
+    [strategy]: { ...(values[strategy] ?? {}) },
+  };
+  rows.forEach((company) => {
+    const key = prefixMemoryKey(company);
+    if (Object.prototype.hasOwnProperty.call(next[strategy], key)) return;
+    const loaded = normalizePrefixValue(company.value);
+    if (!loaded) return;
+    const computed = normalizePrefixValue(computePresetPrefix(company, strategy, mstDigits));
+    const defaultPrefix = normalizePrefixValue(company.default_prefix || company.prefix_strategies?.last_2_words || computePresetPrefix(company, 'last_2_words', mstDigits));
+    if (loaded !== computed && loaded !== defaultPrefix) {
+      next[strategy][key] = loaded;
+    }
+  });
+  return next;
+}
+
+function applyPrefixStrategyRows(rows: CompanyRow[], strategy: PrefixPresetStrategy, mstDigits: number, values: PrefixStrategyValues, commit = false): CompanyRow[] {
+  const strategyValues = values[strategy] ?? {};
+  return rows.map((company) => {
+    const key = prefixMemoryKey(company);
+    const savedValue = Object.prototype.hasOwnProperty.call(strategyValues, key) ? strategyValues[key] : undefined;
+    const value = savedValue ?? computePresetPrefix(company, strategy, mstDigits);
+    return { ...company, value, ...(commit ? { committed_prefix: normalizePrefixValue(value) } : {}) };
+  });
+}
+
+function scrollStageBodyToTop() {
+  window.requestAnimationFrame(() => {
+    const body = document.querySelector('.stage-body');
+    if (body instanceof HTMLElement) body.scrollTo({ top: 0, left: 0 });
+  });
+}
+
+function computeCustomPrefix(company: CompanyRow, option: { name?: string; formula: string; chars: number; mstDigits?: number }): string {
   const provinceNames = new Set(['HÀ NỘI', 'HỒ CHÍ MINH', 'ĐÀ NẴNG', 'HẢI PHÒNG', 'CẦN THƠ', 'VIỆT NAM', 'Viet Nam', 'VIET NAM']);
   const words = company.company.split(/\s+/).filter((word) => word.length > 0);
   const filtered = words.filter((word) => !provinceNames.has(word));
@@ -1678,7 +2064,7 @@ function computeCustomPrefix(company: CompanyRow, option: CustomPrefixOption): s
   return initials + mstDigits;
 }
 
-function computePresetPrefix(company: CompanyRow, strategy: 'last_2_words' | 'last_3_mst' | '2_words_mst', mstDigits = 3): string {
+function computePresetPrefix(company: CompanyRow, strategy: PrefixPresetStrategy, mstDigits = 3): string {
   const digits = Math.max(1, Math.min(10, mstDigits));
   const mstSuffix = (company.mst || '').slice(-digits);
   const wordsPrefix = company.prefix_strategies?.last_2_words || computeCustomPrefix(company, { name: '2 words', formula: 'initials', chars: 2 });
@@ -1687,7 +2073,7 @@ function computePresetPrefix(company: CompanyRow, strategy: 'last_2_words' | 'la
   return wordsPrefix;
 }
 
-function normalizedPrefixStrategy(strategy: string): 'last_2_words' | 'last_3_mst' | '2_words_mst' {
+function normalizedPrefixStrategy(strategy: string): PrefixPresetStrategy {
   return strategy === 'last_3_mst' || strategy === '2_words_mst' ? strategy : 'last_2_words';
 }
 
@@ -1768,15 +2154,70 @@ function PlaceholderStage({ title, detail }: { title: string; detail: string }) 
   return <div className="placeholder-stage"><h3>{title}</h3><p>{detail}</p></div>;
 }
 
-function LoadingStage({ title, detail }: { title: string; detail: string }) {
-  return <div className="loading-stage"><div className="loading-spinner" aria-hidden="true" /><h3>{title}</h3><p>{detail}</p></div>;
+function isInventoryAllocationRunning(job: InventoryAllocationJob | null): boolean {
+  const status = String(job?.status || '').toLowerCase();
+  return status === 'queued' || status === 'running';
 }
 
-function ProfilePlaceholder({ profile, stage }: { profile: string; stage: StageDefinition }) {
-  const detail = stage.phase === 'price'
-    ? 'Cao Thành có stage lọc đơn giá trong PySide. React chỉ hiển thị shell đúng luồng, chưa gọi backend cho stage này.'
-    : 'Shell này phản ánh luồng PySide hiện tại. API React chưa migrate profile này, nên nội dung là placeholder an toàn và không giả lập xử lý.';
-  return <PlaceholderStage title={`${profile}: ${stage.label}`} detail={detail} />;
+function inventoryJobProgress(job: InventoryAllocationJob | null): OperationProgress | null {
+  if (!job) return null;
+  const done = Math.max(0, Number(job.done ?? 0));
+  const total = Math.max(0, Number(job.total ?? 0));
+  const percent = total > 0 ? Math.round((Math.min(done, total) / total) * 100) : Math.max(0, Math.min(100, Number(job.progress ?? 0)));
+  return {
+    operation_id: 'inventory-allocation',
+    status: job.status || 'running',
+    done,
+    total,
+    percent,
+    label: job.label || 'Đang phân bổ tồn kho...',
+  };
+}
+
+function formatOperationStatus(progress: OperationProgress | null, fallback: string) {
+  if (!progress) return fallback;
+  const label = progress.label || fallback;
+  const total = Number(progress.total || 0);
+  const done = Number(progress.done || 0);
+  const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  if (total > 1) return `${label} ${percent}% (${formatCount(done)}/${formatCount(total)} dòng)`;
+  return label;
+}
+
+function formatInventoryJobStatus(job: InventoryAllocationJob | null) {
+  return formatOperationStatus(inventoryJobProgress(job), job?.label || 'Đang phân bổ tồn kho...');
+}
+
+function LoadingStage({ title, detail, progress }: { title: string; detail: string; progress?: OperationProgress | null }) {
+  const percent = Math.max(0, Math.min(100, Number(progress?.percent ?? 0)));
+  const hasRealRowProgress = Boolean(progress && Number(progress.total || 0) > 1);
+  const rowProgress = hasRealRowProgress ? progress : null;
+  return (
+    <div className="loading-stage">
+      <div className="loading-spinner" aria-hidden="true" />
+      <h3>{title}</h3>
+      <p>{progress?.label || detail}</p>
+      {rowProgress && (
+        <div className="loading-progress-block">
+          <div className="loading-progress-bar" aria-label="Tiến trình xử lý"><span style={{ width: `${percent}%` }} /></div>
+          <strong>{percent}%</strong>
+          <small>{formatCount(rowProgress.done)} / {formatCount(rowProgress.total)} dòng</small>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LegacyProfileWorkspace({ profile, label, licenseReady }: { profile: ProfileKey; label: string; licenseReady: boolean }) {
+  if (!licenseReady) {
+    return <PlaceholderStage title={`${label}: cần license`} detail="Kích hoạt license trước khi mở workflow cũ cho profile này." />;
+  }
+  const src = `/legacy/?profile=${encodeURIComponent(profile)}&embedded=1`;
+  return (
+    <div className="legacy-profile-workspace">
+      <iframe title={`${label} legacy workflow`} src={src} />
+    </div>
+  );
 }
 
 function ReviewTable({ groups, collapsedGroups, onToggleGroup, onRowChange, reviewScope }: { groups: ReviewDisplayGroup[]; collapsedGroups: Record<string, boolean>; onToggleGroup: (groupTitle: string) => void; onRowChange?: (index: number, update: Partial<ReviewRow>) => void; reviewScope?: 'all' | 'company' }) {
@@ -2088,6 +2529,8 @@ async function loadProductPreviewCodes(companies: CompanyRow[], wordRules: Recor
 function buildPurchaseProcessPayload(workflow: WorkflowState) {
   const companies = workflow.companyRows;
   const activeCompanies = companies.filter((company) => company.process !== false);
+  const activePrefixStrategy = normalizedPrefixStrategy(workflow.purchasePrefixStrategy);
+  const purchasePrefixStrategyValues = rememberManualPrefixValues(workflow.purchasePrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits);
   return {
     profile: 'vietmax',
     vietmax_phase: 'purchase',
@@ -2100,6 +2543,9 @@ function buildPurchaseProcessPayload(workflow: WorkflowState) {
     purchase_price_col: 'P',
     invoice_status_col: 'AJ',
     include_company_prefix: workflow.includeCompanyPrefix,
+    prefix_strategy: activePrefixStrategy,
+    prefix_mst_digits: workflow.prefixMstDigits,
+    prefix_strategy_values: purchasePrefixStrategyValues,
     comparison_scope: workflow.comparisonScope,
     word_rules: workflow.wordRules,
     repeated_phrase_removals: workflow.repeatedPhraseRemovals.filter((phrase) => phrase.trim()),
@@ -2108,7 +2554,7 @@ function buildPurchaseProcessPayload(workflow: WorkflowState) {
     inventory_pairs: workflow.inventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
     use_default_inventory_pair: workflow.useDefaultInventoryPair,
     default_inventory_pair_id: workflow.defaultInventoryPairId,
-    inventory_pair_rules: workflow.inventoryPairRules.filter((rule) => rule.source_col.trim() && rule.pair_id.trim()),
+    inventory_pair_rules: inventoryRulesForPayload(workflow.inventoryPairRules),
     prefixes: companyPrefixes(companies),
     all_mst: companies.map((company) => company.mst),
     process_mst: activeCompanies.map((company) => company.mst),
@@ -2121,6 +2567,8 @@ function buildPurchaseProcessPayload(workflow: WorkflowState) {
 function buildSalesProcessPayload(workflow: WorkflowState) {
   const companies = workflow.salesCompanyRows;
   const activeCompanies = companies.filter((company) => company.process !== false);
+  const activePrefixStrategy = normalizedPrefixStrategy(workflow.salesPrefixStrategy);
+  const salesPrefixStrategyValues = rememberManualPrefixValues(workflow.salesPrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits);
   return {
     profile: 'vietmax',
     vietmax_phase: 'sales',
@@ -2133,14 +2581,17 @@ function buildSalesProcessPayload(workflow: WorkflowState) {
     purchase_price_col: 'P',
     invoice_status_col: 'AJ',
     include_company_prefix: workflow.includeCompanyPrefix,
+    prefix_strategy: activePrefixStrategy,
+    prefix_mst_digits: workflow.prefixMstDigits,
+    prefix_strategy_values: salesPrefixStrategyValues,
     comparison_scope: workflow.comparisonScope,
     word_rules: workflow.wordRules,
     repeated_phrase_removals: workflow.repeatedPhraseRemovals.filter((phrase) => phrase.trim()),
-    manual_code_overrides: workflow.salesProductCodeOverrides,
+    manual_code_overrides: { ...workflow.salesProductCodeOverrides, ...reviewManualCodeOverrides(workflow.salesReviewRows) },
     inventory_pairs: workflow.inventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
     use_default_inventory_pair: workflow.useDefaultInventoryPair,
     default_inventory_pair_id: workflow.defaultInventoryPairId,
-    inventory_pair_rules: workflow.inventoryPairRules.filter((rule) => rule.source_col.trim() && rule.pair_id.trim()),
+    inventory_pair_rules: inventoryRulesForPayload(workflow.inventoryPairRules),
     vietmax_processed_purchase_saved_name: workflow.processedPurchaseSavedName,
     vietmax_ban_ra_purchase_matches: workflow.matches.filter((match) => match.confirmed !== false),
     vietmax_ban_ra_purchase_match_rules: buildSalesMatchRules(workflow),
@@ -2162,6 +2613,18 @@ function buildSalesReviewProducts(workflow: WorkflowState): ReviewProduct[] {
   return buildReviewProducts(workflow.salesCompanyRows, 'sales');
 }
 
+function inventoryRulesForPayload(rules: InventoryRule[]) {
+  return rules
+    .filter((rule) => rule.source_col.trim() && rule.pair_id.trim())
+    .map((rule) => ({
+      ...rule,
+      source_col: rule.source_col.trim().toUpperCase(),
+      value: rule.value ?? '',
+      priority: Number.isFinite(Number(rule.priority)) ? Math.trunc(Number(rule.priority)) : 0,
+      enabled: rule.enabled !== false,
+    }));
+}
+
 function buildReviewProducts(companies: CompanyRow[], phase: 'purchase' | 'sales'): ReviewProduct[] {
   return companies.flatMap((company, companyIndex) => {
     if (company.process === false) return [];
@@ -2169,19 +2632,33 @@ function buildReviewProducts(companies: CompanyRow[], phase: 'purchase' | 'sales
     return company.all_products.flatMap((product, productIndex) => {
       if (!selected.has(product.name)) return [];
       const firstPriceRow = product.priceRows?.[0];
-      return [{
-        purchase_product: product.name,
-        purchase_code: '',
-        purchase_unit: firstPriceRow?.unit ?? '',
+      const base = {
         invoice_no: firstPriceRow?.invoiceNo ?? '',
         invoice_date: firstPriceRow?.invoiceDate ?? '',
-        purchase_company: company.company,
-        purchase_mst: company.mst,
-        purchase_company_key: company.mst,
         product_key: productKey(company.mst, product.name),
         company_index: companyIndex,
         product_index: productIndex,
         phase,
+      };
+      if (phase === 'sales') {
+        return [{
+          ...base,
+          sales_product: product.name,
+          sales_code: '',
+          sales_unit: firstPriceRow?.unit ?? '',
+          sales_company: company.company,
+          sales_mst: company.mst,
+          sales_company_key: company.mst,
+        } as ReviewProduct];
+      }
+      return [{
+        ...base,
+        purchase_product: product.name,
+        purchase_code: '',
+        purchase_unit: firstPriceRow?.unit ?? '',
+        purchase_company: company.company,
+        purchase_mst: company.mst,
+        purchase_company_key: company.mst,
       }];
     });
   });
@@ -2209,10 +2686,12 @@ function confirmedPurchaseReviewMerges(rows: ReviewRow[], comparisonScope: strin
   });
 }
 
-function buildConfigPayloads(workflow: WorkflowState) {
+function buildConfigPayloads(workflow: WorkflowState, phase: 'purchase' | 'sales' | 'all' = 'all') {
   const payloads = [];
-  if (workflow.companyRows.length) payloads.push(buildConfigPayload(workflow));
-  if (workflow.salesCompanyRows.length || workflow.salesFile || workflow.matches.length || workflow.salesMatchRules.length) payloads.push(buildSalesConfigPayload(workflow));
+  if ((phase === 'purchase' || phase === 'all') && workflow.companyRows.length) payloads.push(buildConfigPayload(workflow));
+  if ((phase === 'sales' || phase === 'all') && (workflow.salesCompanyRows.length || workflow.salesFile || workflow.matches.length || workflow.salesMatchRules.length)) payloads.push(buildSalesConfigPayload(workflow));
+  if (!payloads.length && phase === 'sales') return [buildSalesConfigPayload(workflow)];
+  if (!payloads.length && phase === 'purchase') return [buildConfigPayload(workflow)];
   return payloads.length ? payloads : [buildConfigPayload(workflow)];
 }
 
@@ -2263,21 +2742,30 @@ function buildSalesConfigPayload(workflow: WorkflowState) {
       const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
       return [company.mst, skipped];
     }).filter(([, skipped]) => Array.isArray(skipped) && skipped.length)),
-    manual_code_overrides: workflow.salesProductCodeOverrides,
+    manual_code_overrides: { ...workflow.salesProductCodeOverrides, ...reviewManualCodeOverrides(workflow.salesReviewRows) },
     vietmax_ban_ra_purchase_match_rules: buildSalesMatchRules(workflow),
   };
 }
 
 function companyPrefixes(companies: CompanyRow[]) {
-  return Object.fromEntries(companies.filter((company) => company.value.trim()).map((company) => [company.mst, company.value.trim()]));
+  return Object.fromEntries(companies.filter((company) => normalizePrefixValue(company.value)).map((company) => [company.mst, normalizePrefixValue(company.value)]));
 }
 
 function companyPrefixFields(companies: CompanyRow[]) {
-  return Object.fromEntries(companies.map((company, index) => [`prefix_${index}`, company.value.trim()]));
+  return Object.fromEntries(companies.map((company, index) => [`prefix_${index}`, normalizePrefixValue(company.value)]));
 }
 
 function selectedProductNames(company: CompanyRow) {
   return company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name);
+}
+
+function processedStatsSentence(stats: ProcessedFileStats | null) {
+  if (!stats) return '';
+  return `Công ty ${formatCount(stats.processed_company_count)}/${formatCount(stats.company_count)}, dòng hàng ${formatCount(stats.processed_product_row_count)}/${formatCount(stats.product_row_count)}.`;
+}
+
+function formatCount(value: number | undefined) {
+  return Number(value || 0).toLocaleString('vi-VN');
 }
 
 

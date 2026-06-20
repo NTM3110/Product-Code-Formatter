@@ -1,0 +1,27 @@
+{
+  "profiles": [
+    { "key": "son_phuong", "label": "Sơn Phương" },
+    { "key": "cao_thanh", "label": "Cao Thành" },
+    { "key": "quang_thinh", "label": "Quang Thịnh" },
+    { "key": "vietmax", "label": "Vietmax" }
+  ],
+  "products": [
+    {
+      "code": "product-code-formatter",
+      "name": "Product Code Formatter",
+      "label": "Product Code Formatter",
+      "uses_profiles": true,
+      "application": "ProductCodeFormatter"
+    },
+    {
+      "code": "inventory-allocator",
+      "name": "Inventory Allocator",
+      "label": "Inventory Allocator",
+      "uses_profiles": false,
+      "application": "InventoryAllocator"
+    }
+  ],
+  "company_presets": [
+    { "label": "Vietmax", "value": "Vietmax" }
+  ]
+}

@@ -6,6 +6,27 @@ export type UploadSummary = {
   invoice_statuses: Array<{ value: string; count: number; skip: boolean }>;
 };
 
+export type ProcessedFileStats = {
+  phase: 'purchase' | 'sales' | string;
+  company_count: number;
+  processed_company_count: number;
+  product_row_count: number;
+  processed_product_row_count: number;
+  code_col?: string;
+  company_col?: string;
+  mst_col?: string;
+  product_col?: string;
+};
+
+export type OperationProgress = {
+  operation_id: string;
+  status: string;
+  done: number;
+  total: number;
+  percent: number;
+  label: string;
+};
+
 export type ProcessResult = {
   blob: Blob;
   processedSavedName: string;
@@ -54,6 +75,115 @@ export type InventoryAllocationSummary = {
   range_rejected_lines?: number;
 };
 
+export type InventoryReportWarehouse = {
+  warehouse_code: string;
+  warehouse_name?: string;
+  account?: string;
+};
+
+export type InventorySalesSummaryRow = {
+  key: string;
+  index?: number;
+  warehouse_code: string;
+  variant_code: string;
+  product_name: string;
+  unit_name: string;
+  quantity: number;
+  cost_amount: number;
+  sale_amount: number;
+  profit_amount: number;
+  margin_percent?: number | null;
+  tax_amount: number;
+  total_amount: number;
+  row_count?: number;
+  margin_sale_amount?: number;
+  cost_missing_count?: number;
+};
+
+export type InventorySalesDetailRow = {
+  key: string;
+  summary_key: string;
+  row_type?: string;
+  warehouse_code: string;
+  invoice_date?: string;
+  invoice_date_iso?: string;
+  invoice_no?: string;
+  customer?: string;
+  tax_code?: string;
+  variant_code?: string;
+  product_name?: string;
+  unit_name?: string;
+  quantity?: number;
+  sale_price?: number;
+  sale_amount?: number;
+  cost_price?: number;
+  cost_amount?: number;
+  profit_amount?: number;
+  tax_rate?: number;
+  tax_amount?: number;
+  total_amount?: number;
+  cost_missing?: boolean;
+};
+
+export type InventorySummaryRow = {
+  key: string;
+  index?: number;
+  warehouse_code: string;
+  warehouse_name?: string;
+  account?: string;
+  variant_code: string;
+  product_name: string;
+  unit_name: string;
+  opening_qty: number;
+  opening_amount: number;
+  in_qty: number;
+  in_amount: number;
+  out_qty: number;
+  out_amount: number;
+  ending_qty: number;
+  ending_amount: number;
+  row_count?: number;
+};
+
+export type InventoryLedgerDetailRow = {
+  key: string;
+  summary_key: string;
+  row_type?: string;
+  warehouse_code: string;
+  variant_code?: string;
+  product_name?: string;
+  unit_name?: string;
+  date?: string;
+  date_iso?: string;
+  doc_no?: string;
+  customer?: string;
+  description?: string;
+  account?: string;
+  unit_price?: number | string;
+  sale_unit_price?: number | string;
+  sale_amount?: number | string;
+  tax_rate?: number | string;
+  tax_amount?: number | string;
+  total_amount?: number | string;
+  cost_missing?: boolean;
+  qty_in?: number;
+  amount_in?: number;
+  qty_out?: number;
+  amount_out?: number;
+  running_qty?: number;
+  running_amount?: number;
+  logic_note?: string;
+};
+
+export type InventoryAllocationReportView = {
+  date_range?: { from?: string; to?: string };
+  warehouses?: InventoryReportWarehouse[];
+  sales_summary_rows?: InventorySalesSummaryRow[];
+  sales_detail_rows?: InventorySalesDetailRow[];
+  inventory_summary_rows?: InventorySummaryRow[];
+  ledger_detail_rows?: InventoryLedgerDetailRow[];
+};
+
 export type InventoryAllocationResult = {
   job_id: string;
   filename: string;
@@ -62,11 +192,14 @@ export type InventoryAllocationResult = {
   allocation_count?: number;
   stock_count?: number;
   verification?: Array<{ group: string; check: string; status: string; difference?: number; explanation?: string }>;
+  report_view?: InventoryAllocationReportView;
 };
 
 export type InventoryAllocationJob = {
   status: 'queued' | 'running' | 'complete' | 'error' | string;
   progress?: number;
+  done?: number;
+  total?: number;
   label?: string;
   error?: string;
   result?: InventoryAllocationResult;
@@ -82,6 +215,7 @@ export type CompanyRow = {
   process?: boolean;
   pending_process?: boolean;
   committed_prefix?: string;
+  default_prefix?: string;
   prefix_strategies?: Record<string, string>;
 };
 
@@ -97,6 +231,7 @@ export type InventoryRule = {
   value: string;
   pair_id: string;
   enabled?: boolean;
+  priority?: number;
 };
 
 export type ReviewRow = {
@@ -129,14 +264,20 @@ export type ReviewRow = {
 };
 
 export type ReviewProduct = {
-  purchase_product: string;
-  purchase_code: string;
+  purchase_product?: string;
+  purchase_code?: string;
   purchase_unit?: string;
+  sales_product?: string;
+  sales_code?: string;
+  sales_unit?: string;
   invoice_no?: string;
   invoice_date?: string;
   purchase_company?: string;
   purchase_mst?: string;
   purchase_company_key?: string;
+  sales_company?: string;
+  sales_mst?: string;
+  sales_company_key?: string;
   product_key?: string;
   company_index?: number;
   product_index?: number;
@@ -172,6 +313,10 @@ export type LicenseStatus = {
   activated: boolean;
   status: string;
   allowed_profiles: string[];
+  allowed_companies: string[];
+  supported_profiles: string[];
+  product_code: string;
+  application: string;
   vietmax_allowed: boolean;
   server_url: string;
   account_id: string;

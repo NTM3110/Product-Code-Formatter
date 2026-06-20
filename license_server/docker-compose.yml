@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keygen
+      POSTGRES_USER: keygen
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - keygen_postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    volumes:
+      - keygen_redis:/data
+
+  keygen:
+    image: keygen/api:latest
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "${KEYGEN_PORT:-3000}:3000"
+    environment:
+      KEYGEN_HOST: ${KEYGEN_HOST}
+      KEYGEN_DOMAIN: ${KEYGEN_DOMAIN}
+      KEYGEN_EDITION: ${KEYGEN_EDITION:-CE}
+      KEYGEN_MODE: ${KEYGEN_MODE:-singleplayer}
+      KEYGEN_ACCOUNT_ID: ${KEYGEN_ACCOUNT_ID}
+      SECRET_KEY_BASE: ${KEYGEN_SECRET_KEY_BASE}
+      ENCRYPTION_PRIMARY_KEY: ${KEYGEN_ENCRYPTION_PRIMARY_KEY}
+      ENCRYPTION_DETERMINISTIC_KEY: ${KEYGEN_ENCRYPTION_DETERMINISTIC_KEY}
+      ENCRYPTION_KEY_DERIVATION_SALT: ${KEYGEN_ENCRYPTION_KEY_DERIVATION_SALT}
+      DATABASE_URL: postgres://keygen:${POSTGRES_PASSWORD}@postgres:5432/keygen
+      REDIS_URL: redis://redis:6379/0
+
+volumes:
+  keygen_postgres:
+  keygen_redis:

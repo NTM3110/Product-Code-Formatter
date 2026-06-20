@@ -1,6 +1,8 @@
 Product Code Formatter - MST All Names V6
 
 New in V6:
+- App requires LAN Keygen license activation before normal use.
+- License metadata can restrict allowed app company profiles.
 - The company check page shows all company names found under the same MST.
 - The app still groups by MST người bán.
 - The main name used for prefix suggestion is the most common company name for that MST.
@@ -17,4 +19,6 @@ Previous features:
 Build:
 1. Extract ZIP.
 2. Double-click build_exe_auto.bat.
-3. Run dist\ProductCodeFormatter.exe.
+3. Run deploy\ProductCodeFormatter.exe.
+
+License server setup notes: license_server\README.md

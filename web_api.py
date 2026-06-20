@@ -24,6 +24,7 @@ from app import (
     OUTPUT_DIR,
     UPLOAD_DIR,
     VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES,
+    VIETMAX_COMPARISON_SCOPE_SAME_COMPANY,
     VIETMAX_PHASE_PURCHASE,
     VIETMAX_PHASE_SALES,
     MAX_CODE_LENGTH,
@@ -33,9 +34,11 @@ from app import (
     build_vietmax_ban_ra_purchase_matches,
     build_vietmax_khh_exact_purchase_matches,
     apply_word_rules_to_words,
+    cell,
     code_words,
     effective_processing_profile,
     empty_profile_config,
+    excel_col_to_index,
     index_to_excel_col,
     invoice_status_options,
     license_allows_profile,
@@ -43,7 +46,14 @@ from app import (
     load_config,
     make_excel_workbook,
     make_product_part,
+    merge_price_ranges,
+    normalize_config,
+    normalize_inventory_pair_rules,
+    normalize_inventory_pairs,
+    normalize_phrase_list,
+    normalized_header_label,
     preview_data,
+    process_zip_stream,
     process_workbook,
     product_key,
     profile_key,
@@ -52,8 +62,13 @@ from app import (
     remove_repeated_phrases,
     resolve_output_path,
     save_config,
+    should_process_qty,
+    up_ban_ra_output_path,
+    create_up_ban_ra_workbook,
     validate_vietmax_processed_purchase_workbook,
+    vietmax_ban_ra_match_key,
     vietmax_ban_ra_sales_products_from_workbook,
+    vietmax_company_identity_key,
     vietmax_product_review_rows,
     vietmax_purchase_match_export_rows,
     vietmax_purchase_products_from_workbook,
@@ -68,6 +83,94 @@ from inventory_allocation_app.app import (
 
 APP_DIR = Path(__file__).resolve().parent
 REACT_DIST_DIR = APP_DIR / "react_frontend" / "dist"
+PROGRESS_LOCK = threading.Lock()
+PROGRESS_JOBS: dict[str, dict] = {}
+PROGRESS_TTL_SECONDS = 900
+
+
+PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst")
+def has_config_value(value) -> bool:
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None
+
+
+def keep_existing_when_empty(payload: dict, profile_cfg: dict, key: str, default=None):
+    if key not in payload:
+        return profile_cfg.get(key, default)
+    value = payload.get(key)
+    if has_config_value(value) or not has_config_value(profile_cfg.get(key)):
+        return value
+    return profile_cfg.get(key, default)
+
+
+def normalize_prefix_strategy_values(raw):
+    values = {strategy: {} for strategy in PREFIX_STRATEGIES}
+    if not isinstance(raw, dict):
+        return values
+    for strategy in PREFIX_STRATEGIES:
+        strategy_values = raw.get(strategy)
+        if not isinstance(strategy_values, dict):
+            continue
+        values[strategy] = {
+            str(key): str(value).strip().upper()
+            for key, value in strategy_values.items()
+            if key and value is not None
+        }
+    return values
+
+
+def review_merge_key(product, company="", mst="", company_key="", comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    product_part = vietmax_ban_ra_match_key(product)
+    if not product_part:
+        return ""
+    if comparison_scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
+        identity = raw_text(company_key) or vietmax_company_identity_key(company, mst)
+        return f"{identity}|||{product_part}" if identity else ""
+    return product_part
+
+
+def apply_saved_review_choices(rows, saved_merges, comparison_scope):
+    if not isinstance(saved_merges, list) or not saved_merges:
+        return rows
+    scope = comparison_scope if comparison_scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES
+    forward = {}
+    reverse = {}
+    for item in saved_merges:
+        if not isinstance(item, dict) or item.get("confirmed") is False:
+            continue
+        left_key = review_merge_key(item.get("product"), item.get("company"), item.get("mst"), item.get("company_key"), scope)
+        right_key = review_merge_key(item.get("similar_product"), item.get("similar_company"), item.get("similar_mst"), item.get("similar_company_key"), scope)
+        if left_key and right_key:
+            forward[(left_key, right_key)] = item
+            reverse[(right_key, left_key)] = item
+    if not forward and not reverse:
+        return rows
+    restored = []
+    for row in rows:
+        next_row = dict(row)
+        left_key = review_merge_key(row.get("product"), row.get("company"), row.get("mst"), row.get("company_key"), scope)
+        right_key = review_merge_key(row.get("similar_product"), row.get("similar_company"), row.get("similar_mst"), row.get("similar_company_key"), scope)
+        if left_key and right_key and (left_key, right_key) in forward:
+            saved = forward[(left_key, right_key)]
+            next_row.update({"confirmed": True, "code_choice": "similar"})
+            if raw_text(saved.get("split_code")):
+                next_row["split_code"] = raw_text(saved.get("split_code"))
+            if raw_text(saved.get("similar_split_code")):
+                next_row["similar_split_code"] = raw_text(saved.get("similar_split_code"))
+        elif left_key and right_key and (left_key, right_key) in reverse:
+            saved = reverse[(left_key, right_key)]
+            next_row.update({"confirmed": True, "code_choice": "current"})
+            if raw_text(saved.get("split_code")):
+                next_row["similar_split_code"] = raw_text(saved.get("split_code"))
+            if raw_text(saved.get("similar_split_code")):
+                next_row["split_code"] = raw_text(saved.get("similar_split_code"))
+        restored.append(next_row)
+    return restored
 
 
 class VietmaxReviewRequest(BaseModel):
@@ -83,6 +186,7 @@ class VietmaxReviewRequest(BaseModel):
     word_rules: dict[str, str] | None = None
     repeated_phrase_removals: list[str] | None = None
     products: list[dict] | None = None
+    operation_id: str = ""
 
 
 class VietmaxAnalyzeRequest(BaseModel):
@@ -96,6 +200,21 @@ class VietmaxAnalyzeRequest(BaseModel):
     price_col: str = "P"
     invoice_status_col: str = DEFAULT_INVOICE_STATUS_COL
     invoice_status_skip_values: list[str] | None = None
+
+
+class GenericAnalyzeRequest(BaseModel):
+    saved_name: str
+    original_name: str = "output.xlsx"
+    profile: str = "son_phuong"
+    company_col: str = "F"
+    mst_col: str = "G"
+    address_col: str = "H"
+    product_col: str = "M"
+    qty_col: str = "O"
+    price_col: str = ""
+    invoice_status_col: str = DEFAULT_INVOICE_STATUS_COL
+    invoice_status_skip_values: list[str] | None = None
+    operation_id: str = ""
 
 
 class VietmaxProductPreviewRequest(BaseModel):
@@ -118,6 +237,12 @@ class VietmaxSalesMatchRequest(BaseModel):
     sales_price_col: str = "P"
     purchase_price_col: str = "P"
     require_existing_purchase_code: bool = True
+    operation_id: str = ""
+
+
+class VietmaxProcessedFileStatsRequest(BaseModel):
+    saved_name: str
+    phase: str = VIETMAX_PHASE_PURCHASE
 
 
 class VietmaxExportMatchesRequest(BaseModel):
@@ -129,6 +254,7 @@ class VietmaxProcessRequest(BaseModel):
     saved_name: str
     original_name: str = "output.xlsx"
     payload: dict
+    operation_id: str = ""
 
 
 class LicenseActivationRequest(BaseModel):
@@ -145,11 +271,16 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Processed-Saved-Name"],
     )
 
     @api.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "profile": "vietmax"}
+
+    @api.get("/api/progress/{operation_id}")
+    def operation_progress(operation_id: str) -> dict:
+        return get_progress_job(operation_id)
 
     @api.get("/api/config")
     def get_config() -> dict:
@@ -161,14 +292,15 @@ def create_app() -> FastAPI:
 
     @api.post("/api/config/profile/{profile}")
     def import_profile_config(profile: str, payload: dict) -> dict:
+        profile = profile_key(profile)
+        incoming = normalize_config(payload or {})
         current = load_config()
-        incoming_profiles = payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {}
-        source_profile = profile if profile in incoming_profiles else str(payload.get("selected_profile") or profile)
+        incoming_profiles = incoming.get("profiles") if isinstance(incoming.get("profiles"), dict) else {}
+        source_profile = profile if profile in incoming_profiles else incoming.get("selected_profile")
+        source_profile = source_profile if source_profile in incoming_profiles else profile
         current["selected_profile"] = profile
-        if isinstance(payload.get("columns"), dict):
-            current.setdefault("columns", {}).update(payload.get("columns") or {})
-        if source_profile in incoming_profiles:
-            current.setdefault("profiles", {})[profile] = incoming_profiles[source_profile]
+        current.setdefault("columns", {}).update(incoming.get("columns") or {})
+        current.setdefault("profiles", {})[profile] = incoming_profiles.get(source_profile, empty_profile_config(profile))
         return save_config(current)
 
     @api.get("/api/license/status")
@@ -218,6 +350,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return workbook_summary(df, original, saved_name)
 
+    @api.get("/api/files/download/{saved_name}")
+    def download_uploaded_or_cached_file(saved_name: str) -> FileResponse:
+        path = uploaded_path(saved_name)
+        return FileResponse(path, filename=path.name, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+
     @api.post("/api/mapping")
     async def mapping(file: UploadFile = File(...)) -> dict:
         return await upload_excel(file)
@@ -237,34 +374,66 @@ def create_app() -> FastAPI:
         return {"invoice_statuses": statuses}
 
     @api.post("/api/check")
-    def check(payload: VietmaxAnalyzeRequest) -> dict:
-        return vietmax_analyze(payload)
+    def check(payload: GenericAnalyzeRequest) -> dict:
+        path = uploaded_path(payload.saved_name)
+        profile = profile_key(payload.profile)
+        cfg = load_config()
+        profile_cfg = (cfg.get("profiles") or {}).get(profile) or empty_profile_config(profile)
+        try:
+            result = analyze(
+                path,
+                payload.company_col,
+                payload.mst_col,
+                payload.address_col,
+                payload.product_col,
+                payload.qty_col,
+                payload.price_col,
+                profile_cfg,
+                invoice_status_col=payload.invoice_status_col,
+                invoice_status_skip_values=payload.invoice_status_skip_values,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result.update({"original_name": payload.original_name, "saved_name": payload.saved_name})
+        return json_safe(result)
 
     @api.post("/api/vietmax/review")
     def vietmax_review(payload: VietmaxReviewRequest) -> dict:
         path = uploaded_path(payload.saved_name)
+        operation_id = raw_text(payload.operation_id)
+        update_progress_job(operation_id, 0, 1, "Đang chuẩn bị review Mã VT", status="running")
         try:
+            def progress(done, total, label):
+                update_progress_job(operation_id, done, total, label, status="running")
+
             if payload.phase == VIETMAX_PHASE_SALES:
-                products = vietmax_ban_ra_sales_products_from_workbook(
+                products = payload.products if payload.products is not None else vietmax_ban_ra_sales_products_from_workbook(
                     path,
                     payload.product_col,
                     payload.qty_col,
                     payload.invoice_status_col,
                     payload.invoice_status_skip_values,
+                    progress_callback=progress,
                     comparison_scope=payload.comparison_scope,
                     price_col=payload.price_col,
                 )
-                rows = vietmax_product_review_rows(enrich_vietmax_review_products(products, "sales", payload), "sales_product", "sales_unit", comparison_scope=payload.comparison_scope)
+                rows = vietmax_product_review_rows(enrich_vietmax_review_products(products, "sales", payload), "sales_product", "sales_unit", comparison_scope=payload.comparison_scope, progress_callback=progress)
             else:
                 products = payload.products if payload.products is not None else vietmax_purchase_products_from_workbook(
                     path,
                     price_col=payload.price_col,
+                    progress_callback=progress,
                     comparison_scope=payload.comparison_scope,
                     require_existing_code=payload.require_existing_code,
                 )
-                rows = vietmax_product_review_rows(enrich_vietmax_review_products(products, "purchase", payload), "purchase_product", "purchase_unit", comparison_scope=payload.comparison_scope)
+                rows = vietmax_product_review_rows(enrich_vietmax_review_products(products, "purchase", payload), "purchase_product", "purchase_unit", comparison_scope=payload.comparison_scope, progress_callback=progress)
+            saved_profile = vietmax_profile_config(VIETMAX_PHASE_SALES if payload.phase == VIETMAX_PHASE_SALES else VIETMAX_PHASE_PURCHASE)
+            saved_merges = saved_profile.get("vietmax_ban_ra_sales_internal_merges") if payload.phase == VIETMAX_PHASE_SALES else saved_profile.get("vietmax_mua_vao_internal_merges")
+            rows = apply_saved_review_choices(rows, saved_merges or [], payload.comparison_scope)
         except Exception as exc:
+            update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        update_progress_job(operation_id, 1, 1, "Đã tạo xong danh sách review Mã VT", status="complete")
         return {"products": json_safe(products), "review_rows": json_safe(rows)}
 
     @api.post("/api/vietmax/analyze")
@@ -299,6 +468,12 @@ def create_app() -> FastAPI:
             result["default_inventory_pair_id"] = profile_cfg.get("default_inventory_pair_id") or ""
             result["inventory_pair_rules"] = profile_cfg.get("inventory_pair_rules") or []
             result["sales_match_rules"] = profile_cfg.get("vietmax_ban_ra_purchase_match_rules") or []
+            result["vietmax_mua_vao_internal_merges"] = profile_cfg.get("vietmax_mua_vao_internal_merges") or []
+            result["vietmax_ban_ra_sales_internal_merges"] = profile_cfg.get("vietmax_ban_ra_sales_internal_merges") or []
+            result["include_company_prefix"] = profile_cfg.get("include_company_prefix") is not False
+            result["prefix_strategy"] = profile_cfg.get("prefix_strategy") or "last_2_words"
+            result["prefix_mst_digits"] = profile_cfg.get("prefix_mst_digits") or 3
+            result["prefix_strategy_values"] = profile_cfg.get("prefix_strategy_values") or {}
             return json_safe(result)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -319,6 +494,72 @@ def create_app() -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
+    @api.post("/api/process")
+    def process_generic(payload: dict) -> Response:
+        saved_name = str(payload.get("saved_name", ""))
+        original_name = str(payload.get("original_name") or "output.xlsx")
+        path = uploaded_path(saved_name)
+        process_payload = dict(payload)
+        try:
+            out = resolve_output_path(original_name, process_payload.get("output_path", ""))
+            processed_df = process_workbook(path, out, process_payload)
+            companion_stream = create_up_ban_ra_workbook(processed_df)
+            companion_out = up_ban_ra_output_path(out)
+            companion_out.write_bytes(companion_stream.getvalue())
+            cfg = load_config()
+            profile = profile_key(process_payload.get("profile", cfg.get("selected_profile", "son_phuong")))
+            storage_profile = effective_processing_profile(profile, process_payload.get("vietmax_phase")) if profile == VIETMAX_PROFILE else profile
+            uses_price_rules = storage_profile == "cao_thanh"
+            cfg["selected_profile"] = profile
+            cfg.setdefault("profiles", {}).setdefault(storage_profile, empty_profile_config(storage_profile))
+            old_profile = cfg["profiles"].get(storage_profile) or empty_profile_config(storage_profile)
+            merged_price_ranges = merge_price_ranges(old_profile.get("price_range_rules"), process_payload.get("price_range_rules", {})) if uses_price_rules else {}
+            columns = {
+                "company_col": process_payload.get("company_col", ""),
+                "mst_col": process_payload.get("mst_col", ""),
+                "address_col": process_payload.get("address_col", ""),
+                "product_col": process_payload.get("product_col", ""),
+                "qty_col": process_payload.get("qty_col", ""),
+                "price_col": process_payload.get("price_col", ""),
+                "output_col": process_payload.get("output_col", ""),
+                "invoice_status_col": process_payload.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL),
+                "invoice_status_skip_values": process_payload.get("invoice_status_skip_values", DEFAULT_INVOICE_STATUS_SKIP_VALUES),
+            }
+            cfg.setdefault("columns", {}).update(columns)
+            cfg["profiles"][storage_profile].update({
+                "prefixes": process_payload.get("prefixes", {}),
+                "selected_products": process_payload.get("skipped_products_map", {}),
+                "removed_companies": process_payload.get("removed_companies", old_profile.get("removed_companies", {})),
+                "word_rules": keep_existing_when_empty(process_payload, old_profile, "word_rules", {}),
+                "first_word_rules": keep_existing_when_empty(process_payload, old_profile, "first_word_rules", {}),
+                "repeated_phrase_removals": normalize_phrase_list(keep_existing_when_empty(process_payload, old_profile, "repeated_phrase_removals", [])),
+                "price_group_rules": process_payload.get("price_group_rules", {}) if uses_price_rules else {},
+                "price_range_rules": merged_price_ranges,
+                "price_adjust_all_percent": float(process_payload.get("price_adjust_all_percent") or 0) if uses_price_rules else 0,
+                "manual_code_overrides": process_payload.get("manual_code_overrides", {}),
+                "vietmax_mua_vao_internal_merges": process_payload.get("vietmax_mua_vao_internal_merges", old_profile.get("vietmax_mua_vao_internal_merges", [])),
+                "vietmax_ban_ra_sales_internal_merges": process_payload.get("vietmax_ban_ra_sales_internal_merges", old_profile.get("vietmax_ban_ra_sales_internal_merges", [])),
+                "inventory_pairs": normalize_inventory_pairs(keep_existing_when_empty(process_payload, old_profile, "inventory_pairs", [])),
+                "use_default_inventory_pair": bool(process_payload.get("use_default_inventory_pair", old_profile.get("use_default_inventory_pair", False))),
+                "default_inventory_pair_id": str(process_payload.get("default_inventory_pair_id", old_profile.get("default_inventory_pair_id", "")) or "").strip(),
+                "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(process_payload, old_profile, "inventory_pair_rules", [])),
+                "include_company_prefix": process_payload.get("include_company_prefix") is not False,
+                "prefix_strategy": process_payload.get("prefix_strategy", old_profile.get("prefix_strategy", "last_2_words")),
+                "prefix_mst_digits": process_payload.get("prefix_mst_digits", old_profile.get("prefix_mst_digits", 3)),
+                "prefix_strategy_values": normalize_prefix_strategy_values(process_payload.get("prefix_strategy_values", old_profile.get("prefix_strategy_values", {}))),
+                "output_path": process_payload.get("output_path", ""),
+                "columns": columns,
+            })
+            save_config(cfg)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        zip_name = f"{Path(original_name).stem}_ket_qua_xu_ly.zip"
+        return Response(
+            process_zip_stream(out, companion_out).getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+
     @api.post("/api/vietmax/product-preview")
     def vietmax_product_preview(payload: VietmaxProductPreviewRequest) -> dict:
         profile = "vietmax_ban_ra" if payload.phase == VIETMAX_PHASE_SALES else "vietmax_mua_vao"
@@ -334,13 +575,19 @@ def create_app() -> FastAPI:
     def vietmax_sales_match(payload: VietmaxSalesMatchRequest) -> dict:
         sales_path = uploaded_path(payload.sales_saved_name)
         purchase_path = uploaded_path(payload.purchase_saved_name)
+        operation_id = raw_text(payload.operation_id)
+        update_progress_job(operation_id, 0, 1, "Đang chuẩn bị khớp mua vào / bán ra", status="running")
         try:
+            def progress(done, total, label):
+                update_progress_job(operation_id, done, total, label, status="running")
+
             sales_products = vietmax_ban_ra_sales_products_from_workbook(
                 sales_path,
                 payload.product_col,
                 payload.qty_col,
                 payload.invoice_status_col,
                 payload.invoice_status_skip_values,
+                progress_callback=progress,
                 comparison_scope=payload.comparison_scope,
                 price_col=payload.sales_price_col,
                 company_col=payload.sales_company_col,
@@ -349,15 +596,20 @@ def create_app() -> FastAPI:
             purchase_products = vietmax_purchase_products_from_workbook(
                 purchase_path,
                 price_col=payload.purchase_price_col,
+                progress_callback=progress,
                 comparison_scope=payload.comparison_scope,
                 require_existing_code=payload.require_existing_purchase_code,
             )
+            update_progress_job(operation_id, 0, max(1, len(sales_products)), "Đang khớp chính xác KHH/152", status="running")
             exact_matches = build_vietmax_khh_exact_purchase_matches(sales_products, purchase_products, payload.comparison_scope)
-            fuzzy_matches = build_vietmax_ban_ra_purchase_matches(sales_products, purchase_products, comparison_scope=payload.comparison_scope)
+            update_progress_job(operation_id, 0, max(1, len(sales_products)), "Đang so khớp hàng bán/mua", status="running")
+            fuzzy_matches = build_vietmax_ban_ra_purchase_matches(sales_products, purchase_products, progress_callback=progress, comparison_scope=payload.comparison_scope)
             matches = merge_exact_and_fuzzy_matches(exact_matches, fuzzy_matches)
             match_rules = vietmax_profile_config(VIETMAX_PHASE_SALES).get("vietmax_ban_ra_purchase_match_rules") or []
         except Exception as exc:
+            update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        update_progress_job(operation_id, max(1, len(matches)), max(1, len(matches)), "Đã tạo xong danh sách khớp mua/bán", status="complete")
         return {
             "sales_products": json_safe(sales_products),
             "purchase_products": json_safe(purchase_products),
@@ -371,6 +623,14 @@ def create_app() -> FastAPI:
         path = uploaded_path(str(payload.get("saved_name", "")))
         try:
             return validate_vietmax_processed_purchase_workbook(path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.post("/api/vietmax/processed-file-stats")
+    def processed_file_stats(payload: VietmaxProcessedFileStatsRequest) -> dict:
+        path = uploaded_path(payload.saved_name)
+        try:
+            return inspect_vietmax_processed_file(path, payload.phase)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -415,17 +675,22 @@ def create_app() -> FastAPI:
             "selected_products": payload.get("skipped_products_map", {}),
             "removed_companies": payload.get("removed_companies", {}),
             "include_company_prefix": payload.get("include_company_prefix") is not False,
+            "prefix_strategy": payload.get("prefix_strategy", profile_cfg.get("prefix_strategy", "last_2_words")),
+            "prefix_mst_digits": payload.get("prefix_mst_digits", profile_cfg.get("prefix_mst_digits", 3)),
+            "prefix_strategy_values": normalize_prefix_strategy_values(payload.get("prefix_strategy_values", profile_cfg.get("prefix_strategy_values", {}))),
             "output_path": payload.get("output_path", ""),
             "columns": payload.get("columns", {}),
-            "word_rules": payload.get("word_rules", {}),
-            "first_word_rules": payload.get("first_word_rules", {}),
-            "repeated_phrase_removals": payload.get("repeated_phrase_removals", []),
+            "word_rules": keep_existing_when_empty(payload, profile_cfg, "word_rules", {}),
+            "first_word_rules": keep_existing_when_empty(payload, profile_cfg, "first_word_rules", {}),
+            "repeated_phrase_removals": normalize_phrase_list(keep_existing_when_empty(payload, profile_cfg, "repeated_phrase_removals", [])),
             "manual_code_overrides": payload.get("manual_code_overrides", {}),
+            "vietmax_mua_vao_internal_merges": payload.get("vietmax_mua_vao_internal_merges", profile_cfg.get("vietmax_mua_vao_internal_merges", [])),
+            "vietmax_ban_ra_sales_internal_merges": payload.get("vietmax_ban_ra_sales_internal_merges", profile_cfg.get("vietmax_ban_ra_sales_internal_merges", [])),
             "vietmax_ban_ra_purchase_match_rules": payload.get("vietmax_ban_ra_purchase_match_rules", profile_cfg.get("vietmax_ban_ra_purchase_match_rules", [])),
-            "inventory_pairs": payload.get("inventory_pairs", []),
-            "use_default_inventory_pair": bool(payload.get("use_default_inventory_pair")),
-            "default_inventory_pair_id": str(payload.get("default_inventory_pair_id") or "").strip(),
-            "inventory_pair_rules": payload.get("inventory_pair_rules", []),
+            "inventory_pairs": normalize_inventory_pairs(keep_existing_when_empty(payload, profile_cfg, "inventory_pairs", [])),
+            "use_default_inventory_pair": bool(payload.get("use_default_inventory_pair", profile_cfg.get("use_default_inventory_pair", False))),
+            "default_inventory_pair_id": str(payload.get("default_inventory_pair_id", profile_cfg.get("default_inventory_pair_id", "")) or "").strip(),
+            "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(payload, profile_cfg, "inventory_pair_rules", [])),
         })
         cfg["profiles"][storage_profile] = profile_cfg
         return save_config(cfg)
@@ -438,6 +703,13 @@ def create_app() -> FastAPI:
         process_payload["original_name"] = payload.original_name
         try:
             processed_purchase_saved_name = raw_text(process_payload.get("vietmax_processed_purchase_saved_name"))
+            if process_payload.get("vietmax_phase") == VIETMAX_PHASE_SALES and not process_payload.get("vietmax_ban_ra_purchase_match_rules"):
+                profile = profile_key(process_payload.get("profile") or VIETMAX_PROFILE)
+                storage_profile = effective_processing_profile(profile, process_payload.get("vietmax_phase")) if profile == VIETMAX_PROFILE else profile
+                profile_cfg = (load_config().get("profiles", {}).get(storage_profile, {}) or {})
+                saved_match_rules = profile_cfg.get("vietmax_ban_ra_purchase_match_rules") or []
+                if saved_match_rules:
+                    process_payload["vietmax_ban_ra_purchase_match_rules"] = saved_match_rules
             if processed_purchase_saved_name:
                 process_payload["vietmax_processed_purchase_path"] = str(uploaded_path(processed_purchase_saved_name))
             out = resolve_output_path(payload.original_name, process_payload.get("output_path", ""))
@@ -464,7 +736,7 @@ def create_app() -> FastAPI:
             allocation_policy = json.loads(policy or "{}")
             opening_content = await opening_file.read() if opening_file and opening_file.filename else None
             job_id = uuid.uuid4().hex
-            update_inventory_analysis_job(job_id, status="queued", progress=0, label="Đã nhận file. Đang xếp hàng phân bổ tồn kho...")
+            update_inventory_analysis_job(job_id, status="queued", progress=0, done=0, total=0, label="Đã nhận file. Đang xếp hàng phân bổ tồn kho...")
             worker = threading.Thread(
                 target=run_inventory_analysis_job,
                 args=(
@@ -550,6 +822,10 @@ def public_license_status(config: dict) -> dict:
         "activated": activated,
         "status": str(license_cfg.get("status") or ("Kích hoạt thành công" if activated else "Chưa kích hoạt")),
         "allowed_profiles": allowed_profiles,
+        "allowed_companies": license_cfg.get("allowed_companies") or [],
+        "supported_profiles": license_cfg.get("supported_profiles") or [],
+        "product_code": str(license_cfg.get("product_code") or ""),
+        "application": str(license_cfg.get("application") or ""),
         "vietmax_allowed": activated and (
             license_allows_profile("vietmax", allowed_profiles)
             or license_allows_profile("vietmax_mua_vao", allowed_profiles)
@@ -557,6 +833,66 @@ def public_license_status(config: dict) -> dict:
         ),
         "server_url": str(license_cfg.get("server_url") or ""),
         "account_id": str(license_cfg.get("account_id") or ""),
+    }
+
+
+def inspect_vietmax_processed_file(path: Path, phase: str) -> dict:
+    _, df = read_workbook(path)
+    if df.empty:
+        raise ValueError("File đã xử lý không có dữ liệu.")
+    normalized_phase = VIETMAX_PHASE_SALES if str(phase or "").strip().casefold() == VIETMAX_PHASE_SALES else VIETMAX_PHASE_PURCHASE
+    columns = {
+        VIETMAX_PHASE_PURCHASE: {"company": "F", "mst": "G", "product": "M", "qty": "O", "code": "L"},
+        VIETMAX_PHASE_SALES: {"company": "I", "mst": "J", "product": "M", "qty": "O", "code": "L"},
+    }[normalized_phase]
+    company_index = excel_col_to_index(columns["company"])
+    mst_index = excel_col_to_index(columns["mst"])
+    product_index = excel_col_to_index(columns["product"])
+    code_index = excel_col_to_index(columns["code"])
+    qty_index = excel_col_to_index(columns["qty"])
+    required = [company_index, mst_index, product_index, code_index]
+    if df.shape[1] <= max(required):
+        raise ValueError("File đã xử lý không đủ cột Vietmax mặc định để đọc thống kê.")
+    if df.shape[1] <= qty_index:
+        qty_index = None
+    product_header_labels = {"ten hang", "ten hang hoa", "hang hoa", "ten vat tu"}
+    code_header_labels = {"ma vt", "ma vat tu", "ma hang", "ma hang hoa"}
+    company_keys = set()
+    processed_company_keys = set()
+    total_rows = 0
+    processed_rows = 0
+    for row_index in range(len(df)):
+        product = raw_text(cell(df, row_index, product_index))
+        if not product:
+            continue
+        product_label = normalized_header_label(product)
+        code_label = normalized_header_label(cell(df, row_index, code_index))
+        if product_label in product_header_labels or code_label in code_header_labels:
+            continue
+        if qty_index is not None and not should_process_qty(cell(df, row_index, qty_index)):
+            continue
+        company = raw_text(cell(df, row_index, company_index))
+        mst = raw_text(cell(df, row_index, mst_index))
+        if not company and not mst:
+            continue
+        company_key = (mst.casefold().strip(), company.casefold().strip())
+        company_keys.add(company_key)
+        total_rows += 1
+        code = raw_text(cell(df, row_index, code_index))
+        code_valid = bool(code and code not in {"0", "0.0"} and normalized_header_label(code) not in code_header_labels)
+        if code_valid:
+            processed_rows += 1
+            processed_company_keys.add(company_key)
+    return {
+        "phase": normalized_phase,
+        "company_count": len(company_keys),
+        "processed_company_count": len(processed_company_keys),
+        "product_row_count": total_rows,
+        "processed_product_row_count": processed_rows,
+        "company_col": columns["company"],
+        "mst_col": columns["mst"],
+        "product_col": columns["product"],
+        "code_col": columns["code"],
     }
 
 
@@ -572,6 +908,42 @@ def cache_processed_workbook(path: Path) -> str:
     target = UPLOAD_DIR / saved_name
     target.write_bytes(path.read_bytes())
     return saved_name
+
+
+def cleanup_progress_jobs(now=None):
+    now = now or time.time()
+    expired = [key for key, value in PROGRESS_JOBS.items() if now - float(value.get("updated_at", now)) > PROGRESS_TTL_SECONDS]
+    for key in expired:
+        PROGRESS_JOBS.pop(key, None)
+
+
+def update_progress_job(operation_id: str, done: int, total: int, label: str, status: str = "running") -> None:
+    if not operation_id:
+        return
+    safe_total = max(1, int(total or 1))
+    safe_done = max(0, min(int(done or 0), safe_total))
+    percent = int(round((safe_done / safe_total) * 100))
+    now = time.time()
+    with PROGRESS_LOCK:
+        cleanup_progress_jobs(now)
+        PROGRESS_JOBS[operation_id] = {
+            "operation_id": operation_id,
+            "status": status,
+            "done": safe_done,
+            "total": safe_total,
+            "percent": percent,
+            "label": raw_text(label),
+            "updated_at": now,
+        }
+
+
+def get_progress_job(operation_id: str) -> dict:
+    with PROGRESS_LOCK:
+        cleanup_progress_jobs()
+        job = dict(PROGRESS_JOBS.get(operation_id) or {})
+    if job:
+        return {key: value for key, value in job.items() if key != "updated_at"}
+    return {"operation_id": operation_id, "status": "missing", "done": 0, "total": 1, "percent": 0, "label": "Chưa có tiến trình."}
 
 
 def json_safe(value):

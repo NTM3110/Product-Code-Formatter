@@ -2,9 +2,10 @@
 
 ## Overview
 
-Native Windows desktop app (PySide6 + Python) for formatting `Mã VT` from Excel invoice data.
+Windows desktop app for formatting `Mã VT` from Excel invoice data. The active UI is React + Vite, served by a FastAPI backend and wrapped in pywebview for the desktop `.exe`.
 
 Main capabilities:
+- require LAN Keygen license activation before normal use
 - group sellers by `MST`
 - suggest and validate company prefixes
 - let users include or skip companies and products
@@ -14,6 +15,12 @@ Main capabilities:
 
 ## Current Notes
 
+- Active UI: `react_frontend/`
+- Active backend: `web_api.py`
+- Shared Excel/business logic: `app.py`
+- Desktop wrapper: `web_desktop_app.py`
+- Future edit map: `docs/PROJECT_MAP.md`
+- Fast fix checklist: `docs/FAST_CHANGE_GUIDE.md`
 - The company check page shows all company names found under the same `MST`.
 - The app still groups by seller `MST`.
 - Prefix suggestion uses the most common company name for that `MST`.
@@ -23,23 +30,37 @@ Main capabilities:
 ## Build
 
 1. Extract the project ZIP.
-2. Run `build_exe_auto.bat`.
-3. Launch `deploy\ProductCodeFormatter.exe`.
+2. Build the React bundle: `cd react_frontend; npm run build`.
+3. Build the desktop wrapper: `.\.venv\Scripts\python.exe -m PyInstaller ProductCodeFormatterWeb.spec --noconfirm`.
+4. Copy `dist\ProductCodeFormatterWeb.exe` to `deploy\ProductCodeFormatterWeb.exe`.
+
+## License Activation
+
+The desktop app shows a license activation dialog before the main window opens. Use a self-hosted `keygen-sh/keygen-api` server on the same LAN and enter:
+
+- License server URL, such as `http://license-server.local:3000` for private LAN use or `https://license-server.local` when using an HTTPS reverse proxy
+- Keygen account id or slug
+- License key
+
+For local setup notes, see `license_server/README.md`. License metadata can restrict allowed app company profiles with `allowed_profiles`, `profiles`, `company_profiles`, `allowed_companies`, or `companies`.
 
 ## Run From Source
 
-- Backend: `run_python_app.bat`
-- Native desktop source: `.venv\\Scripts\\python.exe desktop_app.py`
+- React/FastAPI web app: `run_react_app.bat`
+- Desktop wrapper from source: `run_react_native_app.bat`
+- License admin: `run_license_server_admin.bat`
 
 ## Key Paths
 
-- Backend: `app.py`
-- Native desktop app: `desktop_app.py`
-- Legacy frontend template: `frontend/src/app/app.component.html`
-- Legacy frontend styles: `frontend/src/app/app.component.css`
-- Legacy frontend tests: `frontend/src/app/app.component.spec.ts`
-- Build script: `build_exe_auto.bat`
-- Packaged app output: `deploy/ProductCodeFormatter.exe`
+- Project map: `docs/PROJECT_MAP.md`
+- Fast change guide: `docs/FAST_CHANGE_GUIDE.md`
+- Active React UI: `react_frontend/src/vietmax/VietmaxApp.tsx`
+- Inventory allocation UI: `react_frontend/src/vietmax/InventoryAllocationStage.tsx`
+- FastAPI backend: `web_api.py`
+- Shared backend logic: `app.py`
+- Desktop wrapper: `web_desktop_app.py`
+- PyInstaller spec: `ProductCodeFormatterWeb.spec`
+- Packaged app output: `deploy/ProductCodeFormatterWeb.exe`
 
 ## Context Compaction Guide
 

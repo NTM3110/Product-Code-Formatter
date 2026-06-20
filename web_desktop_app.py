@@ -1,6 +1,8 @@
 import base64
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,6 +11,14 @@ import uvicorn
 
 from app import ICON_PATH
 from web_api import app as fastapi_app, find_free_port
+
+APP_TITLE = "Product Code Formatter"
+DESKTOP_SHORTCUT_NAME = "Product Code Formatter.lnk"
+DESKTOP_SHORTCUT_ALIASES = [
+    "Product Code Formatter.lnk",
+    "ProductCodeFormatter.lnk",
+    "ProductCodeFormatterWeb.lnk",
+]
 
 
 class DesktopApi:
@@ -32,6 +42,83 @@ class DesktopApi:
         return {"saved": True, "path": str(target)}
 
 
+def ps_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def current_exe_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve()
+
+
+def ensure_desktop_shortcut() -> None:
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    exe_path = current_exe_path()
+    shortcut_names = "@(" + ",".join(ps_quote(name) for name in DESKTOP_SHORTCUT_ALIASES) + ")"
+    script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$ExePath = {ps_quote(exe_path)}
+$ShortcutName = {ps_quote(DESKTOP_SHORTCUT_NAME)}
+$ShortcutAliases = {shortcut_names}
+$Shell = New-Object -ComObject WScript.Shell
+$desktopPaths = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory')
+) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
+
+foreach ($desktop in $desktopPaths) {{
+  foreach ($name in $ShortcutAliases) {{
+    $shortcutPath = Join-Path $desktop $name
+    if (Test-Path $shortcutPath) {{
+      try {{
+        $link = $Shell.CreateShortcut($shortcutPath)
+        $link.TargetPath = $ExePath
+        $link.WorkingDirectory = Split-Path -Parent $ExePath
+        $link.IconLocation = $ExePath + ',0'
+        $link.Description = 'Product Code Formatter'
+        $link.Save()
+      }} catch {{}}
+    }}
+  }}
+}}
+
+$userDesktop = [Environment]::GetFolderPath('Desktop')
+if ($userDesktop -and (Test-Path $userDesktop)) {{
+  $shortcutPath = Join-Path $userDesktop $ShortcutName
+  $link = $Shell.CreateShortcut($shortcutPath)
+  $link.TargetPath = $ExePath
+  $link.WorkingDirectory = Split-Path -Parent $ExePath
+  $link.IconLocation = $ExePath + ',0'
+  $link.Description = 'Product Code Formatter'
+  $link.Save()
+}}
+
+$ie4uinit = Join-Path $env:WINDIR 'System32\\ie4uinit.exe'
+if (Test-Path $ie4uinit) {{
+  Start-Process -FilePath $ie4uinit -ArgumentList '-show' -WindowStyle Hidden
+}}
+""".strip()
+    startupinfo = None
+    creationflags = 0
+    if hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            text=True,
+            capture_output=True,
+            timeout=8,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    except Exception:
+        pass
+
+
 def wait_for_server(port: int, timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -52,6 +139,7 @@ def run_api_server(port: int) -> None:
 def main() -> None:
     import webview
 
+    ensure_desktop_shortcut()
     port = int(os.environ.get("PRODUCT_CODE_FORMATTER_PORT") or find_free_port())
     thread = threading.Thread(target=run_api_server, args=(port,), daemon=True)
     thread.start()

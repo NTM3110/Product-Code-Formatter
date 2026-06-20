@@ -9,6 +9,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.sisyphus/
+*/.sisyphus/
+.codex_pycache/
+.playwright-mcp/
+.pycompile_check*/
 .coverage
 htmlcov/
 
