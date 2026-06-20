@@ -32,6 +32,14 @@ export type ProcessResult = {
   processedSavedName: string;
 };
 
+export type GenericAnalyzeResult = {
+  rows_to_process: number;
+  company_count: number;
+  companies: CompanyRow[];
+  original_name?: string;
+  saved_name?: string;
+};
+
 export type InventoryAllocationMappingSection = {
   sheet: string;
   header_row: number;
@@ -211,7 +219,7 @@ export type CompanyRow = {
   safe_id: string;
   value: string;
   selected_product_names: string[];
-  all_products: Array<{ name: string; count?: number; priceRows?: Array<{ unit?: string; invoiceNo?: string; invoiceDate?: string }> }>;
+  all_products: Array<{ name: string; count?: number; minPrice?: number | null; maxPrice?: number | null; priceCount?: number; priceRows?: Array<{ price?: number | null; quantity?: number | null; amount?: number | null; excelRow?: string | number; stt?: string; unit?: string; invoiceNo?: string; invoiceDate?: string; name?: string }> }>;
   process?: boolean;
   pending_process?: boolean;
   committed_prefix?: string;

@@ -1,4 +1,4 @@
-import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, LicenseStatus, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from './types';
+import type { CompanyRow, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, LicenseStatus, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from './types';
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
@@ -12,6 +12,56 @@ export async function uploadExcel(file: File): Promise<UploadSummary> {
   const form = new FormData();
   form.append('file', file);
   return parseJsonResponse<UploadSummary>(await fetch('/api/files/upload', { method: 'POST', body: form }));
+}
+
+export async function getAppConfig(): Promise<Record<string, unknown>> {
+  return parseJsonResponse<Record<string, unknown>>(await fetch('/api/config'));
+}
+
+export async function analyzeGenericWorkbook(payload: Record<string, unknown>): Promise<GenericAnalyzeResult> {
+  return parseJsonResponse<GenericAnalyzeResult>(
+    await fetch('/api/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function previewGenericProductCodes(payload: { profile: string; products: string[]; word_rules?: Record<string, string>; first_word_rules?: Record<string, string>; repeated_phrase_removals?: string[] }) {
+  return parseJsonResponse<{ codes: Record<string, string> }>(
+    await fetch('/api/product-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function processGenericWorkbook(payload: Record<string, unknown>): Promise<Blob> {
+  const response = await fetch('/api/process', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorPayload = await response.json().catch(() => ({}));
+    throw new Error(String(errorPayload.detail || errorPayload.error || response.statusText));
+  }
+  return response.blob();
+}
+
+export async function exportPriceReportWorkbook(payload: Record<string, unknown>): Promise<Blob> {
+  const response = await fetch('/api/export_price_report', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorPayload = await response.json().catch(() => ({}));
+    throw new Error(String(errorPayload.detail || errorPayload.error || response.statusText));
+  }
+  return response.blob();
 }
 
 export async function inspectProcessedVietmaxFile(savedName: string, phase: 'purchase' | 'sales'): Promise<ProcessedFileStats> {

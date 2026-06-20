@@ -224,6 +224,14 @@ class VietmaxProductPreviewRequest(BaseModel):
     repeated_phrase_removals: list[str] | None = None
 
 
+class GenericProductPreviewRequest(BaseModel):
+    profile: str = "son_phuong"
+    products: list[str]
+    word_rules: dict[str, str] | None = None
+    first_word_rules: dict[str, str] | None = None
+    repeated_phrase_removals: list[str] | None = None
+
+
 class VietmaxSalesMatchRequest(BaseModel):
     sales_saved_name: str
     purchase_saved_name: str
@@ -571,6 +579,20 @@ def create_app() -> FastAPI:
             if name:
                 codes[name] = make_product_part(profile, name, word_rules, repeated_phrase_removals=repeated)[:MAX_CODE_LENGTH]
         return {"codes": codes}
+
+    @api.post("/api/product-preview")
+    def generic_product_preview(payload: GenericProductPreviewRequest) -> dict:
+        profile = profile_key(payload.profile)
+        word_rules = payload.word_rules or {}
+        first_word_rules = payload.first_word_rules or {}
+        repeated = payload.repeated_phrase_removals or []
+        codes = {}
+        for product in payload.products:
+            name = raw_text(product)
+            if name:
+                codes[name] = make_product_part(profile, name, word_rules, first_word_rules, repeated)[:MAX_CODE_LENGTH]
+        return {"codes": codes}
+
     @api.post("/api/vietmax/sales-match")
     def vietmax_sales_match(payload: VietmaxSalesMatchRequest) -> dict:
         sales_path = uploaded_path(payload.sales_saved_name)

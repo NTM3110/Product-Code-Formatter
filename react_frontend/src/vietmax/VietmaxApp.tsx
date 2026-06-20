@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { activateLicense, analyzeVietmaxCompanies, createPurchaseReview, createSalesMatches, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, inspectProcessedVietmaxFile, previewVietmaxProductCodes, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel } from '../api';
+import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createPurchaseReview, createSalesMatches, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel } from '../api';
 import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, LicenseStatus, MatchRow, OperationProgress, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from '../types';
 import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
 
@@ -1437,7 +1437,7 @@ export function VietmaxApp() {
   }
 
   function renderProfileStage() {
-    return <LegacyProfileWorkspace profile={profile} label={selectedProfile.label} licenseReady={licenseReady} />;
+    return <LegacyProfileWorkspace profile={profile} label={selectedProfile.label} licenseReady={licenseReady} setShellStatus={setStatus} />;
   }
 }
 
@@ -2208,40 +2208,734 @@ function LoadingStage({ title, detail, progress }: { title: string; detail: stri
   );
 }
 
-function LegacyProfileWorkspace({ profile, label, licenseReady }: { profile: ProfileKey; label: string; licenseReady: boolean }) {
+function LegacyProfileWorkspace({ profile, label, licenseReady, setShellStatus }: { profile: ProfileKey; label: string; licenseReady: boolean; setShellStatus: (message: string) => void }) {
   if (!licenseReady) {
     return <PlaceholderStage title={`${label}: cần license`} detail="Kích hoạt license trước khi mở workflow profile này." />;
   }
-  const profilePlan: Record<Exclude<ProfileKey, 'vietmax'>, { title: string; detail: string; steps: string[] }> = {
-    cao_thanh: {
-      title: 'Cao Thành',
-      detail: 'Workflow bán ra và lọc đơn giá sẽ được migrate vào React. Màn hình cũ đã tắt để tránh mở lặp app trong app.',
-      steps: ['Tải file bán ra', 'Chọn cột và công ty', 'Lọc đơn giá', 'Xuất file'],
-    },
-    son_phuong: {
-      title: 'Sơn Phương',
-      detail: 'Profile đang chờ migrate workflow riêng sang React. Dữ liệu Vietmax và profile khác vẫn được giữ riêng.',
-      steps: ['Xác nhận luồng xử lý cũ', 'Map cột', 'Review mã', 'Xuất file'],
-    },
-    quang_thinh: {
-      title: 'Quang Thịnh',
-      detail: 'Profile đang chờ migrate workflow riêng sang React. Màn hình này không còn nhúng lại app chính.',
-      steps: ['Xác nhận luồng xử lý cũ', 'Map cột', 'Review mã', 'Xuất file'],
-    },
-  };
-  const plan = profilePlan[profile as Exclude<ProfileKey, 'vietmax'>];
+  if (profile === 'cao_thanh') {
+    return <CaoThanhWorkflow label={label} setShellStatus={setShellStatus} />;
+  }
   return (
     <div className="legacy-profile-workspace native-profile-workspace">
-      <section className="profile-migration-card">
-        <span className="upload-step-badge">{plan.title}</span>
+      <section className="profile-migration-card compact-profile-card">
+        <span className="upload-step-badge">{label}</span>
         <h3>{label}</h3>
-        <p>{plan.detail}</p>
-        <div className="profile-migration-steps" aria-label={`${label} migration steps`}>
-          {plan.steps.map((step, index) => <div key={step}><strong>{index + 1}</strong><span>{step}</span></div>)}
-        </div>
+        <p>Profile này vẫn đang chờ migrate workflow riêng sang React. Cao Thành đang được chuyển trước.</p>
       </section>
     </div>
   );
+}
+
+type CaoThanhStep = 'upload' | 'company' | 'price' | 'export';
+
+type CaoThanhColumns = {
+  company_col: string;
+  mst_col: string;
+  address_col: string;
+  product_col: string;
+  qty_col: string;
+  price_col: string;
+  output_col: string;
+  invoice_status_col: string;
+  invoice_status_skip_values: string[];
+};
+
+type CaoThanhPriceSourceRow = {
+  key: string;
+  code: string;
+  company: string;
+  mst: string;
+  productName: string;
+  unit: string;
+  price: number;
+  quantity: number;
+  amount: number;
+  excelRow: string;
+  invoiceNo: string;
+  invoiceDate: string;
+};
+
+type CaoThanhPriceBucket = {
+  key: string;
+  label: string;
+  finalCode: string;
+  min: number;
+  max: number;
+  count: number;
+  quantity: number;
+  amount: number;
+  averagePrice: number;
+  marginPercent: number;
+  costUnitPrice: number;
+  costAmount: number;
+  profitAmount: number;
+  profitPercent: number;
+  rows: CaoThanhPriceSourceRow[];
+};
+
+type CaoThanhPriceGroup = {
+  key: string;
+  code: string;
+  companies: string;
+  productNames: string;
+  unit: string;
+  sourceRows: CaoThanhPriceSourceRow[];
+  min: number;
+  max: number;
+  priceCount: number;
+  quantity: number;
+  amount: number;
+  averagePrice: number;
+  filterPercent: number;
+  buckets: CaoThanhPriceBucket[];
+};
+
+const defaultCaoThanhColumns: CaoThanhColumns = {
+  company_col: 'F',
+  mst_col: 'G',
+  address_col: 'H',
+  product_col: 'M',
+  qty_col: 'O',
+  price_col: 'P',
+  output_col: 'L',
+  invoice_status_col: 'AJ',
+  invoice_status_skip_values: ['Hóa đơn đã bị điều chỉnh', 'Hóa đơn bị thay thế', 'Hóa đơn đã bị thay thế'],
+};
+
+function CaoThanhWorkflow({ label, setShellStatus }: { label: string; setShellStatus: (message: string) => void }) {
+  const [step, setStep] = useState<CaoThanhStep>('upload');
+  const [summary, setSummary] = useState<UploadSummary | null>(null);
+  const [columns, setColumns] = useState<CaoThanhColumns>(defaultCaoThanhColumns);
+  const [companies, setCompanies] = useState<CompanyRow[]>([]);
+  const [selectedCompanyIndex, setSelectedCompanyIndex] = useState(-1);
+  const [previewCodes, setPreviewCodes] = useState<Record<string, string>>({});
+  const [manualOverrides, setManualOverrides] = useState<Record<string, string>>({});
+  const [wordRules, setWordRules] = useState<Record<string, string>>({});
+  const [firstWordRules, setFirstWordRules] = useState<Record<string, string>>({});
+  const [repeatedPhrases, setRepeatedPhrases] = useState<string[]>(['inox']);
+  const [includeCompanyPrefix, setIncludeCompanyPrefix] = useState(true);
+  const [priceRangeRules, setPriceRangeRules] = useState<Record<string, any>>({});
+  const [priceGroups, setPriceGroups] = useState<CaoThanhPriceGroup[]>([]);
+  const [priceFilterAllPercent, setPriceFilterAllPercent] = useState(8);
+  const [priceAdjustAllPercent, setPriceAdjustAllPercent] = useState(0);
+  const [inventoryPairs, setInventoryPairs] = useState<InventoryPair[]>([]);
+  const [inventoryPairRules, setInventoryPairRules] = useState<InventoryRule[]>([]);
+  const [useDefaultInventoryPair, setUseDefaultInventoryPair] = useState(false);
+  const [defaultInventoryPairId, setDefaultInventoryPairId] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('Tải file bán ra Cao Thành để bắt đầu.');
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const cfg = await getAppConfig();
+        const profilesCfg = (cfg.profiles && typeof cfg.profiles === 'object' ? cfg.profiles : {}) as Record<string, any>;
+        const profileCfg = profilesCfg.cao_thanh || {};
+        const globalColumns = cfg.selected_profile === 'cao_thanh' && cfg.columns && typeof cfg.columns === 'object' ? cfg.columns as Record<string, unknown> : {};
+        const savedColumns = profileCfg.columns && typeof profileCfg.columns === 'object' ? profileCfg.columns as Record<string, unknown> : {};
+        if (!active) return;
+        setColumns(normalizeCaoThanhColumns({ ...defaultCaoThanhColumns, ...globalColumns, ...savedColumns }));
+        setWordRules(cleanStringMap(profileCfg.word_rules));
+        setFirstWordRules(cleanStringMap(profileCfg.first_word_rules));
+        setRepeatedPhrases(Array.isArray(profileCfg.repeated_phrase_removals) ? profileCfg.repeated_phrase_removals.map(String) : ['inox']);
+        setIncludeCompanyPrefix(profileCfg.include_company_prefix !== false);
+        setPriceRangeRules(profileCfg.price_range_rules && typeof profileCfg.price_range_rules === 'object' ? profileCfg.price_range_rules : {});
+        setPriceAdjustAllPercent(Number(profileCfg.price_adjust_all_percent || 0));
+        setManualOverrides(cleanStringMap(profileCfg.manual_code_overrides));
+        setMessage('Đã tải cấu hình Cao Thành.');
+      } catch (error) {
+        if (!active) return;
+        setMessage(error instanceof Error ? error.message : String(error));
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  function updateMessage(nextMessage: string) {
+    setMessage(nextMessage);
+    setShellStatus(nextMessage);
+  }
+
+  async function uploadCaoThanh(file: File | undefined) {
+    if (!file) return;
+    setBusy(true);
+    updateMessage('Đang tải file bán ra Cao Thành...');
+    try {
+      const nextSummary = await uploadExcel(file);
+      setSummary(nextSummary);
+      setCompanies([]);
+      setPreviewCodes({});
+      setPriceGroups([]);
+      setStep('company');
+      updateMessage(`Đã tải ${nextSummary.original_name}. Chọn cột rồi tải danh sách công ty.`);
+    } catch (error) {
+      updateMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function analyzeCompanies() {
+    if (!summary) return;
+    setBusy(true);
+    updateMessage('Đang đọc công ty và hàng hóa Cao Thành...');
+    try {
+      const result = await analyzeGenericWorkbook({ saved_name: summary.saved_name, original_name: summary.original_name, profile: 'cao_thanh', ...columns });
+      const rows = sortAppliedCompanyRows(result.companies.map((company) => {
+        const process = company.process ?? true;
+        const value = normalizePrefixValue(company.value || company.default_prefix || '');
+        return { ...company, value, process, pending_process: process, committed_prefix: value };
+      }));
+      const codes = await loadCaoThanhPreviewCodes(rows, wordRules, firstWordRules, repeatedPhrases);
+      setCompanies(rows);
+      setSelectedCompanyIndex(firstDisplayedCompanyIndex(rows));
+      setPreviewCodes(codes);
+      setPriceGroups([]);
+      updateMessage(`Đã tải ${result.company_count} công ty, ${result.rows_to_process} dòng xử lý Cao Thành.`);
+    } catch (error) {
+      updateMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateCompanyPending(index: number, pending: boolean) {
+    setCompanies((rows) => rows.map((company, rowIndex) => rowIndex === index ? { ...company, pending_process: pending } : company));
+    setSelectedCompanyIndex(index);
+  }
+
+  function bulkUpdateCompanies(pending: boolean) {
+    setCompanies((rows) => rows.map((company) => ({ ...company, pending_process: pending })));
+  }
+
+  function updateProduct(companyIndex: number, productName: string, selected: boolean) {
+    setCompanies((rows) => rows.map((company, rowIndex) => {
+      if (rowIndex !== companyIndex) return company;
+      const current = new Set(selectedProductNames(company));
+      if (selected) current.add(productName);
+      else current.delete(productName);
+      return { ...company, selected_product_names: company.all_products.map((product) => product.name).filter((name) => current.has(name)) };
+    }));
+    setSelectedCompanyIndex(companyIndex);
+    setPriceGroups([]);
+  }
+
+  function updateProductCode(companyIndex: number, productName: string, code: string) {
+    const company = companies[companyIndex];
+    if (!company) return;
+    setManualOverrides((current) => ({ ...current, [productKey(company.mst, productName)]: code.toUpperCase() }));
+    setSelectedCompanyIndex(companyIndex);
+    setPriceGroups([]);
+  }
+
+  function updateCompanyPrefix(index: number, value: string) {
+    setCompanies((rows) => rows.map((company, rowIndex) => rowIndex === index ? { ...company, value } : company));
+    setSelectedCompanyIndex(index);
+    setPriceGroups([]);
+  }
+
+  async function refreshPreviewCodes() {
+    if (!companies.length) return;
+    setBusy(true);
+    updateMessage('Đang cập nhật mã VT preview Cao Thành...');
+    try {
+      const codes = await loadCaoThanhPreviewCodes(companies, wordRules, firstWordRules, repeatedPhrases);
+      setPreviewCodes(codes);
+      setPriceGroups([]);
+      updateMessage('Đã cập nhật mã VT preview Cao Thành.');
+    } catch (error) {
+      updateMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function applyCompanyChoices() {
+    const committed = sortAppliedCompanyRows(companies.map((company) => {
+      const process = company.pending_process ?? company.process ?? true;
+      const value = normalizePrefixValue(company.value);
+      return { ...company, process, pending_process: process, value, committed_prefix: value };
+    }));
+    const nextGroups = buildCaoThanhPriceGroups(committed, previewCodes, manualOverrides, includeCompanyPrefix, priceRangeRules, priceAdjustAllPercent);
+    setCompanies(committed);
+    setSelectedCompanyIndex(firstDisplayedCompanyIndex(committed));
+    setPriceGroups(nextGroups);
+    setStep('price');
+    updateMessage(`Đã áp dụng ${committed.filter((company) => company.process !== false).length} công ty. Có ${nextGroups.length} mã VT để lọc giá.`);
+  }
+
+  function updateGroupPercent(groupKey: string, value: number) {
+    setPriceGroups((groups) => groups.map((group) => group.key === groupKey ? rebuildCaoThanhPriceGroup({ ...group, filterPercent: clampPercent(value, group.filterPercent || 8) }, priceAdjustAllPercent) : group));
+  }
+
+  function updateBucketMargin(groupKey: string, bucketKey: string, value: number) {
+    setPriceGroups((groups) => groups.map((group) => group.key === groupKey ? { ...group, buckets: group.buckets.map((bucket) => bucket.key === bucketKey ? rebuildCaoThanhBucket({ ...bucket, marginPercent: clampPercent(value, bucket.marginPercent || 0) }) : bucket) } : group));
+  }
+
+  function applyBulkPriceFilter() {
+    setPriceGroups((groups) => groups.map((group) => rebuildCaoThanhPriceGroup({ ...group, filterPercent: clampPercent(priceFilterAllPercent, 8) }, priceAdjustAllPercent)));
+  }
+
+  function applyBulkMargin() {
+    setPriceGroups((groups) => groups.map((group) => ({ ...group, buckets: group.buckets.map((bucket) => rebuildCaoThanhBucket({ ...bucket, marginPercent: clampPercent(priceAdjustAllPercent, 0) })) })));
+  }
+
+  async function exportPriceReport() {
+    if (!priceGroups.length) return;
+    setBusy(true);
+    updateMessage('Đang xuất báo cáo lọc giá Cao Thành...');
+    try {
+      const payload = caoThanhPriceReportPayload(summary?.original_name || 'cao_thanh.xlsx', priceGroups);
+      const blob = await exportPriceReportWorkbook(payload);
+      const saved = await saveBlob(blob, caoThanhReportFileName(summary?.original_name || 'cao_thanh.xlsx'));
+      updateMessage(saved ? 'Đã xuất báo cáo lọc giá Cao Thành.' : 'Đã hủy lưu báo cáo lọc giá Cao Thành.');
+    } catch (error) {
+      updateMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function processCaoThanh() {
+    if (!summary) return;
+    const committedGroups = priceGroups.length ? priceGroups : buildCaoThanhPriceGroups(companies, previewCodes, manualOverrides, includeCompanyPrefix, priceRangeRules, priceAdjustAllPercent);
+    setBusy(true);
+    updateMessage('Đang xử lý file Cao Thành...');
+    try {
+      const rangeRules = caoThanhRangeRules(committedGroups);
+      setPriceRangeRules((current) => ({ ...current, ...rangeRules }));
+      const payload = buildCaoThanhProcessPayload(summary, columns, companies, manualOverrides, includeCompanyPrefix, wordRules, firstWordRules, repeatedPhrases, rangeRules, priceAdjustAllPercent);
+      const blob = await processGenericWorkbook(payload);
+      const saved = await saveBlob(blob, `${fileStem(summary.original_name)}_ket_qua_xu_ly.zip`);
+      setStep('export');
+      updateMessage(saved ? 'Đã xuất file Cao Thành và lưu cấu hình lọc giá.' : 'Đã xử lý Cao Thành; người dùng đã hủy lưu file.');
+    } catch (error) {
+      updateMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateWordRule(index: number, field: 'from' | 'to', value: string) {
+    const entries = Object.entries(wordRules);
+    entries[index] = field === 'from' ? [value, entries[index]?.[1] || ''] : [entries[index]?.[0] || '', value];
+    setWordRules(Object.fromEntries(entries.filter(([from]) => from.trim())));
+    setPriceGroups([]);
+  }
+
+  function addWordRule() {
+    setWordRules((current) => ({ ...current, '': '' }));
+  }
+
+  function updateRepeated(index: number, value: string) {
+    setRepeatedPhrases((current) => current.map((item, rowIndex) => rowIndex === index ? value : item));
+    setPriceGroups([]);
+  }
+
+  function addRepeated() {
+    setRepeatedPhrases((current) => [...current, '']);
+  }
+
+  function removeRepeated(index: number) {
+    setRepeatedPhrases((current) => current.filter((_, rowIndex) => rowIndex !== index));
+    setPriceGroups([]);
+  }
+
+  const priceTotals = caoThanhPriceTotals(priceGroups);
+
+  return (
+    <div className="cao-thanh-workspace">
+      <div className="cao-stage-pills" role="tablist" aria-label="Cao Thành workflow">
+        <button type="button" className={step === 'upload' ? 'active' : ''} disabled={busy} onClick={() => setStep('upload')}>1. Tải file bán ra</button>
+        <button type="button" className={step === 'company' ? 'active' : ''} disabled={busy || !summary} onClick={() => setStep('company')}>2. Cột & công ty</button>
+        <button type="button" className={step === 'price' ? 'active' : ''} disabled={busy || !priceGroups.length} onClick={() => setStep('price')}>3. Lọc đơn giá</button>
+        <button type="button" className={step === 'export' ? 'active' : ''} disabled={busy || !summary} onClick={() => setStep('export')}>4. Xuất file</button>
+      </div>
+      <div className="status-bar"><strong>{label}</strong><span>{busy ? 'Đang xử lý... ' : ''}{message}</span></div>
+
+      {step === 'upload' && <UploadStage title="HD bán ra Cao Thành" summary={summary} disabled={busy} onUpload={uploadCaoThanh} />}
+
+      {step === 'company' && (
+        <div className="cao-company-step">
+          <div className="cao-column-card">
+            <div className="stage-toolbar"><h3>Cột xử lý Cao Thành</h3><div className="toolbar-actions"><button type="button" disabled={busy || !summary} onClick={analyzeCompanies}>{companies.length ? 'Tải lại danh sách' : 'Tải danh sách công ty'}</button></div></div>
+            <div className="column-grid">{caoThanhColumnFields.map((field) => <label key={field.key}><span>{field.label}</span><select value={columns[field.key]} onChange={(event) => setColumns({ ...columns, [field.key]: event.currentTarget.value })}>{summary?.columns.map((column) => <option key={`${field.key}-${column.letter}`} value={column.letter}>{column.label}</option>) ?? <option value={columns[field.key]}>{columns[field.key]}</option>}</select></label>)}</div>
+          </div>
+          {companies.length ? <CompanyRulesStage companies={companies} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={previewCodes} productCodeOverrides={manualOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhrases} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy="last_2_words" prefixMstDigits={3} onIncludeCompanyPrefixChange={(include) => { setIncludeCompanyPrefix(include); setPriceGroups([]); }} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={() => {}} onApplyPrefixPresetToAll={() => {}} onCompanySelect={setSelectedCompanyIndex} onCompanyChange={updateCompanyPending} onBulkCompanyChange={bulkUpdateCompanies} onProductChange={updateProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyChoices} onRefreshPreviews={refreshPreviewCodes} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeated} onAddRepeated={addRepeated} onRemoveRepeated={removeRepeated} onAddInventoryPair={() => { const id = `pair-${Date.now()}`; setInventoryPairs([...inventoryPairs, { id, ma_kho: '', tk_vat_tu: '' }]); setDefaultInventoryPairId(defaultInventoryPairId || id); }} onInventoryPairChange={(index, field, value) => setInventoryPairs((rows) => rows.map((pair, rowIndex) => rowIndex === index ? { ...pair, [field]: value.toUpperCase() } : pair))} onRemoveInventoryPair={(index) => setInventoryPairs((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} onInventoryDefaultsChange={(update) => { if ('useDefaultInventoryPair' in update) setUseDefaultInventoryPair(Boolean(update.useDefaultInventoryPair)); if ('defaultInventoryPairId' in update) setDefaultInventoryPairId(String(update.defaultInventoryPairId || '')); }} onAddInventoryRule={() => setInventoryPairRules((rows) => [...rows, { source_col: 'M', operator: 'contains', value: '', pair_id: defaultInventoryPairId || inventoryPairs[0]?.id || '', enabled: true, priority: 1 }])} onInventoryRuleChange={(index, update) => setInventoryPairRules((rows) => rows.map((rule, rowIndex) => rowIndex === index ? { ...rule, ...update } : rule))} onRemoveInventoryRule={(index) => setInventoryPairRules((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} /> : <PreviewPanel summary={summary} />}
+        </div>
+      )}
+
+      {step === 'price' && (
+        <div className="cao-price-step">
+          <div className="stage-toolbar">
+            <div><h3>Lọc đơn giá Cao Thành</h3><p className="muted">Gộp theo Mã VT cuối cùng, chia nhóm đơn giá theo % lọc, rồi xuất file với hậu tố .001/.002 khi cần.</p></div>
+            <div className="toolbar-actions"><button type="button" className="btn-secondary" disabled={busy} onClick={() => setStep('company')}>Quay lại công ty</button><button type="button" className="btn-secondary" disabled={busy || !priceGroups.length} onClick={exportPriceReport}>Xuất báo cáo giá</button><button type="button" disabled={busy || !priceGroups.length} onClick={processCaoThanh}>Xử lý & xuất file</button></div>
+          </div>
+          <div className="cao-price-stats"><span><strong>{priceGroups.length}</strong>Mã VT</span><span><strong>{formatCount(priceTotals.rows)}</strong>Dòng giá</span><span><strong>{formatDecimal(priceTotals.quantity)}</strong>Số lượng</span><span><strong>{formatMoney(priceTotals.amount)}</strong>Doanh thu</span><span><strong>{formatMoney(priceTotals.cost)}</strong>Giá vốn dự tính</span></div>
+          <div className="cao-price-controls"><label>Áp % lọc<input type="number" min={0.1} step={0.1} value={priceFilterAllPercent} onChange={(event) => setPriceFilterAllPercent(Number(event.currentTarget.value || 8))} /></label><button type="button" className="btn-secondary" disabled={busy || !priceGroups.length} onClick={applyBulkPriceFilter}>Áp % lọc</button><label>Áp % lãi<input type="number" min={0} step={0.1} value={priceAdjustAllPercent} onChange={(event) => setPriceAdjustAllPercent(Number(event.currentTarget.value || 0))} /></label><button type="button" className="btn-secondary" disabled={busy || !priceGroups.length} onClick={applyBulkMargin}>Áp % lãi</button></div>
+          <div className="inner-scroll cao-price-scroll"><table className="cao-price-table"><thead><tr><th>Mã VT</th><th>Hàng hóa</th><th>Dòng giá</th><th>Giá min/max</th><th>% lọc</th><th>Nhóm sau lọc</th></tr></thead><tbody>{priceGroups.map((group) => <tr key={group.key}><td><code>{group.code}</code><div className="muted">{group.companies}</div></td><td>{group.productNames}</td><td>{group.sourceRows.length} dòng / {formatDecimal(group.quantity)}</td><td>{formatMoney(group.min)} → {formatMoney(group.max)}</td><td><input className="price-percent-input" type="number" min={0.1} step={0.1} value={group.filterPercent} onChange={(event) => updateGroupPercent(group.key, Number(event.currentTarget.value || 8))} /></td><td><div className="cao-bucket-list">{group.buckets.map((bucket) => <div className="cao-bucket" key={bucket.key}><strong>{bucket.finalCode}</strong><span>{formatMoney(bucket.min)} → {formatMoney(bucket.max)}</span><span>{bucket.count} dòng, TB {formatMoney(bucket.averagePrice)}</span><label>% lãi <input className="price-percent-input" type="number" min={0} step={0.1} value={bucket.marginPercent} onChange={(event) => updateBucketMargin(group.key, bucket.key, Number(event.currentTarget.value || 0))} /></label><span>Giá vốn {formatMoney(bucket.costUnitPrice)}</span></div>)}</div></td></tr>)}</tbody></table></div>
+        </div>
+      )}
+
+      {step === 'export' && <ProcessStage title="Xuất file Cao Thành" detail="File đã được xử lý theo lựa chọn công ty, hàng hóa và lọc đơn giá. Có thể xuất lại file hoặc báo cáo giá từ cache cấu hình hiện tại." buttonLabel="Xử lý & xuất lại" disabled={busy || !summary} onProcess={processCaoThanh} />}
+    </div>
+  );
+}
+
+const caoThanhColumnFields: Array<{ key: keyof CaoThanhColumns; label: string }> = [
+  { key: 'company_col', label: 'Công ty' },
+  { key: 'mst_col', label: 'MST' },
+  { key: 'address_col', label: 'Địa chỉ' },
+  { key: 'product_col', label: 'Tên hàng' },
+  { key: 'qty_col', label: 'Số lượng' },
+  { key: 'price_col', label: 'Đơn giá' },
+  { key: 'output_col', label: 'Mã VT xuất' },
+  { key: 'invoice_status_col', label: 'Trạng thái HĐ' },
+];
+
+function normalizeCaoThanhColumns(raw: Record<string, unknown>): CaoThanhColumns {
+  const columnValue = (key: keyof CaoThanhColumns) => {
+    const value = String(raw[key] ?? defaultCaoThanhColumns[key] ?? '').trim().toUpperCase();
+    return value || String(defaultCaoThanhColumns[key] || '').toUpperCase();
+  };
+  const skipValues = Array.isArray(raw.invoice_status_skip_values)
+    ? raw.invoice_status_skip_values.map(String).filter((item) => item.trim())
+    : defaultCaoThanhColumns.invoice_status_skip_values;
+  return {
+    company_col: columnValue('company_col'),
+    mst_col: columnValue('mst_col'),
+    address_col: columnValue('address_col'),
+    product_col: columnValue('product_col'),
+    qty_col: columnValue('qty_col'),
+    price_col: columnValue('price_col'),
+    output_col: columnValue('output_col'),
+    invoice_status_col: columnValue('invoice_status_col'),
+    invoice_status_skip_values: skipValues,
+  };
+}
+
+function cleanStringMap(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>)
+      .map(([key, value]) => [key.trim(), String(value ?? '').trim()])
+      .filter(([key, value]) => key && value),
+  );
+}
+
+async function loadCaoThanhPreviewCodes(
+  companies: CompanyRow[],
+  wordRules: Record<string, string>,
+  firstWordRules: Record<string, string>,
+  repeatedPhraseRemovals: string[],
+) {
+  const products = Array.from(new Set(companies.flatMap((company) => company.all_products.map((product) => product.name)).filter(Boolean)));
+  if (!products.length) return {};
+  const result = await previewGenericProductCodes({
+    profile: 'cao_thanh',
+    products,
+    word_rules: wordRules,
+    first_word_rules: firstWordRules,
+    repeated_phrase_removals: repeatedPhraseRemovals.filter((phrase) => phrase.trim()),
+  });
+  return result.codes;
+}
+
+function clampPercent(value: number, fallback: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(1000, parsed));
+}
+
+function numericValue(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const text = String(value ?? '').trim();
+  if (!text) return 0;
+  const normalized = text.replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function fileStem(filename: string) {
+  return String(filename || 'output').replace(/\.[^.]+$/, '') || 'output';
+}
+
+function formatDecimal(value: number | undefined) {
+  return Number(value || 0).toLocaleString('vi-VN', { maximumFractionDigits: 3 });
+}
+
+function formatMoney(value: number | undefined) {
+  return Number(value || 0).toLocaleString('vi-VN', { maximumFractionDigits: 2 });
+}
+
+function buildCaoThanhPriceGroups(
+  companies: CompanyRow[],
+  previewCodes: Record<string, string>,
+  manualOverrides: Record<string, string>,
+  includePrefix: boolean,
+  savedRules: Record<string, any>,
+  defaultMarginPercent: number,
+): CaoThanhPriceGroup[] {
+  const grouped = new Map<string, CaoThanhPriceGroup>();
+  companies.forEach((company) => {
+    if (company.process === false) return;
+    const selected = new Set(selectedProductNames(company));
+    company.all_products.forEach((product) => {
+      if (!selected.has(product.name)) return;
+      const code = productDisplayCode(company, product.name, previewCodes, manualOverrides, includePrefix);
+      if (!code) return;
+      const rows = product.priceRows || [];
+      rows.forEach((row, rowIndex) => {
+        const price = numericValue(row.price);
+        const quantity = numericValue(row.quantity);
+        const amount = numericValue(row.amount) || price * quantity;
+        if (price <= 0) return;
+        const sourceRow: CaoThanhPriceSourceRow = {
+          key: `${company.mst}|${product.name}|${row.excelRow ?? rowIndex}|${rowIndex}`,
+          code,
+          company: company.company,
+          mst: company.mst,
+          productName: product.name,
+          unit: String(row.unit ?? ''),
+          price,
+          quantity,
+          amount,
+          excelRow: String(row.excelRow ?? ''),
+          invoiceNo: String(row.invoiceNo ?? ''),
+          invoiceDate: String(row.invoiceDate ?? ''),
+        };
+        const current = grouped.get(code);
+        if (current) {
+          current.sourceRows.push(sourceRow);
+          current.companies = mergeLabelList(current.companies, company.company);
+          current.productNames = mergeLabelList(current.productNames, product.name);
+          current.unit = mergeLabelList(current.unit, sourceRow.unit);
+        } else {
+          const savedRule = savedRules && typeof savedRules === 'object' ? savedRules[code] : undefined;
+          grouped.set(code, {
+            key: code,
+            code,
+            companies: company.company,
+            productNames: product.name,
+            unit: sourceRow.unit,
+            sourceRows: [sourceRow],
+            min: 0,
+            max: 0,
+            priceCount: 0,
+            quantity: 0,
+            amount: 0,
+            averagePrice: 0,
+            filterPercent: Number(savedRule?.percent || 8),
+            buckets: [],
+          });
+        }
+      });
+    });
+  });
+  return Array.from(grouped.values())
+    .map((group) => rebuildCaoThanhPriceGroup(group, defaultMarginPercent))
+    .sort((left, right) => left.code.localeCompare(right.code, 'vi'));
+}
+
+function mergeLabelList(current: string, next: string) {
+  const values = new Set(current.split(' / ').filter(Boolean));
+  if (next) values.add(next);
+  return Array.from(values).slice(0, 4).join(' / ');
+}
+
+function rebuildCaoThanhPriceGroup(group: CaoThanhPriceGroup, defaultMarginPercent: number): CaoThanhPriceGroup {
+  const rows = [...group.sourceRows].sort((left, right) => left.price - right.price);
+  const prices = rows.map((row) => row.price).filter((price) => price > 0);
+  const min = prices.length ? Math.min(...prices) : 0;
+  const max = prices.length ? Math.max(...prices) : 0;
+  const percent = clampPercent(group.filterPercent, 8) || 8;
+  const step = min > 0 ? min * percent / 100 : 0;
+  const rawBuckets = new Map<number, CaoThanhPriceSourceRow[]>();
+  rows.forEach((row) => {
+    const rawIndex = step > 0 ? Math.max(1, Math.floor((row.price - min) / step) + 1) : 1;
+    rawBuckets.set(rawIndex, [...(rawBuckets.get(rawIndex) || []), row]);
+  });
+  const previousMargins = new Map(group.buckets.map((bucket) => [bucket.key, bucket.marginPercent || defaultMarginPercent || 0]));
+  const buckets = Array.from(rawBuckets.entries())
+    .sort(([left], [right]) => left - right)
+    .map(([rawIndex, bucketRows], index) => {
+      const suffix = `${index + 1}`.padStart(3, '0');
+      const key = `${group.code}|${rawIndex}`;
+      return rebuildCaoThanhBucket({
+        key,
+        label: `Nhóm ${index + 1}`,
+        finalCode: `${group.code}.${suffix}`,
+        min: Math.min(...bucketRows.map((row) => row.price)),
+        max: Math.max(...bucketRows.map((row) => row.price)),
+        count: bucketRows.length,
+        quantity: bucketRows.reduce((sum, row) => sum + row.quantity, 0),
+        amount: bucketRows.reduce((sum, row) => sum + row.amount, 0),
+        averagePrice: 0,
+        marginPercent: previousMargins.get(key) ?? defaultMarginPercent ?? 0,
+        costUnitPrice: 0,
+        costAmount: 0,
+        profitAmount: 0,
+        profitPercent: 0,
+        rows: bucketRows,
+      });
+    });
+  const quantity = rows.reduce((sum, row) => sum + row.quantity, 0);
+  const amount = rows.reduce((sum, row) => sum + row.amount, 0);
+  return {
+    ...group,
+    sourceRows: rows,
+    min,
+    max,
+    priceCount: new Set(prices).size,
+    quantity,
+    amount,
+    averagePrice: quantity ? amount / quantity : 0,
+    filterPercent: percent,
+    buckets,
+  };
+}
+
+function rebuildCaoThanhBucket(bucket: CaoThanhPriceBucket): CaoThanhPriceBucket {
+  const quantity = bucket.rows.reduce((sum, row) => sum + row.quantity, 0);
+  const amount = bucket.rows.reduce((sum, row) => sum + row.amount, 0);
+  const averagePrice = quantity ? amount / quantity : 0;
+  const margin = clampPercent(bucket.marginPercent, 0);
+  const costUnitPrice = averagePrice / (1 + margin / 100);
+  const costAmount = costUnitPrice * quantity;
+  const profitAmount = amount - costAmount;
+  return {
+    ...bucket,
+    quantity,
+    amount,
+    averagePrice,
+    marginPercent: margin,
+    costUnitPrice,
+    costAmount,
+    profitAmount,
+    profitPercent: amount ? profitAmount / amount * 100 : 0,
+  };
+}
+
+function caoThanhRangeRules(groups: CaoThanhPriceGroup[]) {
+  return Object.fromEntries(groups.filter((group) => group.min > 0 && group.max >= group.min).map((group) => [group.code, {
+    min_price: group.min,
+    max_price: group.max,
+    percent: group.filterPercent,
+    groups: group.buckets.map((bucket, index) => ({
+      index: index + 1,
+      label: bucket.label,
+      min_price: bucket.min,
+      max_price: bucket.max,
+      average_price: bucket.averagePrice,
+      adjust_percent: bucket.marginPercent,
+    })),
+  }]));
+}
+
+function caoThanhPriceTotals(groups: CaoThanhPriceGroup[]) {
+  return {
+    rows: groups.reduce((sum, group) => sum + group.sourceRows.length, 0),
+    quantity: groups.reduce((sum, group) => sum + group.quantity, 0),
+    amount: groups.reduce((sum, group) => sum + group.amount, 0),
+    cost: groups.reduce((sum, group) => sum + group.buckets.reduce((bucketSum, bucket) => bucketSum + bucket.costAmount, 0), 0),
+  };
+}
+
+function caoThanhPriceReportPayload(originalName: string, groups: CaoThanhPriceGroup[]) {
+  const summaryHeaders = ['Mã VT', 'Tên hàng', 'Công ty', 'ĐVT', 'Số dòng', 'SL', 'Giá min', 'Giá max', '% lọc', 'Nhóm', 'Mã VT xuất', 'Giá TB', '% lãi', 'Giá vốn dự tính', 'Tiền hàng', 'Tiền vốn'];
+  const detailHeaders = ['Mã VT xuất', 'Mã VT gốc', 'Ngày HĐ', 'Số HĐ', 'Công ty', 'MST', 'Tên hàng', 'ĐVT', 'SL', 'Đơn giá', 'Thành tiền', 'Dòng Excel'];
+  const summaryRows = groups.flatMap((group) => group.buckets.map((bucket) => ({
+    'Mã VT': group.code,
+    'Tên hàng': group.productNames,
+    'Công ty': group.companies,
+    'ĐVT': group.unit,
+    'Số dòng': bucket.count,
+    'SL': bucket.quantity,
+    'Giá min': bucket.min,
+    'Giá max': bucket.max,
+    '% lọc': group.filterPercent,
+    'Nhóm': bucket.label,
+    'Mã VT xuất': bucket.finalCode,
+    'Giá TB': bucket.averagePrice,
+    '% lãi': bucket.marginPercent,
+    'Giá vốn dự tính': bucket.costUnitPrice,
+    'Tiền hàng': bucket.amount,
+    'Tiền vốn': bucket.costAmount,
+  })));
+  const detailRows = groups.flatMap((group) => group.buckets.flatMap((bucket) => bucket.rows.map((row) => ({
+    'Mã VT xuất': bucket.finalCode,
+    'Mã VT gốc': group.code,
+    'Ngày HĐ': row.invoiceDate,
+    'Số HĐ': row.invoiceNo,
+    'Công ty': row.company,
+    'MST': row.mst,
+    'Tên hàng': row.productName,
+    'ĐVT': row.unit,
+    'SL': row.quantity,
+    'Đơn giá': row.price,
+    'Thành tiền': row.amount,
+    'Dòng Excel': row.excelRow,
+  }))));
+  return {
+    filename: `${fileStem(originalName)}_bao_cao_loc_gia.xlsx`,
+    sheets: [
+      { name: 'Tong hop loc gia', headers: summaryHeaders, rows: summaryRows },
+      { name: 'Chi tiet gia', headers: detailHeaders, rows: detailRows },
+    ],
+  };
+}
+
+function caoThanhReportFileName(originalName: string) {
+  return `${fileStem(originalName)}_bao_cao_loc_gia.xlsx`;
+}
+
+function buildCaoThanhProcessPayload(
+  summary: UploadSummary,
+  columns: CaoThanhColumns,
+  companies: CompanyRow[],
+  manualOverrides: Record<string, string>,
+  includeCompanyPrefix: boolean,
+  wordRules: Record<string, string>,
+  firstWordRules: Record<string, string>,
+  repeatedPhrases: string[],
+  priceRangeRules: Record<string, any>,
+  priceAdjustAllPercent: number,
+) {
+  const activeCompanies = companies.filter((company) => company.process !== false);
+  return {
+    saved_name: summary.saved_name,
+    original_name: summary.original_name,
+    profile: 'cao_thanh',
+    ...columns,
+    include_company_prefix: includeCompanyPrefix,
+    prefix_strategy: 'last_2_words',
+    prefix_mst_digits: 3,
+    prefix_strategy_values: emptyPrefixStrategyValues(),
+    word_rules: wordRules,
+    first_word_rules: firstWordRules,
+    repeated_phrase_removals: repeatedPhrases.filter((phrase) => phrase.trim()),
+    manual_code_overrides: manualOverrides,
+    price_range_rules: priceRangeRules,
+    price_adjust_all_percent: priceAdjustAllPercent,
+    prefixes: companyPrefixes(companies),
+    removed_companies: Object.fromEntries(companies.filter((company) => company.process === false).map((company) => [company.mst, true])),
+    skipped_products_map: Object.fromEntries(companies.map((company) => {
+      const selected = new Set(selectedProductNames(company));
+      const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
+      return [company.mst, skipped];
+    }).filter(([, skipped]) => Array.isArray(skipped) && skipped.length)),
+    all_mst: companies.map((company) => company.mst),
+    process_mst: activeCompanies.map((company) => company.mst),
+    mst_safe_id: companies.map((company, index) => `${company.mst}|||${index}`),
+    ...companyPrefixFields(companies),
+    ...Object.fromEntries(companies.flatMap((company, index) => (company.process === false ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
+  };
+}
+function PreviewPanel({ summary }: { summary: UploadSummary | null }) {
+  if (!summary) return <PlaceholderStage title="Chưa có file" detail="Tải file bán ra trước." />;
+  const previewKeys = summary.preview.length ? Object.keys(summary.preview[0]) : [];
+  return <div className="preview-panel"><h3>Xem trước dữ liệu</h3><div className="preview-scroll"><table><thead><tr>{previewKeys.map((key) => <th key={key}>{key}</th>)}</tr></thead><tbody>{summary.preview.map((row, index) => <tr key={index}>{previewKeys.map((key) => <td key={key}>{row[key]}</td>)}</tr>)}</tbody></table></div></div>;
 }
 
 function ReviewTable({ groups, collapsedGroups, onToggleGroup, onRowChange, reviewScope }: { groups: ReviewDisplayGroup[]; collapsedGroups: Record<string, boolean>; onToggleGroup: (groupTitle: string) => void; onRowChange?: (index: number, update: Partial<ReviewRow>) => void; reviewScope?: 'all' | 'company' }) {
