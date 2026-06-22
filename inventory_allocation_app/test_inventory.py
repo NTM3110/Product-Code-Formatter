@@ -104,8 +104,39 @@ def up_sales_file(code, quantity, price):
 
 
 class AllocationTests(unittest.TestCase):
+    def test_split_sales_ledger_preserves_source_sale_and_tax_amounts(self):
+        purchase = [
+            line("purchase", "PAPER", 5, 40, invoice_no="M1", invoice_date="01/01/2026", warehouse_code="KVT", warehouse_account="152")
+        ]
+        sales = [
+            line(
+                "sales",
+                "PAPER",
+                10,
+                100,
+                invoice_no="B1",
+                invoice_date="02/01/2026",
+                line_amount=1000.3,
+                tax_amount=80.07,
+            )
+        ]
+        allocations, _, _, _ = allocate_stock([], purchase, sales, {"allow_negative_export": True})
+
+        ledger = build_inventory_ledger([], purchase, allocations, sales_lines=sales)
+        sale_rows = [
+            row
+            for warehouse in ledger["warehouses"]
+            for group in warehouse["groups"]
+            for row in group["rows"]
+            if row["type"] == "sale"
+        ]
+
+        self.assertEqual(len(sale_rows), 2)
+        self.assertAlmostEqual(sum(row["sale_amount"] for row in sale_rows), 1000.3)
+        self.assertAlmostEqual(sum(row["tax_amount"] for row in sale_rows), 80.07)
+
     def test_sale_warehouse_without_inbound_keeps_zero_cost_and_zero_margin(self):
-        purchase = [line("purchase", "PAPER", 10, 50, invoice_no="M1", invoice_date="01/01/2026", warehouse_code="KHH", warehouse_account="156")]
+        purchase = [line("purchase", "PAPER", 10, 50, invoice_no="M1", invoice_date="01/01/2026", warehouse_code="KVT", warehouse_account="152")]
         sales = [line("sales", "PAPER", 3, 120, invoice_no="B1", invoice_date="02/01/2026", party_name="Khach A", warehouse_code="KGCI", warehouse_account="1552")]
         allocations, _, _, _ = allocate_stock([], purchase, sales, {"allow_negative_export": True})
 
@@ -422,7 +453,7 @@ class AllocationTests(unittest.TestCase):
         )
         ledger = build_inventory_ledger([], purchase, allocations, company_profile="son_phuong")
 
-        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KHH"])
+        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KVT"])
         self.assertEqual(summary["finished_quantity"], 0)
         self.assertGreater(summary["negative_export_quantity"], 0)
         self.assertEqual(allocations[0]["used"][0]["ledger_variant_code"], "PIPE-G")
@@ -472,14 +503,14 @@ class AllocationTests(unittest.TestCase):
         )
         result = load_workbook(result_content)
 
-        self.assertIn("SoChiTietKHH", result.sheetnames)
+        self.assertIn("SoChiTietKVT", result.sheetnames)
         self.assertNotIn("SoChiTietKTP", result.sheetnames)
         self.assertNotIn("SoChiTietHH_TP", result.sheetnames)
-        self.assertIn("TongHopNXT_KHH", result.sheetnames)
+        self.assertIn("TongHopNXT_KVT", result.sheetnames)
         self.assertNotIn("TongHopNXT_KTP", result.sheetnames)
-        self.assertIn("BaoCaoBH_KHH", result.sheetnames)
+        self.assertIn("BaoCaoBH_KVT", result.sheetnames)
         self.assertNotIn("BaoCaoBH_KTP", result.sheetnames)
-        self.assertIn("BangKeHDBH_KHH", result.sheetnames)
+        self.assertIn("BangKeHDBH_KVT", result.sheetnames)
         self.assertNotIn("BangKeHDBH_KTP", result.sheetnames)
 
     def test_ambiguous_steel_report_does_not_treat_nong_as_ong(self):
@@ -834,17 +865,17 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual([purchase_sheet.cell(1, column).value for column in range(1, 10)], [
             "MST", "Tên công ty", "Số HĐ", "Ngày HĐ", "Mã kho", "Mã VT", "Số lượng", "Đơn giá mua", "Thành tiền mua",
         ])
-        self.assertEqual(purchase_sheet.cell(2, 5).value, "KHH")
+        self.assertEqual(purchase_sheet.cell(2, 5).value, "KVT")
         self.assertEqual(purchase_sheet.cell(2, 6).value, "A.001")
         self.assertEqual(purchase_sheet.cell(3, 9).value, 270)
 
-        self.assertEqual(sales_sheet.cell(2, 12).value, "KHH")
+        self.assertEqual(sales_sheet.cell(2, 12).value, "KVT")
         self.assertEqual(sales_sheet.cell(2, 13).value, "A.002")
         self.assertEqual(sales_sheet.cell(2, 5).value, 3)
         self.assertEqual(sales_sheet.cell(2, 7).value, 360)
         self.assertEqual(sales_sheet.cell(2, 8).value, 90)
         self.assertEqual(sales_sheet.cell(2, 11).value, 36)
-        self.assertEqual(sales_sheet.cell(3, 12).value, "KHH")
+        self.assertEqual(sales_sheet.cell(3, 12).value, "KVT")
         self.assertEqual(sales_sheet.cell(3, 13).value, "A.001")
         self.assertEqual(sales_sheet.cell(4, 12).value, "KTP")
         self.assertEqual(sales_sheet.cell(4, 13).value, "A.002")
@@ -870,7 +901,7 @@ class AllocationTests(unittest.TestCase):
         ktp_group = ktp["groups"][0]
         rows = khh_group["rows"]
 
-        self.assertEqual(khh["warehouse_code"], "KHH")
+        self.assertEqual(khh["warehouse_code"], "KVT")
         self.assertEqual(ktp["warehouse_code"], "KTP")
         self.assertEqual(khh_group["variant_code"], "A.001")
         self.assertEqual(khh_group["unit_name"], "Cai")
@@ -902,24 +933,25 @@ class AllocationTests(unittest.TestCase):
         sales = [line(
             "sales", "PAPER", 3, 120, invoice_no="BAN1", invoice_date="02/01/2025",
             invoice_date_iso="2025-01-02", party_name="Khach hang", unit_name="Kg",
-            line_amount=360, warehouse_code="KHH", warehouse_account="152",
+            line_amount=360, warehouse_code="KVT", warehouse_account="152",
         )]
         allocations, _, _, _ = allocate_stock([], purchase, sales)
 
         ledger = build_inventory_ledger([], purchase, allocations, sales_lines=sales)
-        khh = next(warehouse for warehouse in ledger["warehouses"] if warehouse["warehouse_code"] == "KHH")
-        ktp = next(warehouse for warehouse in ledger["warehouses"] if warehouse["warehouse_code"] == "KTP")
+        khh = next(warehouse for warehouse in ledger["warehouses"] if warehouse["warehouse_code"] == "KVT")
         khh_group = khh["groups"][0]
-        ktp_group = ktp["groups"][0]
 
         self.assertEqual(khh["account"], "152")
-        self.assertEqual(sum(row["qty_in"] for row in khh_group["rows"]), 3)
+        self.assertFalse(any(warehouse["warehouse_code"] == "KTP" for warehouse in ledger["warehouses"]))
+        self.assertEqual(sum(row["qty_in"] for row in khh_group["rows"]), 10)
+        self.assertEqual(sum(row["amount_in"] for row in khh_group["rows"]), 500)
         self.assertEqual(sum(row["qty_out"] for row in khh_group["rows"]), 3)
+        purchase_row = next(row for row in khh_group["rows"] if row["type"] == "purchase")
         sale_row = next(row for row in khh_group["rows"] if row["type"] == "sale")
+        self.assertEqual(purchase_row["qty_in"], 10)
         self.assertFalse(sale_row["cost_missing"])
         self.assertEqual(sale_row["unit_price"], 50)
         self.assertEqual(sale_row["amount_out"], 150)
-        self.assertEqual(sum(row["qty_in"] for row in ktp_group["rows"]), 7)
 
     def test_inventory_ledger_moves_unmatched_khh_remainder_to_ktp(self):
         purchase = [line(
@@ -930,19 +962,22 @@ class AllocationTests(unittest.TestCase):
         sales = [line(
             "sales", "PAPER", 3, 120, invoice_no="BAN1", invoice_date="02/01/2025",
             invoice_date_iso="2025-01-02", party_name="Khach hang", unit_name="Kg",
-            line_amount=360, warehouse_code="KHH", warehouse_account="152",
+            line_amount=360, warehouse_code="KVT", warehouse_account="152",
         )]
         allocations, _, _, _ = allocate_stock([], purchase, sales)
 
         ledger = build_inventory_ledger([], purchase, allocations, sales_lines=sales)
         warehouse_codes = [warehouse["warehouse_code"] for warehouse in ledger["warehouses"]]
+        khh = next(warehouse for warehouse in ledger["warehouses"] if warehouse["warehouse_code"] == "KVT")
         ktp = next(warehouse for warehouse in ledger["warehouses"] if warehouse["warehouse_code"] == "KTP")
-        sale_row = next(row for group in ktp["groups"] for row in group["rows"] if row["type"] == "sale")
+        sale_row = next(row for group in khh["groups"] for row in group["rows"] if row["type"] == "sale")
+        purchase_row = next(row for group in ktp["groups"] for row in group["rows"] if row["type"] == "purchase")
 
-        self.assertNotIn("KHH", warehouse_codes)
+        self.assertIn("KVT", warehouse_codes)
         self.assertEqual(sale_row["qty_out"], 3)
         self.assertEqual(sale_row["unit_price"], 0)
         self.assertTrue(sale_row["cost_missing"])
+        self.assertEqual(purchase_row["qty_in"], 10)
 
     def test_inventory_ledger_puts_full_shortage_only_in_ktp(self):
         sales = [line(
@@ -1064,28 +1099,28 @@ class AllocationTests(unittest.TestCase):
         self.assertIn("TongHopKho", result.sheetnames)
         self.assertIn("KiemTraDoiChieu", result.sheetnames)
         self.assertNotIn("TongHopNhapXuatTon", result.sheetnames)
-        self.assertIn("TongHopNXT_KHH", result.sheetnames)
+        self.assertIn("TongHopNXT_KVT", result.sheetnames)
         self.assertIn("TongHopNXT_KTP", result.sheetnames)
-        self.assertIn("BaoCaoBH_KHH", result.sheetnames)
+        self.assertIn("BaoCaoBH_KVT", result.sheetnames)
         self.assertIn("BaoCaoBH_KTP", result.sheetnames)
-        self.assertIn("BangKeHDBH_KHH", result.sheetnames)
+        self.assertIn("BangKeHDBH_KVT", result.sheetnames)
         self.assertIn("BangKeHDBH_KTP", result.sheetnames)
         self.assertNotIn("PhanBoKho", result.sheetnames)
         self.assertNotIn("TonKhoHangHoa", result.sheetnames)
-        self.assertIn("SoChiTietKHH", result.sheetnames)
+        self.assertIn("SoChiTietKVT", result.sheetnames)
         self.assertIn("SoChiTietKTP", result.sheetnames)
         self.assertIn("SoChiTietHH_TP", result.sheetnames)
-        self.assertEqual(result["SoChiTietKHH"].cell(1, 1).value, "Ngày")
+        self.assertEqual(result["SoChiTietKVT"].cell(1, 1).value, "Ngày")
         self.assertEqual(result["SoChiTietHH_TP"].cell(1, 7).value, "Mã VT chi tiết")
-        self.assertEqual(result["TongHopNXT_KHH"].cell(1, 1).value, "TỔNG HỢP NHẬP XUẤT TỒN")
+        self.assertEqual(result["TongHopNXT_KVT"].cell(1, 1).value, "TỔNG HỢP NHẬP XUẤT TỒN")
         self.assertEqual(result["TongHopNXT_KTP"].cell(1, 1).value, "TỔNG HỢP NHẬP XUẤT TỒN")
-        self.assertEqual(result["TongHopNXT_KHH"].cell(2, 1).value, "KHO: KHH - KHO VẬT TƯ, HÀNG HÓA")
+        self.assertEqual(result["TongHopNXT_KVT"].cell(2, 1).value, "KHO: KVT - KHO VẬT TƯ, HÀNG HÓA")
         self.assertEqual(result["TongHopNXT_KTP"].cell(2, 1).value, "KHO: KTP - KHO THÀNH PHẨM")
-        self.assertEqual(result["BaoCaoBH_KHH"].cell(1, 1).value, "BÁO CÁO TỔNG HỢP BÁN HÀNG")
-        self.assertEqual(result["BaoCaoBH_KHH"].cell(5, 8).value, "TIỀN LÃI/LỖ")
-        self.assertEqual(result["BaoCaoBH_KHH"].cell(5, 9).value, "% LÃI/LỖ")
-        self.assertEqual(result["BaoCaoBH_KHH"].cell(7, 2).value, "Tổng cộng:")
-        self.assertEqual(result["BangKeHDBH_KHH"].cell(1, 1).value, "BẢNG KÊ HOÁ ĐƠN BÁN HÀNG")
+        self.assertEqual(result["BaoCaoBH_KVT"].cell(1, 1).value, "BÁO CÁO TỔNG HỢP BÁN HÀNG")
+        self.assertEqual(result["BaoCaoBH_KVT"].cell(5, 8).value, "TIỀN LÃI/LỖ")
+        self.assertEqual(result["BaoCaoBH_KVT"].cell(5, 9).value, "% LÃI/LỖ")
+        self.assertEqual(result["BaoCaoBH_KVT"].cell(7, 2).value, "Tổng cộng:")
+        self.assertEqual(result["BangKeHDBH_KVT"].cell(1, 1).value, "BẢNG KÊ HOÁ ĐƠN BÁN HÀNG")
         verification_statuses = [
             result["KiemTraDoiChieu"].cell(row, 7).value
             for row in range(2, result["KiemTraDoiChieu"].max_row + 1)

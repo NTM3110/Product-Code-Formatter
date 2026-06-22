@@ -90,7 +90,7 @@ VIETMAX_PHASE_PURCHASE = "purchase"
 VIETMAX_PHASE_SALES = "sales"
 VIETMAX_PROFILES = {"vietmax", "vietmax_mua_vao", "vietmax_ban_ra"}
 PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst")
-VIETMAX_BAN_RA_MATCH_MA_KHO = "KHH"
+VIETMAX_BAN_RA_MATCH_MA_KHO = "KVT"
 VIETMAX_BAN_RA_MATCH_TK_VAT_TU = "152"
 VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES = "all_companies"
 VIETMAX_COMPARISON_SCOPE_SAME_COMPANY = "same_company"
@@ -2934,7 +2934,7 @@ def build_vietmax_khh_exact_purchase_matches(sales_products, processed_purchase_
             "purchase_mst": raw_text(purchase.get("purchase_mst")),
             "purchase_company_key": raw_text(purchase.get("purchase_company_key")),
             "unit_mismatch": unit_mismatch,
-            "unit_warning": "Khác đơn vị tính" if unit_mismatch else "Từ HD mua vào đã xử lý (KHH)",
+            "unit_warning": "Khác đơn vị tính" if unit_mismatch else "Từ HD mua vào đã xử lý (KVT)",
             "conversion_mode": VIETMAX_CONVERSION_MODE_NONE,
             "conversion_formula": "",
             "score": 1,

@@ -772,6 +772,15 @@ def read_lines(content, mapping, kind, company_profile="yen_thanh"):
         if tax_amount is None and line_amount is not None and rate_percent is not None:
             tax_amount = line_amount * rate_percent / 100
         raw_invoice_date = cell_value(values, date_col) if date_col else None
+        warehouse_code = normalize_warehouse_code(cell_value(values, warehouse_col)) if warehouse_col else ""
+        warehouse_account = text(cell_value(values, warehouse_account_col)) if warehouse_account_col else ""
+        if company_profile == "vietmax":
+            if kind == "purchase":
+                warehouse_code = MATERIAL_WAREHOUSE_CODE
+                warehouse_account = default_warehouse_account(MATERIAL_WAREHOUSE_CODE)
+            elif warehouse_code in LEGACY_MATERIAL_WAREHOUSE_CODES or warehouse_code == MATERIAL_WAREHOUSE_CODE:
+                warehouse_code = MATERIAL_WAREHOUSE_CODE
+                warehouse_account = default_warehouse_account(MATERIAL_WAREHOUSE_CODE)
         lines.append({
             "kind": kind,
             "row_number": row_number,
@@ -792,8 +801,8 @@ def read_lines(content, mapping, kind, company_profile="yen_thanh"):
             "party_name": text(cell_value(values, party_name_col)) if party_name_col else "",
             "product_name": product_name,
             "unit_name": text(cell_value(values, unit_col)) if unit_col else "",
-            "warehouse_code": normalize_code(cell_value(values, warehouse_col)) if warehouse_col else "",
-            "warehouse_account": text(cell_value(values, warehouse_account_col)) if warehouse_account_col else "",
+            "warehouse_code": warehouse_code,
+            "warehouse_account": warehouse_account,
             "quantity": quantity,
             "unit_price": unit_price,
             "line_amount": line_amount,
@@ -2124,7 +2133,55 @@ def amount_for_quantity(line, quantity):
     return None
 
 
-def iso_in_sales_range(lines):
+def split_amounts_for_quantities(line, quantities):
+    cleaned_quantities = [clean_quantity(quantity or 0) for quantity in quantities]
+    total_amount = line_total_amount(line)
+    if total_amount is None:
+        return [amount_for_quantity(line, quantity) or 0 for quantity in cleaned_quantities]
+    if not cleaned_quantities:
+        return []
+    assigned = 0
+    amounts = []
+    split_total_quantity = sum(cleaned_quantities)
+    line_quantity = clean_quantity(line.get("quantity", 0) or 0)
+    for index, quantity in enumerate(cleaned_quantities):
+        if index == len(cleaned_quantities) - 1 and abs(split_total_quantity - line_quantity) <= QUANTITY_EPSILON:
+            amount = total_amount - assigned
+        else:
+            amount = amount_for_quantity(line, quantity)
+            if amount is None:
+                base_quantity = split_total_quantity or line_quantity
+                amount = total_amount * quantity / base_quantity if base_quantity else 0
+        assigned += amount
+        amounts.append(amount)
+    return amounts
+
+
+def split_tax_amounts_for_sale_amounts(line, sale_amounts):
+    sale_amounts = [amount or 0 for amount in sale_amounts]
+    total_tax = line.get("tax_amount")
+    if total_tax is None:
+        rate = sale_tax_rate(line)
+        return [amount * rate / 100 for amount in sale_amounts]
+    if not sale_amounts:
+        return []
+    assigned = 0
+    tax_amounts = []
+    total_sale_amount = sum(sale_amounts)
+    for index, sale_amount in enumerate(sale_amounts):
+        if index == len(sale_amounts) - 1:
+            tax_amount = total_tax - assigned
+        else:
+            tax_amount = total_tax * sale_amount / total_sale_amount if total_sale_amount else 0
+        assigned += tax_amount
+        tax_amounts.append(tax_amount)
+    return tax_amounts
+
+
+def iso_in_line_range(*line_sets):
+    lines = []
+    for line_set in line_sets:
+        lines.extend(line_set or [])
     values = sorted({line.get("invoice_date_iso", "") for line in lines if line.get("invoice_date_iso")})
     if not values:
         return {"from": "", "to": "", "from_display": "", "to_display": ""}
@@ -2134,6 +2191,10 @@ def iso_in_sales_range(lines):
         "from_display": date_display(values[0]),
         "to_display": date_display(values[-1]),
     }
+
+
+def iso_in_sales_range(lines):
+    return iso_in_line_range(lines)
 
 
 def ledger_sort_key(row):
@@ -2154,14 +2215,24 @@ def combined_ledger_sort_key(row):
     )
 
 
+MATERIAL_WAREHOUSE_CODE = "KVT"
+LEGACY_MATERIAL_WAREHOUSE_CODES = {"KHH"}
+
+
+def normalize_warehouse_code(value):
+    code = normalize_code(value)
+    return MATERIAL_WAREHOUSE_CODE if code in LEGACY_MATERIAL_WAREHOUSE_CODES else code
+
+
 def warehouse_sort_key(warehouse_code):
-    warehouse_order = {"KHH": 0, "KTP": 1}
-    code = normalize_code(warehouse_code) or ""
+    warehouse_order = {MATERIAL_WAREHOUSE_CODE: 0, "KTP": 1, "KHH": 0}
+    code = normalize_warehouse_code(warehouse_code) or ""
     return (warehouse_order.get(code, 20), code)
 
 
-def line_warehouse_code(line, fallback="KHH"):
-    return normalize_code(line.get("warehouse_code") or fallback) or fallback
+def line_warehouse_code(line, fallback=MATERIAL_WAREHOUSE_CODE):
+    fallback_code = normalize_warehouse_code(fallback) or MATERIAL_WAREHOUSE_CODE
+    return normalize_warehouse_code(line.get("warehouse_code") or fallback_code) or fallback_code
 
 
 def line_warehouse_account(line, fallback=""):
@@ -2169,7 +2240,9 @@ def line_warehouse_account(line, fallback=""):
 
 
 def default_warehouse_name(code):
+    code = normalize_warehouse_code(code)
     known = {
+        MATERIAL_WAREHOUSE_CODE: "KHO VẬT TƯ, HÀNG HÓA",
         "KHH": "KHO VẬT TƯ, HÀNG HÓA",
         "KTP": "KHO THÀNH PHẨM",
     }
@@ -2177,8 +2250,10 @@ def default_warehouse_name(code):
 
 
 def default_warehouse_account(code):
+    code = normalize_warehouse_code(code)
     known = {
-        "KHH": "156",
+        MATERIAL_WAREHOUSE_CODE: "152",
+        "KHH": "152",
         "KTP": "155",
     }
     return known.get(code, "")
@@ -2194,7 +2269,7 @@ def allocation_sale_warehouse_account(allocation, fallback=""):
 
 def allocation_remainder_warehouse_code(allocation, fallback="KTP"):
     sale_warehouse_code = allocation_sale_warehouse_code(allocation, "")
-    if normalize_code(sale_warehouse_code) == "KHH":
+    if normalize_warehouse_code(sale_warehouse_code) == MATERIAL_WAREHOUSE_CODE:
         return normalize_code(fallback) or "KTP"
     return sale_warehouse_code or fallback
 
@@ -2208,7 +2283,7 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
     warehouses = {}
 
     def ensure_warehouse(warehouse_code, account=""):
-        code = normalize_code(warehouse_code or "KHH") or "KHH"
+        code = normalize_warehouse_code(warehouse_code or MATERIAL_WAREHOUSE_CODE) or MATERIAL_WAREHOUSE_CODE
         item = warehouses.setdefault(code, {
             "warehouse_code": code,
             "warehouse_name": default_warehouse_name(code),
@@ -2269,24 +2344,23 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
         return max(rejected, key=lambda value: abs(value))
 
     future_reorder_by_purchase = {}
-    purchase_route_usage = defaultdict(list)
+    purchase_route_destinations = {}
     for allocation in allocations or []:
-        sale_warehouse_code = allocation_sale_warehouse_code(allocation, "KHH")
+        sale_warehouse_code = allocation_sale_warehouse_code(allocation, MATERIAL_WAREHOUSE_CODE)
         sale_warehouse_account = allocation_sale_warehouse_account(
             allocation,
             default_warehouse_account(sale_warehouse_code),
         )
         for used in allocation.get("used", []):
-            if company_profile != "son_phuong" and normalize_code(sale_warehouse_code) == "KHH":
+            if company_profile != "son_phuong" and normalize_warehouse_code(sale_warehouse_code) == MATERIAL_WAREHOUSE_CODE:
                 quantity = clean_quantity(used.get("quantity", 0))
                 purchase_code = used.get("purchase_variant_code") or used.get("variant_code") or ""
                 purchase_date = used.get("invoice_date_iso") or ""
                 if quantity > QUANTITY_EPSILON and purchase_code:
-                    purchase_route_usage[(purchase_code, purchase_date)].append({
+                    purchase_route_destinations[(purchase_code, purchase_date)] = {
                         "warehouse_code": sale_warehouse_code,
                         "warehouse_account": sale_warehouse_account,
-                        "remaining_quantity": quantity,
-                    })
+                    }
             if not used.get("future_purchase_reordered"):
                 continue
             key = (used.get("purchase_variant_code", ""), used.get("original_purchase_date_iso") or used.get("invoice_date_iso", ""))
@@ -2357,7 +2431,7 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
         if quantity <= QUANTITY_EPSILON:
             continue
         amount = unit_price * quantity if unit_price is not None else 0
-        warehouse_code = line_warehouse_code(line, "KHH")
+        warehouse_code = line_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
         account = line_warehouse_account(line, default_warehouse_account(warehouse_code))
         ensure_warehouse(warehouse_code, account)
         group_for(warehouse_code, line["variant_code"], line.get("product_name", ""), line.get("unit_name", ""))["rows"].append({
@@ -2388,22 +2462,19 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
         row_date_iso = future_reorder.get("effective_date_iso") if future_reorder else line.get("invoice_date_iso", "")
         row_date = future_reorder.get("effective_date") if future_reorder else line.get("invoice_date", "")
         sequence = future_reorder.get("sequence") if future_reorder else line.get("row_number", 0)
-        warehouse_code = line_warehouse_code(line, "KHH")
+        warehouse_code = line_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
         account = line_warehouse_account(line, default_warehouse_account(warehouse_code))
-        remaining_quantity = quantity
         route_key = (line.get("variant_code", ""), line.get("invoice_date_iso", ""))
-        for route in purchase_route_usage.get(route_key, []):
-            route_quantity = min(remaining_quantity, clean_quantity(route.get("remaining_quantity", 0)))
-            if route_quantity <= QUANTITY_EPSILON:
-                continue
+        route = purchase_route_destinations.get(route_key)
+        if route:
             route_warehouse_code = route.get("warehouse_code") or warehouse_code
-            route_account = route.get("warehouse_account") or default_warehouse_account(route_warehouse_code)
+            route_account = route.get("warehouse_account") or account or default_warehouse_account(route_warehouse_code)
             route_note = ""
             if normalize_code(route_warehouse_code) != normalize_code(warehouse_code):
                 route_note = f"Dong mua vao duoc dua vao so kho {route_warehouse_code} vi da duoc dung lam gia von cho ban ra kho {route_warehouse_code}."
             append_purchase_ledger_row(
                 line,
-                route_quantity,
+                quantity,
                 route_warehouse_code,
                 route_account,
                 row_type,
@@ -2413,14 +2484,10 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
                 future_reorder=future_reorder,
                 route_note=route_note,
             )
-            route["remaining_quantity"] = clean_quantity(route.get("remaining_quantity", 0) - route_quantity)
-            remaining_quantity = clean_quantity(remaining_quantity - route_quantity)
-            if remaining_quantity <= QUANTITY_EPSILON:
-                break
-        if remaining_quantity > QUANTITY_EPSILON:
+        else:
             append_purchase_ledger_row(
                 line,
-                remaining_quantity,
+                quantity,
                 warehouse_code,
                 account,
                 row_type,
@@ -2430,16 +2497,105 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
                 future_reorder=future_reorder,
             )
 
+    def append_source_sale_ledger_row(allocation):
+        quantity = clean_quantity(allocation.get("quantity", 0))
+        if quantity <= QUANTITY_EPSILON:
+            return
+        sale_warehouse_code = allocation_sale_warehouse_code(allocation, MATERIAL_WAREHOUSE_CODE)
+        sale_warehouse_account = allocation_sale_warehouse_account(allocation, default_warehouse_account(sale_warehouse_code))
+        code = allocation.get("variant_code", "")
+        ensure_warehouse(sale_warehouse_code, sale_warehouse_account)
+        group = group_for(sale_warehouse_code, code, allocation.get("product_name", ""), allocation.get("unit_name", ""))
+        sale_amount = line_total_amount(allocation)
+        if sale_amount is None:
+            sale_amount = amount_for_quantity(allocation, quantity) or 0
+        rate = sale_tax_rate(allocation)
+        tax_amount = line_tax_amount(allocation)
+        if tax_amount is None:
+            tax_amount = sale_amount * rate / 100 if sale_amount is not None else 0
+        total_cost_quantity = 0
+        total_cost_amount = 0
+        logic_notes = []
+        for used in allocation.get("used", []):
+            used_quantity = clean_quantity(used.get("quantity", 0))
+            if used_quantity <= QUANTITY_EPSILON:
+                continue
+            unit_cost = used.get("unit_cost")
+            if unit_cost is None:
+                continue
+            total_cost_quantity = clean_quantity(total_cost_quantity + used_quantity)
+            total_cost_amount += unit_cost * used_quantity
+            if used.get("logic_note"):
+                logic_notes.append(used.get("logic_note", ""))
+        has_inbound = any((row.get("qty_in", 0) or 0) > QUANTITY_EPSILON for row in group.get("rows", []))
+        cost_missing = not has_inbound or total_cost_quantity <= QUANTITY_EPSILON
+        if cost_missing:
+            unit_cost = 0
+            cost_amount = 0
+            missing_note = f"Kho {sale_warehouse_code} khong co nhap/ton dau ky cho ma nay; gia von de 0 va khong tinh % lai."
+            logic_notes.append(missing_note)
+        else:
+            cost_amount = total_cost_amount
+            unit_cost = cost_amount / quantity if quantity > QUANTITY_EPSILON else 0
+            if total_cost_quantity + QUANTITY_EPSILON < quantity:
+                logic_notes.append(
+                    f"Chi khop duoc {format_number(total_cost_quantity)}/{format_number(quantity)} theo file mua vao; tien von tinh theo phan da khop."
+                )
+        group["rows"].append({
+            "type": "sale",
+            "date_iso": allocation.get("invoice_date_iso", ""),
+            "date": allocation.get("invoice_date", ""),
+            "doc_no": allocation.get("invoice_no", ""),
+            "variant_code": code,
+            "tax_code": allocation.get("party_tax_code", ""),
+            "customer": allocation.get("party_name", ""),
+            "description": f"Xuat ban cho Khach (kho {sale_warehouse_code})",
+            "account": "6321",
+            "unit_price": unit_cost,
+            "sale_unit_price": line_unit_price(allocation),
+            "sale_amount": sale_amount,
+            "tax_rate": rate,
+            "tax_amount": tax_amount,
+            "total_amount": sale_amount + tax_amount,
+            "qty_in": 0,
+            "amount_in": 0,
+            "qty_out": quantity,
+            "amount_out": cost_amount,
+            "logic_note": " ".join(dict.fromkeys(logic_notes)),
+            "cost_missing": cost_missing,
+            "sequence": allocation.get("row_number", 0) * 1000,
+        })
+
     for allocation in allocations or []:
-        for index, used in enumerate(allocation.get("used", [])):
+        if company_profile != "son_phuong" and normalize_code(allocation.get("warehouse_code", "")):
+            append_source_sale_ledger_row(allocation)
+            continue
+        sale_split_entries = [
+            ("used", used)
+            for used in allocation.get("used", [])
+            if clean_quantity(used.get("quantity", 0)) > QUANTITY_EPSILON
+        ]
+        finished_quantity = clean_quantity(allocation.get("finished_quantity", 0))
+        if finished_quantity > QUANTITY_EPSILON and company_profile != "son_phuong":
+            sale_split_entries.append(("finished", None))
+        sale_split_quantities = [
+            clean_quantity(item.get("quantity", 0)) if kind == "used" else finished_quantity
+            for kind, item in sale_split_entries
+        ]
+        sale_split_amounts = split_amounts_for_quantities(allocation, sale_split_quantities)
+        sale_split_tax_amounts = split_tax_amounts_for_sale_amounts(allocation, sale_split_amounts)
+
+        for index, (kind, used) in enumerate(sale_split_entries):
+            if kind != "used":
+                continue
             quantity = clean_quantity(used.get("quantity", 0))
             if quantity <= QUANTITY_EPSILON:
                 continue
             code = used.get("ledger_variant_code") or used.get("sale_variant_code") or allocation.get("variant_code", "")
             detail_code = used.get("purchase_variant_code") or used.get("variant_code") or code
             unit_price = used.get("unit_cost")
-            sale_amount = amount_for_quantity(allocation, quantity) or 0
-            sale_warehouse_code = allocation_sale_warehouse_code(allocation, "KHH")
+            sale_amount = sale_split_amounts[index] if index < len(sale_split_amounts) else (amount_for_quantity(allocation, quantity) or 0)
+            sale_warehouse_code = allocation_sale_warehouse_code(allocation, MATERIAL_WAREHOUSE_CODE)
             sale_warehouse_account = allocation_sale_warehouse_account(allocation, default_warehouse_account(sale_warehouse_code))
             ensure_warehouse(sale_warehouse_code, sale_warehouse_account)
             group = group_for(sale_warehouse_code, code, allocation.get("product_name", ""), allocation.get("unit_name", ""))
@@ -2451,7 +2607,7 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
             else:
                 amount = unit_price * quantity if unit_price is not None else 0
             rate = sale_tax_rate(allocation)
-            tax_amount = sale_amount * rate / 100 if sale_amount is not None else 0
+            tax_amount = sale_split_tax_amounts[index] if index < len(sale_split_tax_amounts) else (sale_amount * rate / 100 if sale_amount is not None else 0)
             logic_note = used.get("logic_note", "")
             if cost_missing:
                 missing_note = f"Kho {sale_warehouse_code} không có nhập/tồn đầu kỳ cho mã này; giá vốn để 0 và không tính % lãi."
@@ -2481,8 +2637,8 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
                 "cost_missing": cost_missing,
                 "sequence": allocation.get("row_number", 0) * 1000 + index,
             })
-        finished_quantity = clean_quantity(allocation.get("finished_quantity", 0))
         if finished_quantity > QUANTITY_EPSILON and company_profile != "son_phuong":
+            finished_index = len(sale_split_entries) - 1
             code = allocation.get("finished_variant_code") or allocation.get("variant_code", "")
             unit_price = 0
             sale_warehouse_code = allocation_remainder_warehouse_code(allocation, "KTP")
@@ -2491,9 +2647,9 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
             ensure_warehouse(sale_warehouse_code, sale_warehouse_account)
             group = group_for(sale_warehouse_code, code, allocation.get("product_name", ""), allocation.get("unit_name", ""))
             amount = 0
-            sale_amount = amount_for_quantity(allocation, finished_quantity) or 0
+            sale_amount = sale_split_amounts[finished_index] if finished_index < len(sale_split_amounts) else (amount_for_quantity(allocation, finished_quantity) or 0)
             rate = sale_tax_rate(allocation)
-            tax_amount = sale_amount * rate / 100 if sale_amount is not None else 0
+            tax_amount = sale_split_tax_amounts[finished_index] if finished_index < len(sale_split_tax_amounts) else (sale_amount * rate / 100 if sale_amount is not None else 0)
             group["rows"].append({
                 "type": "sale",
                 "date_iso": allocation.get("invoice_date_iso", ""),
@@ -2538,9 +2694,9 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
     result.sort(key=lambda warehouse: warehouse_sort_key(warehouse.get("warehouse_code")))
     return {
         "warehouses": result,
-        "warehouse_code": result[0]["warehouse_code"] if result else "KHH",
-        "warehouse_name": result[0]["warehouse_name"] if result else default_warehouse_name("KHH"),
-        "account": result[0]["account"] if result else default_warehouse_account("KHH"),
+        "warehouse_code": result[0]["warehouse_code"] if result else MATERIAL_WAREHOUSE_CODE,
+        "warehouse_name": result[0]["warehouse_name"] if result else default_warehouse_name(MATERIAL_WAREHOUSE_CODE),
+        "account": result[0]["account"] if result else default_warehouse_account(MATERIAL_WAREHOUSE_CODE),
         "groups": result[0]["groups"] if result else [],
     }
 
@@ -2595,7 +2751,7 @@ def build_purchase_export_rows(purchase_lines):
             line.get("party_name", ""),
             line.get("invoice_no", ""),
             line.get("invoice_date", ""),
-            line_warehouse_code(line, "KHH"),
+            line_warehouse_code(line, MATERIAL_WAREHOUSE_CODE),
             line.get("variant_code", ""),
             clean_quantity(quantity),
             unit_price,
@@ -2648,7 +2804,7 @@ def build_sales_export_rows(allocations, purchase_lines=None, sales_lines=None):
             quantity = used.get("quantity", 0)
             if quantity <= QUANTITY_EPSILON:
                 continue
-            warehouse_code = allocation_sale_warehouse_code(line, "KHH")
+            warehouse_code = allocation_sale_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
             rows.append(build_sales_export_row(
                 line,
                 quantity,
@@ -2757,7 +2913,7 @@ def build_sales_report_rows(allocations, purchase_lines=None, sales_lines=None):
             quantity = used.get("quantity", 0)
             if quantity <= QUANTITY_EPSILON:
                 continue
-            warehouse_code = allocation_sale_warehouse_code(line, "KHH")
+            warehouse_code = allocation_sale_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
             rows.append(build_sales_report_row(
                 line,
                 quantity,
@@ -3020,8 +3176,8 @@ def format_export_sheet(sheet, quantity_columns, money_columns, percent_columns=
 
 def fill_ledger_activity_rows(sheet, in_qty_column, out_qty_column, warehouse_column=None, default_warehouse=""):
     fills = {
-        ("KHH", "in"): PatternFill("solid", fgColor="E6F1FF"),
-        ("KHH", "out"): PatternFill("solid", fgColor="FFF0D7"),
+        (MATERIAL_WAREHOUSE_CODE, "in"): PatternFill("solid", fgColor="E6F1FF"),
+        (MATERIAL_WAREHOUSE_CODE, "out"): PatternFill("solid", fgColor="FFF0D7"),
         ("KTP", "in"): PatternFill("solid", fgColor="E9FBFF"),
         ("KTP", "out"): PatternFill("solid", fgColor="FFE7E1"),
         ("", "in"): PatternFill("solid", fgColor="EAF3FF"),
@@ -3036,7 +3192,8 @@ def fill_ledger_activity_rows(sheet, in_qty_column, out_qty_column, warehouse_co
         warehouse_code = default_warehouse
         if warehouse_column:
             warehouse_code = text(row[warehouse_column - 1].value).upper() or warehouse_code
-        warehouse_code = warehouse_code if warehouse_code in {"KHH", "KTP"} else ""
+        warehouse_code = normalize_warehouse_code(warehouse_code)
+        warehouse_code = warehouse_code if warehouse_code in {MATERIAL_WAREHOUSE_CODE, "KTP"} else ""
         fill = None
         if isinstance(in_qty, (int, float)) and abs(in_qty) > QUANTITY_EPSILON:
             fill = fills.get((warehouse_code, "in"), fills[("", "in")])
@@ -3789,10 +3946,10 @@ def build_verification_rows(purchase_lines, sales_lines, allocations, ledger, sa
     })
     purchase_ledger_totals = {"qty_in": 0.0, "amount_in": 0.0}
     for warehouse_code in warehouse_codes:
-        totals = ledger_totals_for_type(ledger, warehouse_code, "purchase")
-        purchase_ledger_totals["qty_in"] += totals["qty_in"]
-        purchase_ledger_totals["amount_in"] += totals["amount_in"]
-
+        for ledger_type in ("purchase", "purchase_future_reorder"):
+            totals = ledger_totals_for_type(ledger, warehouse_code, ledger_type)
+            purchase_ledger_totals["qty_in"] += totals["qty_in"]
+            purchase_ledger_totals["amount_in"] += totals["amount_in"]
     checks = [
         ("Bán ra", "SL gốc = SL đã phân bổ theo kho", original_sales_qty, processed_sales_qty, 0.0001, "Đảm bảo không mất hoặc nhân đôi số lượng bán ra khi tách kho."),
         ("Bán ra", "Tiền hàng gốc = tiền hàng đã tách", original_sales_amount, processed_sales_amount, 1, "Đảm bảo doanh thu chưa thuế sau xử lý khớp file bán ra gốc."),
@@ -4317,7 +4474,7 @@ def analysis_payload(purchase_content, sales_content, opening_content, raw_mappi
         sales_lines=sales_lines,
         company_profile=company_profile,
     )
-    ledger["date_range"] = iso_in_sales_range(sales_lines)
+    ledger["date_range"] = iso_in_line_range(purchase_lines, sales_lines)
     sales_report_rows = build_sales_report_rows_from_ledger(ledger) if ledger else build_sales_report_rows(allocations, purchase_lines, sales_lines)
     verification_rows = build_verification_rows(
         purchase_lines,

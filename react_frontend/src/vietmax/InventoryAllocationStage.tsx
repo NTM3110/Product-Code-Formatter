@@ -725,12 +725,12 @@ function dateDisplay(value: string) {
 }
 
 function formatNumber(value: unknown) {
-  if (typeof value === 'number') return value.toLocaleString('vi-VN');
+  if (typeof value === 'number') return value.toLocaleString('en-US');
   if (typeof value === 'string') return value;
   return '';
 }
 
 function formatPercent(value: unknown) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '';
-  return `${value.toLocaleString('vi-VN', { maximumFractionDigits: 2 })}%`;
+  return `${value.toLocaleString('en-US', { maximumFractionDigits: 2 })}%`;
 }

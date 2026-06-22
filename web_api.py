@@ -402,7 +402,30 @@ def create_app() -> FastAPI:
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        result.update({"original_name": payload.original_name, "saved_name": payload.saved_name})
+        removed = profile_cfg.get("removed_companies") or {}
+        for company in result.get("companies", []):
+            mst = raw_text(company.get("mst"))
+            process = not bool(removed.get(mst))
+            company["process"] = process
+            company["pending_process"] = process
+            company["committed_prefix"] = company.get("value") or ""
+        result.update({
+            "original_name": payload.original_name,
+            "saved_name": payload.saved_name,
+            "manual_code_overrides": profile_cfg.get("manual_code_overrides") or {},
+            "word_rules": profile_cfg.get("word_rules") or {},
+            "first_word_rules": profile_cfg.get("first_word_rules") or {},
+            "repeated_phrase_removals": profile_cfg.get("repeated_phrase_removals") or [],
+            "inventory_pairs": profile_cfg.get("inventory_pairs") or [],
+            "use_default_inventory_pair": bool(profile_cfg.get("use_default_inventory_pair")),
+            "default_inventory_pair_id": profile_cfg.get("default_inventory_pair_id") or "",
+            "inventory_pair_rules": profile_cfg.get("inventory_pair_rules") or [],
+            "include_company_prefix": profile_cfg.get("include_company_prefix") is not False,
+            "prefix_strategy": profile_cfg.get("prefix_strategy") or "last_2_words",
+            "prefix_mst_digits": profile_cfg.get("prefix_mst_digits") or 3,
+            "prefix_strategy_values": profile_cfg.get("prefix_strategy_values") or {},
+            "columns": profile_cfg.get("columns") or {},
+        })
         return json_safe(result)
 
     @api.post("/api/vietmax/review")
@@ -622,7 +645,7 @@ def create_app() -> FastAPI:
                 comparison_scope=payload.comparison_scope,
                 require_existing_code=payload.require_existing_purchase_code,
             )
-            update_progress_job(operation_id, 0, max(1, len(sales_products)), "Đang khớp chính xác KHH/152", status="running")
+            update_progress_job(operation_id, 0, max(1, len(sales_products)), "Đang khớp chính xác KVT/152", status="running")
             exact_matches = build_vietmax_khh_exact_purchase_matches(sales_products, purchase_products, payload.comparison_scope)
             update_progress_job(operation_id, 0, max(1, len(sales_products)), "Đang so khớp hàng bán/mua", status="running")
             fuzzy_matches = build_vietmax_ban_ra_purchase_matches(sales_products, purchase_products, progress_callback=progress, comparison_scope=payload.comparison_scope)

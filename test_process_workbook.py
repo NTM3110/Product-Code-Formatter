@@ -981,7 +981,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "process_mst": ["MST"],
                 "mst_safe_id": ["MST|||0"],
                 "selected_products_0": ["Giay in A4", "Giay my thuat"],
-                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "156"}],
+                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "152"}],
                 "use_default_inventory_pair": True,
                 "default_inventory_pair_id": "default",
                 "vietmax_ban_ra_purchase_matches": [
@@ -1009,8 +1009,8 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertEqual(result_sheet.cell(4, 15).value, 0.5)
                 self.assertEqual(result_sheet.cell(3, 16).value, 50000)
                 self.assertEqual(result_sheet.cell(4, 16).value, 50000)
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KHH"))
-                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("152", "KHH"))
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
+                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:
@@ -1105,7 +1105,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "process_mst": ["MST"],
                 "mst_safe_id": ["MST|||0"],
                 "selected_products_0": ["Giay in A4", "Giay my thuat"],
-                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "156"}],
+                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "152"}],
                 "use_default_inventory_pair": True,
                 "default_inventory_pair_id": "default",
                 "vietmax_processed_purchase_path": str(purchase),
@@ -1142,21 +1142,21 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertEqual(result_sheet.cell(3, 19).value, 21000)
                 self.assertEqual(result_sheet.cell(3, 20).value, 1680)
                 self.assertEqual(result_sheet.cell(3, 21).value, 22680)
-                self.assertEqual((result_sheet.cell(3, 22).value, result_sheet.cell(3, 23).value), ("152", "KHH"))
+                self.assertEqual((result_sheet.cell(3, 22).value, result_sheet.cell(3, 23).value), ("152", "KVT"))
                 self.assertEqual(result_sheet.cell(4, 14).value, "Xap")
                 self.assertAlmostEqual(result_sheet.cell(4, 15).value, 0.009091, places=6)
                 self.assertAlmostEqual(result_sheet.cell(4, 16).value * result_sheet.cell(4, 15).value, 17500, places=2)
                 self.assertEqual(result_sheet.cell(4, 19).value, 17500)
                 self.assertEqual(result_sheet.cell(4, 20).value, 1400)
                 self.assertEqual(result_sheet.cell(4, 21).value, 18900)
-                self.assertEqual((result_sheet.cell(4, 22).value, result_sheet.cell(4, 23).value), ("152", "KHH"))
+                self.assertEqual((result_sheet.cell(4, 22).value, result_sheet.cell(4, 23).value), ("152", "KVT"))
                 self.assertEqual(result_sheet.cell(5, 14).value, "Kg")
                 self.assertEqual(result_sheet.cell(5, 15).value, 850)
                 self.assertEqual(result_sheet.cell(5, 16).value, 25000)
                 self.assertEqual(result_sheet.cell(5, 19).value, 21250000)
                 self.assertEqual(result_sheet.cell(5, 20).value, 1700000)
                 self.assertEqual(result_sheet.cell(5, 21).value, 22950000)
-                self.assertEqual((result_sheet.cell(5, 22).value, result_sheet.cell(5, 23).value), ("152", "KHH"))
+                self.assertEqual((result_sheet.cell(5, 22).value, result_sheet.cell(5, 23).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:
@@ -1203,7 +1203,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "process_mst": ["MST"],
                 "mst_safe_id": ["MST|||0"],
                 "selected_products_0": ["Unchecked Product"],
-                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "156"}],
+                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "152"}],
                 "use_default_inventory_pair": True,
                 "default_inventory_pair_id": "default",
                 "vietmax_ban_ra_purchase_matches": [
@@ -1226,7 +1226,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertNotEqual(result_sheet.cell(3, 12).value, "PURCHASE-CODE")
                 self.assertEqual(result_sheet.cell(3, 14).value, "To")
                 self.assertEqual(result_sheet.cell(3, 15).value, 500)
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("156", "KVT"))
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:
@@ -1275,7 +1275,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "process_mst": ["MST"],
                 "mst_safe_id": ["MST|||0"],
                 "selected_products_0": ["Matched Product", "Other Product"],
-                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "156"}],
+                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "152"}],
                 "use_default_inventory_pair": True,
                 "default_inventory_pair_id": "default",
                 "vietmax_ban_ra_purchase_matches": [
@@ -1288,8 +1288,8 @@ class ProcessWorkbookTests(unittest.TestCase):
                 result_sheet = output["Invoices"]
                 self.assertEqual(result_sheet.cell(3, 12).value, make_product_part("vietmax_ban_ra", "Matched Product", {}))
                 self.assertNotEqual(result_sheet.cell(4, 12).value, "PURCHASE-CODE")
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KHH"))
-                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("156", "KVT"))
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
+                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:
@@ -1312,11 +1312,11 @@ class ProcessWorkbookTests(unittest.TestCase):
             purchase_ws.cell(2, 14, "DVT")
             purchase_ws.cell(2, 17, "TK vat tu")
             purchase_ws.cell(2, 18, "Ma kho")
-            purchase_ws.cell(3, 12, "KHH-PROC-001")
+            purchase_ws.cell(3, 12, "KVT-PROC-001")
             purchase_ws.cell(3, 13, "Giay in A4")
             purchase_ws.cell(3, 14, "Ram")
             purchase_ws.cell(3, 17, "152")
-            purchase_ws.cell(3, 18, "KHH")
+            purchase_ws.cell(3, 18, "KVT")
             purchase_wb.save(purchase)
             purchase_wb.close()
 
@@ -1374,8 +1374,8 @@ class ProcessWorkbookTests(unittest.TestCase):
             try:
                 result_sheet = output["Sales"]
                 self.assertEqual(result_sheet.cell(3, 12).value, make_product_part("vietmax_ban_ra", "Giay in A4", {}))
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KHH"))
-                self.assertNotEqual(result_sheet.cell(4, 12).value, "KHH-PROC-001")
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
+                self.assertNotEqual(result_sheet.cell(4, 12).value, "KVT-PROC-001")
                 self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("154", "KTP"))
             finally:
                 output.close()
@@ -1400,11 +1400,11 @@ class ProcessWorkbookTests(unittest.TestCase):
             purchase_ws.cell(2, 14, "DVT")
             purchase_ws.cell(2, 17, "TK vat tu")
             purchase_ws.cell(2, 18, "Ma kho")
-            purchase_ws.cell(3, 12, "KHH-EXACT")
+            purchase_ws.cell(3, 12, "KVT-EXACT")
             purchase_ws.cell(3, 13, "Giay in A4")
             purchase_ws.cell(3, 14, "Ram")
             purchase_ws.cell(3, 17, "152")
-            purchase_ws.cell(3, 18, "KHH")
+            purchase_ws.cell(3, 18, "KVT")
             purchase_wb.save(purchase)
             purchase_wb.close()
 
@@ -1454,7 +1454,7 @@ class ProcessWorkbookTests(unittest.TestCase):
             try:
                 result_sheet = output["Sales"]
                 self.assertEqual(result_sheet.cell(3, 12).value, make_product_part("vietmax_ban_ra", "Giay in A4", {}))
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KHH"))
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:
@@ -1670,7 +1670,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "mst_safe_id": ["111|||0", "222|||1"],
                 "selected_products_0": ["Matched Product"],
                 "selected_products_1": ["Matched Product"],
-                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "156"}],
+                "inventory_pairs": [{"id": "default", "ma_kho": "KVT", "tk_vat_tu": "152"}],
                 "use_default_inventory_pair": True,
                 "default_inventory_pair_id": "default",
                 "comparison_scope": app.VIETMAX_COMPARISON_SCOPE_SAME_COMPANY,
@@ -1700,8 +1700,8 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertEqual(result_sheet.cell(4, 14).value, "To")
                 self.assertEqual(result_sheet.cell(3, 15).value, 1)
                 self.assertEqual(result_sheet.cell(4, 15).value, 500)
-                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KHH"))
-                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("156", "KVT"))
+                self.assertEqual((result_sheet.cell(3, 17).value, result_sheet.cell(3, 18).value), ("152", "KVT"))
+                self.assertEqual((result_sheet.cell(4, 17).value, result_sheet.cell(4, 18).value), ("152", "KVT"))
             finally:
                 output.close()
         finally:

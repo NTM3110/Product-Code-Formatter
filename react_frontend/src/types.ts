@@ -38,6 +38,19 @@ export type GenericAnalyzeResult = {
   companies: CompanyRow[];
   original_name?: string;
   saved_name?: string;
+  manual_code_overrides?: Record<string, string>;
+  word_rules?: Record<string, string>;
+  first_word_rules?: Record<string, string>;
+  repeated_phrase_removals?: string[];
+  inventory_pairs?: InventoryPair[];
+  use_default_inventory_pair?: boolean;
+  default_inventory_pair_id?: string;
+  inventory_pair_rules?: InventoryRule[];
+  include_company_prefix?: boolean;
+  prefix_strategy?: string;
+  prefix_mst_digits?: number;
+  prefix_strategy_values?: Record<string, Record<string, string>>;
+  columns?: Record<string, unknown>;
 };
 
 export type InventoryAllocationMappingSection = {
