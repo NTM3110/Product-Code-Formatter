@@ -18,6 +18,11 @@ class InventoryLicenseClientTest(unittest.TestCase):
         self.assertFalse(license_client.metadata_matches_inventory_product({"product_code": "product-code-formatter"}))
         self.assertFalse(license_client.metadata_matches_inventory_product({}))
 
+    def test_license_server_accepts_plain_lan_ip(self):
+        url = license_client.keygen_url("192.168.1.10:3000", "acct", "licenses/actions/validate-key")
+        self.assertEqual(url, "http://192.168.1.10:3000/v1/accounts/acct/licenses/actions/validate-key")
+        self.assertTrue(license_client.keygen_is_local_http_url(url))
+
 
 if __name__ == "__main__":
     unittest.main()

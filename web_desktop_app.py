@@ -28,16 +28,32 @@ class DesktopApi:
         window = webview.windows[0] if webview.windows else None
         if window is None:
             return {"saved": False, "error": "Không tìm thấy cửa sổ để mở hộp thoại lưu file."}
+        requested_name = Path(filename).name
+        requested_suffix = Path(requested_name).suffix.lower()
+        if requested_suffix == ".json":
+            file_types = ("JSON config (*.json)", "All files (*.*)")
+            default_suffix = ".json"
+        elif requested_suffix == ".xls":
+            file_types = ("Excel 97-2003 workbook (*.xls)", "All files (*.*)")
+            default_suffix = ".xls"
+        elif requested_suffix == ".xlsm":
+            file_types = ("Excel macro-enabled workbook (*.xlsm)", "All files (*.*)")
+            default_suffix = ".xlsm"
+        else:
+            file_types = ("Excel workbook (*.xlsx)", "All files (*.*)")
+            default_suffix = ".xlsx"
         paths = window.create_file_dialog(
             webview.FileDialog.SAVE,
-            save_filename=Path(filename).name,
-            file_types=("Excel workbook (*.xlsx)", "All files (*.*)"),
+            save_filename=requested_name,
+            file_types=file_types,
         )
         if not paths:
             return {"saved": False, "cancelled": True}
         target = Path(paths[0])
-        if target.suffix.lower() != ".xlsx":
-            target = target.with_suffix(".xlsx")
+        if not target.suffix:
+            target = target.with_suffix(default_suffix)
+        elif default_suffix == ".xls" and target.suffix.lower() != ".xls":
+            target = target.with_suffix(".xls")
         target.write_bytes(base64.b64decode(data_base64))
         return {"saved": True, "path": str(target)}
 

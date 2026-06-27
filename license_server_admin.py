@@ -345,6 +345,12 @@ license = account.licenses.create!(
   name: JSON.parse({license_name_json!r}),
   metadata: metadata
 )
+keygen_host = ENV.fetch('KEYGEN_HOST', 'license-server.local')
+client_server = keygen_host.start_with?('http') ? keygen_host : "http://#{{keygen_host}}:3000"
+puts "CLIENT_APP_FIELDS=License server/IP + APP_LICENSE_KEY"
+puts "APP_LICENSE_SERVER=#{{client_server}}"
+puts "APP_ACCOUNT_ID=#{{ENV.fetch('KEYGEN_ACCOUNT_ID')}}"
+puts "APP_LICENSE_KEY=#{{license.key}}"
 puts "LICENSE_KEY=#{{license.key}}"
 puts "LICENSE_ID=#{{license.id}}"
 puts "PRODUCT_CODE=#{{product.code}}"

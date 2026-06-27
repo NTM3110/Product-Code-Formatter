@@ -1,11 +1,40 @@
 import unittest
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
+import xlrd
 
 import app
-from app import build_vietmax_ban_ra_purchase_matches, create_up_ban_ra_workbook, default_config, license_allows_company, license_allows_profile, license_has_local_activation, make_product_part, normalize_config, process_workbook, profile_key, resolve_output_path, suggest_prefix, up_ban_ra_output_path, vietmax_ban_ra_sales_products_from_workbook, vietmax_product_review_rows, vietmax_purchase_match_export_rows, vietmax_purchase_products_from_workbook
+from app import build_vietmax_ban_ra_purchase_matches, create_up_ban_ra_workbook, create_up_mua_vao_workbook, default_config, license_allows_company, license_allows_profile, license_has_local_activation, make_product_part, normalize_config, process_workbook, profile_key, resolve_output_path, suggest_prefix, up_ban_ra_output_path, up_mua_vao_output_path, vietmax_ban_ra_sales_products_from_workbook, vietmax_product_review_rows, vietmax_purchase_match_export_rows, vietmax_purchase_products_from_workbook
+
+
+class XlsCellAdapter:
+    def __init__(self, value):
+        self.value = value
+
+
+class XlsSheetAdapter:
+    def __init__(self, sheet):
+        self._sheet = sheet
+        self.max_column = sheet.ncols
+        self.max_row = sheet.nrows
+
+    def cell(self, row, col):
+        return XlsCellAdapter(self._sheet.cell_value(row - 1, col - 1))
+
+
+class XlsWorkbookAdapter:
+    def __init__(self, data):
+        self._workbook = xlrd.open_workbook(file_contents=data)
+        self.sheetnames = self._workbook.sheet_names()
+
+    def __getitem__(self, name):
+        return XlsSheetAdapter(self._workbook.sheet_by_name(name))
+
+    def close(self):
+        self._workbook.release_resources()
 
 
 class ProcessWorkbookTests(unittest.TestCase):
@@ -60,6 +89,21 @@ class ProcessWorkbookTests(unittest.TestCase):
             self.assertFalse(license_has_local_activation({"activated": False, "machine_fingerprint": "TEST-FINGERPRINT"}))
         finally:
             app.local_machine_fingerprint = original_fingerprint
+
+    def test_license_local_activation_accepts_legacy_same_computer_fingerprint(self):
+        original_fingerprint = app.local_machine_fingerprint
+        original_legacy_fingerprint = app.legacy_machine_fingerprint
+        original_machine_name = app.current_machine_name
+        try:
+            app.local_machine_fingerprint = lambda: "DESKTOP-SGFC2SA-WIN-STABLE-GUID"
+            app.legacy_machine_fingerprint = lambda: "DESKTOP-SGFC2SA-28A06B93D8B0"
+            app.current_machine_name = lambda: "DESKTOP-SGFC2SA"
+            self.assertTrue(license_has_local_activation({"activated": True, "machine_fingerprint": "DESKTOP-SGFC2SA-28A06B93D8AD"}))
+            self.assertFalse(license_has_local_activation({"activated": True, "machine_fingerprint": "OTHERPC-28A06B93D8AD"}))
+        finally:
+            app.local_machine_fingerprint = original_fingerprint
+            app.legacy_machine_fingerprint = original_legacy_fingerprint
+            app.current_machine_name = original_machine_name
 
     def test_keygen_metadata_accepts_camel_case_profile_keys(self):
         response = {
@@ -182,15 +226,15 @@ class ProcessWorkbookTests(unittest.TestCase):
         )
         self.assertEqual(
             make_product_part("vietmax_ban_ra", "Giấy An Hòa PP 92/70", {}),
-            "GAHPP92/70",
+            "GIAYAHPP92/70",
         )
         self.assertEqual(
             make_product_part("vietmax_ban_ra", "Giấy in offset 100gsm", {}),
-            "GIAYINOFFSET100GSM",
+            "GIAYIO100GSM",
         )
         self.assertEqual(
             make_product_part("vietmax_ban_ra", "Màng tự dính SYNWK-F1840N", {}),
-            "MANGTUDINH",
+            "MANGTDSYNWK-F1840N",
         )
         self.assertEqual(
             make_product_part("vietmax_ban_ra", "Supercalifragilisticexpialidocious alpha beta gamma delta epsilon", {}),
@@ -211,11 +255,13 @@ class ProcessWorkbookTests(unittest.TestCase):
 
     def test_vietmax_product_code_uses_workbook_prefix_rules_for_variants(self):
         examples = {
-            "Giấy An Hoà 95/60gsm/620x860": "GANHOA9560GSM620x860",
-            "Giấy An Hoà 95/70gsm/620x860": "GANHOA9570GSM620x860",
-            "Giấy Couche 250gsm (79x47) cm": "GCOUCHE250GSM79X47",
+            "Giấy An Hoà 95/60gsm/620x860": "GAH9560GSM620x860",
+            "Giấy An Hoà 95/70gsm/620x860": "GAH9570GSM620x860",
+            "Giấy In An Hòa 92/70gsm/790 x 1090": "GIAYINANHO9270GSM790X1090",
+            "Giấy Couche 250gsm (79x47) cm": "GCOUCHE250GSM79X47CM",
             "Giấy Cacbon CB white 56/610*860_TL (R500)": "GCCBWHITE56610*860_TL(R500)",
             "Giấy offset 100gsm khổ 62x86cm": "GOFFSET100GSM62X86CM",
+            "Giấy In Offset 120gsm khổ 79x109cm": "GIAYINOFFSET120GSMKHO79X109CM",
             "Giấy Couche định lượng 80gsm, khổ 620x860mm": "GCOUCHE80GSM620x860MM",
             "Giấy Ivory định lượng 250gsm, khổ 790 mm": "GIVORY250GSM790MM",
             "Màng tự dính BLWK-Z0585MW": "MANGTUDINH",
@@ -231,10 +277,26 @@ class ProcessWorkbookTests(unittest.TestCase):
             "TAMBANNHOMCTPHL1030x800",
         )
 
+    def test_vietmax_tam_ban_nhom_hyphen_variants_use_base_prefix(self):
+        examples = {
+            "T\u1ea5m b\u1ea3n in b\u1eb1ng nh\u00f4m CTP-HL I 1030x800": (
+                "TAMBANNHOMCTP-HLI1030x800",
+                "TAMBIBNCTP-HLI1030x800",
+            ),
+            "T\u1ea5m b\u1ea3n in b\u1eb1ng nh\u00f4m CTCP-HL I530x400x0.3mm": (
+                "TAMBANNHOMCTCP-HLI530x400x0.3MM",
+                "TAMBIBNCTCP-HLI530x400x0.3MM",
+            ),
+        }
+        for product_name, (purchase_expected, sales_expected) in examples.items():
+            with self.subTest(product_name=product_name):
+                self.assertEqual(make_product_part("vietmax_mua_vao", product_name, {}), purchase_expected)
+                self.assertEqual(make_product_part("vietmax_ban_ra", product_name, {}), sales_expected)
+
     def test_vietmax_mang_tu_dinh_keeps_customer_hardcode(self):
         self.assertEqual(make_product_part("vietmax_mua_vao", "Màng tự dính BLWK-Z0585MW", {}), "MANGTUDINH")
         self.assertEqual(make_product_part("vietmax_mua_vao", "Màng tự dính SYNWK-F1840N", {}), "MANGTUDINH")
-        self.assertEqual(make_product_part("vietmax_ban_ra", "Màng tự dính SYNWK-F1840N", {}), "MANGTUDINH")
+        self.assertEqual(make_product_part("vietmax_ban_ra", "Màng tự dính SYNWK-F1840N", {}), "MANGTDSYNWK-F1840N")
 
     def test_vietmax_duplex_g_m2_uses_single_uppercase_gm2(self):
         self.assertEqual(make_product_part("vietmax_mua_vao", "Giấy Duplex ĐL 300 g/m2", {}), "GDL300GM2")
@@ -400,6 +462,244 @@ class ProcessWorkbookTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_vietmax_product_review_rows_ignores_case_accent_space_only_differences(self):
+        products = [
+            "Gi\u1ea5y in",
+            "Gi\u1ea5y In",
+            "GI\u1ea4Y   IN",
+            "Giay in",
+        ]
+        rows = vietmax_product_review_rows(
+            [{"purchase_product": value, "purchase_unit": "Kg"} for value in products],
+            "purchase_product",
+            "purchase_unit",
+        )
+
+        self.assertEqual(rows, [])
+        codes = {
+            app.make_code("", value, 1, {}, "vietmax_mua_vao", {}, require_qty=False, include_company_prefix=False)
+            for value in products
+        }
+        self.assertEqual(len(codes), 1)
+
+    def test_vietmax_product_review_rows_groups_volume_unit_spelling_differences(self):
+        left = "In Decal N\u01b0\u1edbc gi\u1eb7t Hi5 Ng\u00e0n hoa 10L"
+        right = "In decal n\u01b0\u1edbc gi\u1eb7t hi5 Ng\u00e0n hoa 10 lit"
+
+        purchase_rows = vietmax_product_review_rows(
+            [
+                {"purchase_product": left, "purchase_unit": "B\u1ed9"},
+                {"purchase_product": right, "purchase_unit": "B\u1ed9"},
+            ],
+            "purchase_product",
+            "purchase_unit",
+        )
+        sales_rows = vietmax_product_review_rows(
+            [
+                {"sales_product": left, "sales_unit": "B\u1ed9", "code": "INDNGHI5NH10L"},
+                {"sales_product": right, "sales_unit": "B\u1ed9", "code": "INDNGHI5NH10L"},
+            ],
+            "sales_product",
+            "sales_unit",
+            allow_same_code_split=True,
+        )
+
+        self.assertEqual(len(purchase_rows), 1)
+        self.assertEqual(purchase_rows[0]["review_group"], "unit_spelling_diff")
+        self.assertEqual(len(sales_rows), 1)
+        self.assertEqual(sales_rows[0]["review_group"], "unit_spelling_diff")
+
+    def test_vietmax_code_generation_normalizes_decimal_comma_and_dot(self):
+        codes = {
+            app.make_code("", value, 1, {}, "vietmax_mua_vao", {}, require_qty=False, include_company_prefix=False)
+            for value in ["In tem chai 3.5L", "In tem chai 3,5L"]
+        }
+
+        self.assertEqual(len(codes), 1)
+
+    def test_vietmax_product_review_rows_groups_optional_in_form_variants(self):
+        rows = vietmax_product_review_rows(
+            [
+                {"purchase_product": "Gi\u1ea5y in Couche", "purchase_unit": "Kg", "code": "GIAYINCOUCHE"},
+                {"purchase_product": "Gi\u1ea5y Couche", "purchase_unit": "Kg", "code": "GIAYCOUCHE"},
+                {"purchase_product": "Gi\u1ea5y In Duplex", "purchase_unit": "Kg", "code": "GIAYINDUPLEX"},
+                {"purchase_product": "Gi\u1ea5y Duplex", "purchase_unit": "Kg", "code": "GIAYDUPLEX"},
+            ],
+            "purchase_product",
+            "purchase_unit",
+        )
+
+        similar_rows = [row for row in rows if row["review_group"] == "similar_form"]
+        pairs = {tuple(sorted([row["product"], row["similar_product"]])) for row in similar_rows}
+        self.assertIn(tuple(sorted(["Gi\u1ea5y in Couche", "Gi\u1ea5y Couche"])), pairs)
+        self.assertIn(tuple(sorted(["Gi\u1ea5y In Duplex", "Gi\u1ea5y Duplex"])), pairs)
+        self.assertTrue(all(row["confirmed"] is False for row in similar_rows))
+
+    def test_vietmax_product_review_rows_marks_same_code_split_only_when_enabled(self):
+        products = [
+            {"sales_product": "Giay in Offset", "sales_unit": "Kg", "code": "GIAYOFFSET"},
+            {"sales_product": "Giay Offset", "sales_unit": "Kg", "code": "GIAYOFFSET"},
+        ]
+
+        default_rows = vietmax_product_review_rows(products, "sales_product", "sales_unit")
+        split_rows = vietmax_product_review_rows(products, "sales_product", "sales_unit", allow_same_code_split=True)
+
+        self.assertFalse(any(row.get("review_type") == "same_code_split" for row in default_rows))
+        self.assertTrue(any(row.get("review_group") == "same_code_split" and row.get("review_type") == "same_code_split" for row in split_rows))
+
+    def test_vietmax_product_review_rows_skips_same_code_from_user_config(self):
+        rows = vietmax_product_review_rows(
+            [
+                {"purchase_product": "Giay in Couche", "purchase_unit": "Kg", "code": "GIAYINCOUCHE"},
+                {"purchase_product": "Giay Couche", "purchase_unit": "Kg", "code": "GIAYINCOUCHE", "code_from_user_config": True},
+                {"purchase_product": "Giay in Duplex", "purchase_unit": "Kg", "code": "GIAYINDUPLEX"},
+                {"purchase_product": "Giay Duplex", "purchase_unit": "Kg", "code": "GIAYDUPLEX"},
+            ],
+            "purchase_product",
+            "purchase_unit",
+        )
+
+        pairs = {tuple(sorted([row["product"], row["similar_product"]])) for row in rows}
+        self.assertNotIn(tuple(sorted(["Giay in Couche", "Giay Couche"])), pairs)
+        self.assertIn(tuple(sorted(["Giay in Duplex", "Giay Duplex"])), pairs)
+
+    def test_review_merge_config_strips_normal_codes_but_keeps_split_codes(self):
+        rules = app.sanitize_review_merge_rules_for_config([
+            {
+                "product": "Giay in Offset",
+                "similar_product": "Giay Offset",
+                "confirmed": True,
+                "code_choice": "similar",
+                "code": "STALE1",
+                "similar_code": "STALE2",
+                "review_group": "similar_form",
+            },
+            {
+                "product": "Giay in Couche",
+                "similar_product": "Giay Couche",
+                "confirmed": True,
+                "code_choice": "split",
+                "split_code": "GIAYINCOUCHE(1)",
+                "similar_split_code": "GIAYCOUCHE/2",
+                "review_group": "same_code_split",
+                "review_type": "same_code_split",
+            },
+        ])
+
+        self.assertNotIn("code", rules[0])
+        self.assertNotIn("similar_code", rules[0])
+        self.assertEqual(rules[1]["split_code"], "GIAYINCOUCHE1")
+        self.assertEqual(rules[1]["similar_split_code"], "GIAYCOUCHE2")
+
+    def test_sanitize_product_code_removes_fast_illegal_characters(self):
+        self.assertEqual(app.sanitize_product_code('TT173.INTG(ABC)/A+B? "X"'), "TT173.INTGABCABX")
+        self.assertNotIn("(", app.sanitize_product_code("BNCTP(ABC)"))
+        self.assertNotIn("/", app.sanitize_product_code("BNCTP/ABC"))
+
+    def test_vietmax_split_review_rule_applies_without_manual_code_overrides(self):
+        outputs = Path(__file__).parent / "outputs"
+        outputs.mkdir(exist_ok=True)
+        run_id = uuid4().hex
+        source = outputs / f"_test_vietmax_split_source_{run_id}.xlsx"
+        result = outputs / f"_test_vietmax_split_result_{run_id}.xlsx"
+        try:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Purchase"
+            sheet.cell(2, 6, "Ten nguoi ban")
+            sheet.cell(2, 7, "MST")
+            sheet.cell(2, 12, "Ma VT")
+            sheet.cell(2, 13, "Ten hang")
+            sheet.cell(2, 15, "So luong")
+            sheet.cell(3, 6, "Cong ty A")
+            sheet.cell(3, 7, "111")
+            sheet.cell(3, 12, 0)
+            sheet.cell(3, 13, "In decal Tumax")
+            sheet.cell(3, 15, 1)
+            sheet.cell(4, 6, "Cong ty A")
+            sheet.cell(4, 7, "111")
+            sheet.cell(4, 12, 0)
+            sheet.cell(4, 13, "In decal Fly-pro")
+            sheet.cell(4, 15, 1)
+            workbook.save(source)
+            workbook.close()
+
+            process_workbook(source, result, {
+                "company_col": "F",
+                "mst_col": "G",
+                "product_col": "M",
+                "qty_col": "O",
+                "output_col": "L",
+                "profile": "vietmax",
+                "vietmax_phase": app.VIETMAX_PHASE_PURCHASE,
+                "include_company_prefix": False,
+                "all_mst": ["111"],
+                "process_mst": ["111"],
+                "mst_safe_id": ["111|||0"],
+                "selected_products_0": ["In decal Tumax", "In decal Fly-pro"],
+                "vietmax_mua_vao_internal_merges": [
+                    {
+                        "product": "In decal Tumax",
+                        "similar_product": "In decal Fly-pro",
+                        "confirmed": True,
+                        "code_choice": "split",
+                        "review_group": "same_code_split",
+                        "review_type": "same_code_split",
+                        "split_code": "INDT(1)",
+                        "similar_split_code": "INDF/2",
+                    },
+                ],
+            })
+
+            output = load_workbook(result, data_only=True)
+            try:
+                result_sheet = output["Purchase"]
+                self.assertEqual(result_sheet.cell(3, 12).value, "INDT1")
+                self.assertEqual(result_sheet.cell(4, 12).value, "INDF2")
+            finally:
+                output.close()
+        finally:
+            source.unlink(missing_ok=True)
+            result.unlink(missing_ok=True)
+
+    def test_saved_review_choices_restore_by_scope_and_section(self):
+        from web_api import apply_saved_review_choices
+
+        rows = [{
+            "product": "Giay Couche",
+            "similar_product": "Giay in Couche",
+            "review_group": "similar_form",
+            "confirmed": False,
+        }]
+        wrong_section = [{
+            "product": "Giay Couche",
+            "similar_product": "Giay in Couche",
+            "review_group": "other",
+            "comparison_scope": app.VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES,
+            "confirmed": True,
+            "code_choice": "similar",
+        }]
+        wrong_scope = [{
+            "product": "Giay Couche",
+            "similar_product": "Giay in Couche",
+            "review_group": "similar_form",
+            "comparison_scope": app.VIETMAX_COMPARISON_SCOPE_SAME_COMPANY,
+            "confirmed": True,
+            "code_choice": "similar",
+        }]
+        right_rule = [{
+            "product": "Giay Couche",
+            "similar_product": "Giay in Couche",
+            "review_group": "similar_form",
+            "comparison_scope": app.VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES,
+            "confirmed": True,
+            "code_choice": "similar",
+        }]
+
+        self.assertFalse(apply_saved_review_choices(rows, wrong_section, app.VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES)[0]["confirmed"])
+        self.assertFalse(apply_saved_review_choices(rows, wrong_scope, app.VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES)[0]["confirmed"])
+        self.assertTrue(apply_saved_review_choices(rows, right_rule, app.VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES)[0]["confirmed"])
+
     def test_vietmax_product_review_rows_groups_obvious_size_or_volume_differences(self):
         rows = vietmax_product_review_rows(
             [
@@ -542,11 +842,16 @@ class ProcessWorkbookTests(unittest.TestCase):
         )
 
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["purchase_code"], "GC300")
+        self.assertEqual(matches[0]["purchase_code"], "GCOUCHE300GSM")
         self.assertEqual(matches[0]["purchase_product"], "Giấy Couche 300 gsm")
 
     def test_vietmax_internal_purchase_merge_uses_representative_code(self):
         purchase_products = [{"purchase_product": "Giấy Couche 300 gms", "purchase_code": "OLD300", "purchase_unit": "Ram"}]
+        purchase_products.append({
+            "purchase_product": purchase_products[0]["purchase_product"].replace("gms", "gsm"),
+            "purchase_code": "COMMON300",
+            "purchase_unit": "Ram",
+        })
         merges = app.normalize_vietmax_internal_merges([
             {
                 "product": "Giấy Couche 300 gms",
@@ -569,6 +874,61 @@ class ProcessWorkbookTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["purchase_code"], "COMMON300")
         self.assertEqual(matches[0]["purchase_product"], "Giấy Couche 300 gsm")
+
+    def test_vietmax_similar_form_merge_uses_selected_ma_vt_2(self):
+        purchase_products = [
+            {"purchase_product": "Giấy In An Hòa 92/70gsm/790 x 1090", "purchase_code": "GIAYINANHO9270GSM790X1090", "purchase_unit": "Ram"},
+            {"purchase_product": "Giấy An Hòa 92/70gsm/790x1090", "purchase_code": "GAH9270GSM790x1090", "purchase_unit": "Ram"},
+        ]
+        merges = app.normalize_vietmax_internal_merges([
+            {
+                "product": "Giấy In An Hòa 92/70gsm/790 x 1090",
+                "similar_product": "Giấy An Hòa 92/70gsm/790x1090",
+                "code": "GIAYINANHO9270GSM790X1090",
+                "similar_code": "GAH9270GSM790x1090",
+                "code_choice": "similar",
+                "review_group": "similar_form",
+                "confirmed": True,
+            },
+        ])
+        effective_purchase_products = app.apply_vietmax_internal_merges_to_products(
+            purchase_products,
+            "purchase_product",
+            "purchase_unit",
+            merges,
+        )
+
+        self.assertEqual(len(effective_purchase_products), 1)
+        self.assertEqual(effective_purchase_products[0]["purchase_product"], "Giấy An Hòa 92/70gsm/790x1090")
+        self.assertEqual(effective_purchase_products[0]["purchase_code"], "GAH9270GSM790x1090")
+
+    def test_vietmax_similar_form_merge_uses_selected_ma_vt_1(self):
+        purchase_products = [
+            {"purchase_product": "Giấy In An Hòa 92/70gsm/790 x 1090", "purchase_code": "GIAYINANHO9270GSM790X1090", "purchase_unit": "Ram"},
+            {"purchase_product": "Giấy An Hòa 92/70gsm/790x1090", "purchase_code": "GAH9270GSM790x1090", "purchase_unit": "Ram"},
+        ]
+        merges = app.normalize_vietmax_internal_merges([
+            {
+                # This is the shape saved by the React review table when the user chooses "Mã VT 1".
+                "product": "Giấy An Hòa 92/70gsm/790x1090",
+                "similar_product": "Giấy In An Hòa 92/70gsm/790 x 1090",
+                "code": "GAH9270GSM790x1090",
+                "similar_code": "GIAYINANHO9270GSM790X1090",
+                "code_choice": "current",
+                "review_group": "similar_form",
+                "confirmed": True,
+            },
+        ])
+        effective_purchase_products = app.apply_vietmax_internal_merges_to_products(
+            purchase_products,
+            "purchase_product",
+            "purchase_unit",
+            merges,
+        )
+
+        self.assertEqual(len(effective_purchase_products), 1)
+        self.assertEqual(effective_purchase_products[0]["purchase_product"], "Giấy In An Hòa 92/70gsm/790 x 1090")
+        self.assertEqual(effective_purchase_products[0]["purchase_code"], "GIAYINANHO9270GSM790X1090")
 
     def test_unchecked_vietmax_internal_purchase_merge_is_ignored(self):
         purchase_products = [{"purchase_product": "Tên khác hoàn toàn", "purchase_code": "WRONG", "purchase_unit": "Ram"}]
@@ -1709,17 +2069,18 @@ class ProcessWorkbookTests(unittest.TestCase):
             result.unlink(missing_ok=True)
 
 
-    def test_output_suffixes_are_fdi_and_nhap_kho(self):
+    def test_output_suffixes_are_fdi_and_up_files(self):
         output = resolve_output_path("hoa_don.xlsx", "")
-        self.assertEqual(output.name, "hoa_don_fdi.xlsx")
-        self.assertEqual(up_ban_ra_output_path(output).name, "hoa_don_fdi_nhap_kho.xlsx")
+        self.assertEqual(output.name, "hoa_don_fdi.xls")
+        self.assertEqual(up_mua_vao_output_path(output).name, "hoa_don_fdi_UP_mua_vao.xlsx")
+        self.assertEqual(up_ban_ra_output_path(output).name, "hoa_don_fdi_UP_ban_ra.xlsx")
 
     def test_selected_output_filename_is_normalized_to_fdi_suffix(self):
         output = resolve_output_path("hoa_don.xlsx", "outputs/custom_name.xlsx")
-        self.assertEqual(output.name, "custom_name_fdi.xlsx")
-        self.assertEqual(resolve_output_path("hoa_don.xlsx", "outputs/custom_name_fdi.xlsx").name, "custom_name_fdi.xlsx")
+        self.assertEqual(output.name, "custom_name_fdi.xls")
+        self.assertEqual(resolve_output_path("hoa_don.xlsx", "outputs/custom_name_fdi.xlsx").name, "custom_name_fdi.xls")
 
-    def test_nhap_kho_workbook_uses_inventory_columns(self):
+    def test_up_workbooks_use_inventory_columns(self):
         outputs = Path(__file__).parent / "outputs"
         outputs.mkdir(exist_ok=True)
         run_id = uuid4().hex
@@ -1770,19 +2131,233 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "selected_products_0": ["Hang A"],
                 "inventory_pairs": [{"id": "only", "ma_kho": "KVT", "tk_vat_tu": "152"}],
             })
-            stream = create_up_ban_ra_workbook(processed)
-            output = load_workbook(stream, data_only=True)
+            purchase_stream = create_up_mua_vao_workbook(processed)
+            purchase_output = load_workbook(purchase_stream, data_only=True)
             try:
-                sheet = output.active
-                self.assertEqual(sheet["AB2"].value, "152")
-                self.assertEqual(sheet["AF2"].value, "KVT")
-                self.assertNotEqual(sheet["AB2"].value, "KVT")
-                self.assertNotEqual(sheet["AF2"].value, "152")
+                purchase_sheet = purchase_output.active
+                self.assertEqual(purchase_sheet["J2"].value, "KVT")
+                self.assertEqual(purchase_sheet["O2"].value, "152")
             finally:
-                output.close()
+                purchase_output.close()
+
+            sales_stream = create_up_ban_ra_workbook(processed)
+            sales_output = load_workbook(sales_stream, data_only=True)
+            try:
+                sales_sheet = sales_output.active
+                self.assertEqual(sales_sheet["AB2"].value, "152")
+                self.assertEqual(sales_sheet["AF2"].value, "KVT")
+                self.assertNotEqual(sales_sheet["AB2"].value, "KVT")
+                self.assertNotEqual(sales_sheet["AF2"].value, "152")
+            finally:
+                sales_output.close()
         finally:
             source.unlink(missing_ok=True)
             result.unlink(missing_ok=True)
+
+    def test_fast_import_package_uses_processed_fdi_sources(self):
+        outputs = Path(__file__).parent / "outputs"
+        outputs.mkdir(exist_ok=True)
+        run_id = uuid4().hex
+        purchase_source = outputs / f"_test_fast_purchase_{run_id}.xlsx"
+        sales_source = outputs / f"_test_fast_sales_{run_id}.xlsx"
+
+        def write_processed_fdi(path, row_values):
+            if isinstance(row_values, dict):
+                row_values = [row_values]
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Invoices"
+            for col, header in {
+                "A": "Mẫu HD",
+                "B": "Ký hiệu",
+                "C": "Số HĐ",
+                "D": "Ngày HD",
+                "F": "Tên người bán",
+                "G": "MST người bán",
+                "H": "Địa chỉ người bán",
+                "I": "Tên người mua",
+                "J": "MST người mua",
+                "K": "Địa chỉ người mua",
+                "L": "Mã VT",
+                "M": "Tên hàng hóa",
+                "N": "ĐVT",
+                "O": "Số lượng",
+                "P": "Đơn giá",
+                "R": "Thuế suất",
+                "V": "Tiền chưa thuế",
+                "W": "Tiền thuế",
+                "AQ": "Mã ngoại tệ",
+                "AR": "Tỷ giá",
+                "AS": "TK vật tư",
+                "AT": "Mã kho",
+            }.items():
+                sheet.cell(2, app.excel_col_to_index(col) + 1, header)
+            for row_index, values in enumerate(row_values, start=3):
+                for col, value in values.items():
+                    sheet.cell(row_index, app.excel_col_to_index(col) + 1, value)
+            workbook.save(path)
+            workbook.close()
+
+        try:
+            write_processed_fdi(purchase_source, {
+                "A": "01GTKT0",
+                "B": "AA/26E",
+                "C": "312",
+                "D": "16/01/2026",
+                "F": "CÔNG TY BÁN",
+                "G": "010SELL",
+                "H": "Địa chỉ bán",
+                "I": "VIETMAX",
+                "J": "010BUY",
+                "K": "Địa chỉ mua",
+                "L": "GIAYIN",
+                "M": "Giấy in",
+                "N": "Kg",
+                "O": 12.5,
+                "P": 21000,
+                "R": 0.08,
+                "V": 262500,
+                "W": 21000,
+                "AQ": "VND",
+                "AR": 1,
+                "AS": "152",
+                "AT": "KVT",
+            })
+            write_processed_fdi(sales_source, [{
+                "A": "01GTKT0",
+                "B": "BB/26E",
+                "C": "140",
+                "D": "13/01/2026",
+                "F": "VIETMAX",
+                "G": "010SELL",
+                "H": "Địa chỉ bán",
+                "I": "CÔNG TY MUA",
+                "J": "010CUSTOMER",
+                "K": "Địa chỉ khách",
+                "L": "INTG",
+                "M": "In túi giấy",
+                "N": "Chiếc",
+                "O": 10,
+                "P": 10000,
+                "R": 0.08,
+                "V": 100000,
+                "W": 8000,
+                "AQ": "VND",
+                "AR": 1,
+                "AS": "155",
+                "AT": "KTP",
+            }, {
+                "A": "01GTKT0",
+                "B": "BB/26E",
+                "C": "141",
+                "D": "14/01/2026",
+                "F": "VIETMAX",
+                "G": "010SELL",
+                "H": "Địa chỉ bán",
+                "I": "CÔNG TY GIA CÔNG",
+                "J": "010CUSTOMER2",
+                "K": "Địa chỉ khách 2",
+                "L": "CONGIN",
+                "M": "Công in",
+                "N": "Lần",
+                "O": 5,
+                "P": 100,
+                "R": 0.08,
+                "V": 500,
+                "W": 40,
+                "AQ": "VND",
+                "AR": 1,
+                "AS": "1552",
+                "AT": "KGCI",
+            }])
+            _, purchase_df = app.read_workbook(purchase_source)
+            _, sales_df = app.read_workbook(sales_source)
+
+            stream = app.fast_import_multi_sheet_workbook(purchase_df, sales_df)
+            workbook = XlsWorkbookAdapter(stream.getvalue())
+            try:
+                self.assertEqual(
+                    workbook.sheetnames,
+                    ["Hoadonmuahang", "Bao_cao_trung_so_ct", "Hoadonbanhang", "DMvat_tu", "DMkhachhang"],
+                )
+
+                sheet = workbook["Hoadonmuahang"]
+                self.assertEqual(sheet.max_column, len(app.FAST_HOA_DON_MUA_HANG_HEADERS))
+                self.assertEqual(sheet.cell(2, 1).value, "010SELL")
+                self.assertEqual(sheet.cell(2, 6).value, "312")
+                self.assertEqual(sheet.cell(2, 10).value, "KVT")
+                self.assertEqual(sheet.cell(2, 11).value, "GIAYIN")
+                self.assertEqual(sheet.cell(2, 15).value, "152")
+                for col in [2, 4, 16, 20, 21]:
+                    self.assertIn(sheet.cell(2, col).value, (None, ""))
+
+                sheet = workbook["Hoadonbanhang"]
+                self.assertEqual(sheet.max_column, len(app.FAST_HOA_DON_BAN_HANG_HEADERS))
+                self.assertEqual(sheet.cell(2, 1).value, "010CUSTOMER")
+                self.assertEqual(sheet.cell(2, 5).value, "140")
+                self.assertEqual(sheet.cell(2, 22).value, "08")
+                self.assertEqual(sheet.cell(2, 28).value, "155")
+                self.assertEqual(sheet.cell(2, 32).value, "KTP")
+                self.assertEqual(sheet.cell(2, 33).value, "INTG")
+                self.assertEqual(sheet.cell(2, 34).value, "Xuất bán hàng")
+                self.assertEqual(sheet.cell(3, 1).value, "010CUSTOMER2")
+                self.assertEqual(sheet.cell(3, 28).value, "1552")
+                self.assertEqual(sheet.cell(3, 32).value, "KGCI")
+                self.assertEqual(sheet.cell(3, 33).value, "CONGIN")
+                for col in [2, 3, 4, 7, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 30, 35, 36, 38, 39, 40, 41, 42, 44, 46, 47, 48]:
+                    self.assertIn(sheet.cell(2, col).value, (None, ""))
+
+                sheet = workbook["DMvat_tu"]
+                codes = {sheet.cell(row, 1).value for row in range(2, sheet.max_row + 1)}
+                self.assertEqual(codes, {"GIAYIN", "INTG", "CONGIN"})
+                for row in range(2, sheet.max_row + 1):
+                    for col in [8, 9, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30]:
+                        self.assertIn(sheet.cell(row, col).value, (None, ""))
+
+                sheet = workbook["DMkhachhang"]
+                self.assertEqual(sheet.max_column, len(app.FAST_DM_KHACH_HANG_HEADERS))
+                customers = {sheet.cell(row, 1).value for row in range(2, sheet.max_row + 1)}
+                self.assertEqual(customers, {"010SELL", "010CUSTOMER", "010CUSTOMER2"})
+                for row in range(2, sheet.max_row + 1):
+                    mst = sheet.cell(row, 1).value
+                    self.assertEqual(sheet.cell(row, 4).value, mst)
+                    self.assertIn(sheet.cell(row, 2).value, {"CÔNG TY BÁN", "CÔNG TY MUA", "CÔNG TY GIA CÔNG"})
+                    self.assertIn(sheet.cell(row, 5).value, {"Địa chỉ bán", "Địa chỉ khách", "Địa chỉ khách 2"})
+                    for col in [3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]:
+                        self.assertIn(sheet.cell(row, col).value, (None, ""))
+            finally:
+                workbook.close()
+        finally:
+            purchase_source.unlink(missing_ok=True)
+            sales_source.unlink(missing_ok=True)
+
+    def test_fast_import_validation_requires_inventory_columns(self):
+        outputs = Path(__file__).parent / "outputs"
+        outputs.mkdir(exist_ok=True)
+        source = outputs / f"_test_fast_missing_inventory_{uuid4().hex}.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        for col, header in {
+            "C": "Số HĐ",
+            "L": "Mã VT",
+            "O": "Số lượng",
+        }.items():
+            sheet.cell(2, app.excel_col_to_index(col) + 1, header)
+        sheet.cell(3, app.excel_col_to_index("C") + 1, "1")
+        sheet.cell(3, app.excel_col_to_index("L") + 1, "GIAYIN")
+        sheet.cell(3, app.excel_col_to_index("O") + 1, 10)
+        try:
+            workbook.save(source)
+            workbook.close()
+            _, df = app.read_workbook(source)
+            with self.assertRaises(ValueError) as context:
+                app.validate_fast_import_processed_dataframe(df, "FDI test")
+            message = str(context.exception)
+            self.assertIn("TK vật tư", message)
+            self.assertIn("Mã kho", message)
+        finally:
+            workbook.close()
+            source.unlink(missing_ok=True)
 
 
 

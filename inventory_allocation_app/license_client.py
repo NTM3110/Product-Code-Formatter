@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import re
 import sys
@@ -94,20 +95,40 @@ def local_machine_fingerprint():
     return f"{os.environ.get('COMPUTERNAME') or 'windows'}-{uuid.getnode():012x}".upper()
 
 
-def keygen_url(server_url, account_id, path):
+def normalize_keygen_server_url(server_url):
     base = str(server_url or "").strip().rstrip("/")
+    if base and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", base):
+        base = f"http://{base}"
+    return base
+
+
+def keygen_allows_http_host(hostname):
+    host = str(hostname or "").strip().lower()
+    if host in LOCAL_KEYGEN_HOSTS:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.endswith(".local") or "." not in host
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def keygen_url(server_url, account_id, path):
+    base = normalize_keygen_server_url(server_url)
     account = str(account_id or "").strip().strip("/")
     if not base or not account:
         raise ValueError("Cần nhập địa chỉ server và account của Keygen.")
     parsed = urlparse(base)
-    if parsed.scheme != "https" and parsed.hostname not in LOCAL_KEYGEN_HOSTS:
-        raise ValueError("License server phải dùng HTTPS. Chỉ localhost được phép dùng HTTP để thử nghiệm.")
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("License server phải bắt đầu bằng http:// hoặc https://, hoặc nhập IP LAN.")
+    if parsed.scheme == "http" and not keygen_allows_http_host(parsed.hostname):
+        raise ValueError("License server HTTP chỉ được phép cho localhost hoặc máy trong mạng LAN.")
     return f"{base}/v1/accounts/{account}/{path.lstrip('/')}"
 
 
 def keygen_is_local_http_url(url):
     parsed = urlparse(str(url or ""))
-    return parsed.scheme == "http" and parsed.hostname in LOCAL_KEYGEN_HOSTS
+    return parsed.scheme == "http" and keygen_allows_http_host(parsed.hostname)
 
 
 def keygen_request(method, url, payload=None, license_key=None, timeout=10):
@@ -219,7 +240,7 @@ def activate_keygen_license(server_url, account_id, license_key, timeout=10):
     if not validation["valid"]:
         raise ValueError(validation["detail"] or validation["code"] or "License chưa hợp lệ sau khi kích hoạt máy.")
     return {
-        "server_url": str(server_url or "").strip().rstrip("/"),
+        "server_url": normalize_keygen_server_url(server_url),
         "account_id": str(account_id or "").strip(),
         "license_key": str(license_key or "").strip(),
         "machine_fingerprint": fingerprint,

@@ -1,4 +1,4 @@
-# Python environments and caches
+﻿# Python environments and caches
 .venv/
 venv/
 env/
@@ -52,11 +52,14 @@ deploy/outputs/
 *.xlsx
 *.xlsm
 !mau HD ban ra.xlsx
+!mau_mua_vao_up.xlsx
+!mau_ban_ra_up.xlsx
 *.pdf
 
 # Local runtime configuration and secrets
 config.json
 product_code_config.json
+product_code_config*.json
 deploy/product_code_config.json
 .env
 .env.*
@@ -100,3 +103,4 @@ inventory_allocation_app/*.exe
 inventory_allocation_app/outputs/
 inventory_allocation_app/uploads/
 .aider*
+

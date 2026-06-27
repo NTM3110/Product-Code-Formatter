@@ -43,9 +43,9 @@ SECTIONS = [
         [
             "If using license-server.local, add this line to C:\\Windows\\System32\\drivers\\etc\\hosts on each client PC: SERVER_IP license-server.local",
             "Open ProductCodeFormatter.exe on the client PC.",
-            "License server: http://license-server.local:3000",
-            "Account: 6f1f56e8-3b6f-4a86-9a31-9e0e7f62c001",
-            "License key: paste the generated key.",
+            "License server: enter the license server IP/URL, for example http://SERVER_IP:3000. The app sends the Keygen host header automatically for LAN IPs.",
+            "Account: not required in the client app. APP_ACCOUNT_ID is shown only for admin/debug use; do not use LICENSE_ID.",
+            "License key: paste APP_LICENSE_KEY / LICENSE_KEY from the license admin output.",
             "Click Kich hoat.",
         ],
     ),

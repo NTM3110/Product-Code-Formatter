@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { InventoryAllocationConfig, InventoryAllocationMappingSection, InventoryAllocationReportView, InventoryAllocationResult, InventoryLedgerDetailRow, InventorySalesDetailRow, InventorySalesSummaryRow, InventorySummaryRow, ProcessedFileStats, UploadSummary } from '../types';
 
 type InventoryAllocationStageProps = {
@@ -22,6 +22,63 @@ const mappingSections: Array<{ key: 'purchase' | 'sales' | 'opening'; label: str
   { key: 'sales', label: 'File bán ra đã xử lý', showInvoice: true },
   { key: 'opening', label: 'Tồn đầu kỳ (tùy chọn)', showInvoice: false },
 ];
+const REPORT_RENDER_BATCH_SIZE = 140;
+const REPORT_LEDGER_SECTION_BATCH_SIZE = 12;
+const REPORT_LEDGER_ROW_BATCH_SIZE = 80;
+const REPORT_RENDER_CACHE_LIMIT = 80;
+
+function rememberRenderedCount(cacheRef: { current: Map<string, number> } | undefined, cacheKey: string, count: number) {
+  if (!cacheRef || !cacheKey) return;
+  cacheRef.current.delete(cacheKey);
+  cacheRef.current.set(cacheKey, count);
+  while (cacheRef.current.size > REPORT_RENDER_CACHE_LIMIT) {
+    const oldestKey = cacheRef.current.keys().next().value;
+    if (!oldestKey) break;
+    cacheRef.current.delete(oldestKey);
+  }
+}
+
+function useProgressiveRows<T>(rows: T[], active = true, batchSize = REPORT_RENDER_BATCH_SIZE, cacheKey = '', cacheRef?: { current: Map<string, number> }) {
+  const cachedCount = cacheKey && cacheRef ? cacheRef.current.get(cacheKey) : undefined;
+  const initialCount = active ? Math.min(rows.length, Math.max(batchSize, cachedCount ?? 0)) : 0;
+  const [visibleCount, setVisibleCount] = useState(initialCount);
+
+  useEffect(() => {
+    if (!active) {
+      setVisibleCount(0);
+      return;
+    }
+    const savedCount = cacheKey && cacheRef ? cacheRef.current.get(cacheKey) : undefined;
+    const firstBatch = Math.min(rows.length, Math.max(batchSize, savedCount ?? 0));
+    setVisibleCount(firstBatch);
+    rememberRenderedCount(cacheRef, cacheKey, firstBatch);
+    if (rows.length <= firstBatch) return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+    const showNextBatch = () => {
+      if (cancelled) return;
+      setVisibleCount((current) => {
+        const next = Math.min(rows.length, current + batchSize);
+        rememberRenderedCount(cacheRef, cacheKey, next);
+        if (next < rows.length) timer = window.setTimeout(showNextBatch, 16);
+        return next;
+      });
+    };
+    timer = window.setTimeout(showNextBatch, 16);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [active, batchSize, rows, cacheKey, cacheRef]);
+
+  const count = active ? Math.min(visibleCount, rows.length) : 0;
+  return {
+    visibleRows: active && count < rows.length ? rows.slice(0, count) : rows,
+    visibleCount: count,
+    isRendering: active && count < rows.length,
+  };
+}
 
 export function InventoryAllocationStage({ purchaseFile, salesFile, processedPurchaseSavedName, processedSalesSavedName, processedPurchaseStats, processedSalesStats, openingStockFile, config, busy, onProcessedPurchaseFileChange, onProcessedSalesFileChange, onOpeningStockFileChange, onConfigChange }: InventoryAllocationStageProps) {
   const ready = Boolean(processedPurchaseSavedName && processedSalesSavedName);
@@ -41,7 +98,7 @@ export function InventoryAllocationStage({ purchaseFile, salesFile, processedPur
           <ProcessedFileInput label="Mua vào đã xử lý" originalName={purchaseFile?.original_name} ready={Boolean(processedPurchaseSavedName)} stats={processedPurchaseStats} busy={busy} onFileChange={onProcessedPurchaseFileChange} />
           <ProcessedFileInput label="Bán ra đã xử lý" originalName={salesFile?.original_name} ready={Boolean(processedSalesSavedName)} stats={processedSalesStats} busy={busy} onFileChange={onProcessedSalesFileChange} />
           <label className={`inventory-opening-upload ${openingStockFile ? 'has-file' : ''}`}>
-            <input type="file" accept=".xlsx,.xlsm" disabled={busy} onChange={(event) => onOpeningStockFileChange(event.currentTarget.files?.[0] ?? null)} />
+            <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy} onChange={(event) => onOpeningStockFileChange(event.currentTarget.files?.[0] ?? null)} />
             <span>Tồn đầu kỳ</span>
             <strong>{openingStockFile?.name || 'Bỏ qua nếu không có'}</strong>
             <small>Chỉ upload khi cần cộng tồn đầu kỳ vào phân bổ.</small>
@@ -72,7 +129,7 @@ export function InventoryAllocationStage({ purchaseFile, salesFile, processedPur
 function ProcessedFileInput({ label, originalName, ready, stats, busy, onFileChange }: { label: string; originalName?: string; ready: boolean; stats: ProcessedFileStats | null; busy: boolean; onFileChange: (file: File | undefined) => void }) {
   return (
     <label className={`inventory-file-status ${ready ? 'ready' : ''}`}>
-      <input type="file" accept=".xlsx,.xlsm" disabled={busy} onChange={(event) => onFileChange(event.currentTarget.files?.[0])} />
+      <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy} onChange={(event) => onFileChange(event.currentTarget.files?.[0])} />
       <span>{label}</span>
       <strong>{ready ? (originalName || 'Đã có cache') : 'Chưa có file đã xử lý'}</strong>
       <small>{ready ? 'Đã sẵn sàng để phân bổ.' : 'Upload file đã xử lý nếu bỏ qua stage trước.'}</small>
@@ -178,7 +235,6 @@ export function InventoryAllocationExportStage({ result, busy, onDownload }: { r
 
 function AllocationReportViewer({ reportView }: { reportView: InventoryAllocationReportView }) {
   const [tab, setTab] = useState<'sales' | 'ledger' | 'inventory'>('sales');
-  const [viewMode, setViewMode] = useState<'combined' | 'byWarehouse'>('combined');
   const [warehouseFilter, setWarehouseFilter] = useState('');
   const [selectedSalesKey, setSelectedSalesKey] = useState('');
   const [selectedInventoryKey, setSelectedInventoryKey] = useState('');
@@ -196,15 +252,30 @@ function AllocationReportViewer({ reportView }: { reportView: InventoryAllocatio
     setSelectedSalesKey('');
     setSelectedInventoryKey('');
   }, [initialFromDate, initialToDate]);
+  const [isReportSwitching, setIsReportSwitching] = useState(false);
+  const reportSwitchTimer = useRef<number | null>(null);
+  const reportSettleTimer = useRef<number | null>(null);
+  const reportRenderCache = useRef(new Map<string, number>());
+  useEffect(() => {
+    reportRenderCache.current.clear();
+  }, [reportView]);
+  useEffect(() => () => {
+    if (reportSwitchTimer.current !== null) window.clearTimeout(reportSwitchTimer.current);
+    if (reportSettleTimer.current !== null) window.clearTimeout(reportSettleTimer.current);
+  }, []);
+
   const warehouses = reportView.warehouses ?? [];
   const salesDetailSource = reportView.sales_detail_rows ?? [];
   const ledgerDetailSource = reportView.ledger_detail_rows ?? [];
-  const filteredSalesDetails = useMemo(() => filterSalesDetailsByDate(salesDetailSource, fromDate, toDate), [salesDetailSource, fromDate, toDate]);
-  const filteredLedgerDetails = useMemo(() => filterLedgerDetailsByDate(ledgerDetailSource, fromDate, toDate), [ledgerDetailSource, fromDate, toDate]);
-  const salesSummaryRows = useMemo(() => filterByWarehouse(buildSalesSummaryRows(filteredSalesDetails, salesDetailSource.length ? [] : (reportView.sales_summary_rows ?? [])), warehouseFilter), [filteredSalesDetails, salesDetailSource.length, reportView.sales_summary_rows, warehouseFilter]);
-  const inventorySummaryRows = useMemo(() => filterByWarehouse(buildInventorySummaryRows(filteredLedgerDetails, ledgerDetailSource.length ? [] : (reportView.inventory_summary_rows ?? [])), warehouseFilter), [filteredLedgerDetails, ledgerDetailSource.length, reportView.inventory_summary_rows, warehouseFilter]);
-  const ledgerSections = useMemo(() => buildLedgerSections(filterByWarehouse(filteredLedgerDetails, warehouseFilter), warehouses), [filteredLedgerDetails, warehouseFilter, warehouses]);
-  const inventoryDetailRows = useMemo(() => filterByWarehouse(filteredLedgerDetails, warehouseFilter).filter((row) => row.summary_key === selectedInventoryKey), [filteredLedgerDetails, warehouseFilter, selectedInventoryKey]);
+  const needsLedgerRows = tab === 'ledger' || tab === 'inventory' || Boolean(selectedSalesKey) || Boolean(selectedInventoryKey);
+  const warehouseSalesDetails = useMemo(() => filterByWarehouse(salesDetailSource, warehouseFilter), [salesDetailSource, warehouseFilter]);
+  const warehouseLedgerDetails = useMemo(() => needsLedgerRows ? filterByWarehouse(ledgerDetailSource, warehouseFilter) : [], [needsLedgerRows, ledgerDetailSource, warehouseFilter]);
+  const filteredSalesDetails = useMemo(() => filterSalesDetailsByDate(warehouseSalesDetails, fromDate, toDate), [warehouseSalesDetails, fromDate, toDate]);
+  const filteredLedgerDetails = useMemo(() => filterLedgerDetailsByDate(warehouseLedgerDetails, fromDate, toDate), [warehouseLedgerDetails, fromDate, toDate]);
+  const salesSummaryRows = useMemo(() => buildSalesSummaryRows(filteredSalesDetails, salesDetailSource.length ? [] : filterByWarehouse(reportView.sales_summary_rows ?? [], warehouseFilter)), [filteredSalesDetails, salesDetailSource.length, reportView.sales_summary_rows, warehouseFilter]);
+  const inventorySummaryRows = useMemo(() => tab === 'inventory' ? buildInventorySummaryRows(warehouseLedgerDetails, ledgerDetailSource.length ? [] : filterByWarehouse(reportView.inventory_summary_rows ?? [], warehouseFilter), fromDate, toDate) : [], [tab, warehouseLedgerDetails, ledgerDetailSource.length, reportView.inventory_summary_rows, warehouseFilter, fromDate, toDate]);
+  const ledgerSections = useMemo(() => tab === 'ledger' ? buildLedgerSections(warehouseLedgerDetails, warehouses, fromDate, toDate) : [], [tab, warehouseLedgerDetails, warehouses, fromDate, toDate]);
+  const inventoryDetailRows = useMemo(() => tab === 'inventory' && selectedInventoryKey ? filteredLedgerDetails.filter((row) => row.summary_key === selectedInventoryKey) : [], [tab, filteredLedgerDetails, selectedInventoryKey]);
   const reportTotals = useMemo(() => reportKpis(salesSummaryRows, inventorySummaryRows), [salesSummaryRows, inventorySummaryRows]);
   const selectedWarehouse = warehouses.find((warehouse) => warehouse.warehouse_code === warehouseFilter);
   const selectedSalesRow = useMemo(() => salesSummaryRows.find((row) => row.key === selectedSalesKey) ?? null, [salesSummaryRows, selectedSalesKey]);
@@ -214,30 +285,59 @@ function AllocationReportViewer({ reportView }: { reportView: InventoryAllocatio
     const ledgerKey = inventoryReportSummaryKey(selectedSalesRow.warehouse_code, selectedSalesRow.variant_code);
     return filteredLedgerDetails.filter((row) => row.summary_key === ledgerKey);
   }, [filteredLedgerDetails, selectedSalesRow]);
+  const ledgerRenderKey = ['ledger', fromDate || 'all-from', toDate || 'all-to', warehouseFilter || 'all-warehouses'].join('|');
+
+  function runReportSwitch(action: () => void) {
+    if (isReportSwitching) return;
+    if (reportSwitchTimer.current !== null) window.clearTimeout(reportSwitchTimer.current);
+    if (reportSettleTimer.current !== null) window.clearTimeout(reportSettleTimer.current);
+    setIsReportSwitching(true);
+    reportSwitchTimer.current = window.setTimeout(() => {
+      action();
+      reportSwitchTimer.current = null;
+      reportSettleTimer.current = window.setTimeout(() => {
+        setIsReportSwitching(false);
+        reportSettleTimer.current = null;
+      }, 140);
+    }, 90);
+  }
+
+  function changeTab(nextTab: 'sales' | 'ledger' | 'inventory') {
+    if (nextTab === tab) return;
+    runReportSwitch(() => {
+      setTab(nextTab);
+      setSelectedSalesKey('');
+      setSelectedInventoryKey('');
+    });
+  }
+
 
   function applyDateFilter() {
     const nextFrom = draftFromDate;
     const nextTo = draftToDate;
-    if (nextFrom && nextTo && nextFrom > nextTo) {
-      setFromDate(nextTo);
-      setToDate(nextFrom);
-      setDraftFromDate(nextTo);
-      setDraftToDate(nextFrom);
-    } else {
-      setFromDate(nextFrom);
-      setToDate(nextTo);
-    }
-    setSelectedSalesKey('');
-    setSelectedInventoryKey('');
+    runReportSwitch(() => {
+      if (nextFrom && nextTo && nextFrom > nextTo) {
+        setFromDate(nextTo);
+        setToDate(nextFrom);
+        setDraftFromDate(nextTo);
+        setDraftToDate(nextFrom);
+      } else {
+        setFromDate(nextFrom);
+        setToDate(nextTo);
+      }
+      setSelectedSalesKey('');
+      setSelectedInventoryKey('');
+    });
   }
 
   function changeWarehouse(value: string) {
-    setWarehouseFilter(value);
-    setSelectedSalesKey('');
-    setSelectedInventoryKey('');
+    if (value === warehouseFilter) return;
+    runReportSwitch(() => {
+      setWarehouseFilter(value);
+      setSelectedSalesKey('');
+      setSelectedInventoryKey('');
+    });
   }
-
-  const warehouseGroups = warehouses.filter((warehouse) => !warehouseFilter || warehouse.warehouse_code === warehouseFilter);
 
   return (
     <div className="allocation-report-viewer">
@@ -246,9 +346,9 @@ function AllocationReportViewer({ reportView }: { reportView: InventoryAllocatio
           <strong>{selectedWarehouse ? `KHO: ${selectedWarehouse.warehouse_code} - ${selectedWarehouse.warehouse_name || ''}` : 'TẤT CẢ KHO'}</strong>
           <span>TỪ NGÀY: {dateDisplay(fromDate)} ĐẾN NGÀY: {dateDisplay(toDate)}</span>
         </div>
-        <label><span>Từ ngày</span><input type="date" value={draftFromDate} onChange={(event) => setDraftFromDate(event.currentTarget.value)} /></label>
-        <label><span>Đến ngày</span><input type="date" value={draftToDate} onChange={(event) => setDraftToDate(event.currentTarget.value)} /></label>
-        <button type="button" className="btn-secondary" onClick={applyDateFilter}>Áp dụng</button>
+        <label><span>Từ ngày</span><input type="date" value={draftFromDate} disabled={isReportSwitching} onChange={(event) => setDraftFromDate(event.currentTarget.value)} /></label>
+        <label><span>Đến ngày</span><input type="date" value={draftToDate} disabled={isReportSwitching} onChange={(event) => setDraftToDate(event.currentTarget.value)} /></label>
+        <button type="button" className="btn-secondary" disabled={isReportSwitching} onClick={applyDateFilter}>{isReportSwitching ? 'Đang áp dụng...' : 'Áp dụng'}</button>
       </div>
       <div className="report-kpi-grid">
         <div><strong>{formatNumber(reportTotals.salesQuantity)}</strong><span>Số lượng bán ra</span></div>
@@ -258,58 +358,42 @@ function AllocationReportViewer({ reportView }: { reportView: InventoryAllocatio
       </div>
       <div className="allocation-report-toolbar">
         <div className="segmented-control">
-          <button type="button" className={tab === 'sales' ? 'active' : ''} onClick={() => setTab('sales')}>Báo cáo bán hàng</button>
-          <button type="button" className={tab === 'ledger' ? 'active' : ''} onClick={() => setTab('ledger')}>Sổ chi tiết</button>
-          <button type="button" className={tab === 'inventory' ? 'active' : ''} onClick={() => setTab('inventory')}>Tổng hợp NXT</button>
+          <button type="button" className={tab === 'sales' ? 'active' : ''} disabled={isReportSwitching} onClick={() => changeTab('sales')}>Báo cáo bán hàng</button>
+          <button type="button" className={tab === 'ledger' ? 'active' : ''} disabled={isReportSwitching} onClick={() => changeTab('ledger')}>Sổ chi tiết</button>
+          <button type="button" className={tab === 'inventory' ? 'active' : ''} disabled={isReportSwitching} onClick={() => changeTab('inventory')}>Tổng hợp NXT</button>
         </div>
         <div className="report-toolbar-right">
-          <div className="segmented-control compact">
-            <button type="button" className={viewMode === 'combined' ? 'active' : ''} onClick={() => setViewMode('combined')}>Bản gộp</button>
-            <button type="button" className={viewMode === 'byWarehouse' ? 'active' : ''} onClick={() => setViewMode('byWarehouse')}>Chia theo kho</button>
-          </div>
           <label className="report-warehouse-filter">
             <span>Kho</span>
-            <select value={warehouseFilter} onChange={(event) => changeWarehouse(event.currentTarget.value)}>
+            <select value={warehouseFilter} disabled={isReportSwitching} onChange={(event) => changeWarehouse(event.currentTarget.value)}>
               <option value="">Tất cả kho</option>
               {warehouses.map((warehouse) => <option key={warehouse.warehouse_code} value={warehouse.warehouse_code}>{warehouse.warehouse_code}{warehouse.warehouse_name ? ` - ${warehouse.warehouse_name}` : ''}</option>)}
             </select>
           </label>
         </div>
       </div>
-
       {tab === 'sales' && (
         <div className="allocation-report-layout single">
-          {viewMode === 'combined' ? (
-            <SalesSummaryPanel title="Báo cáo bán hàng - tất cả kho" rows={salesSummaryRows} onOpen={(row) => setSelectedSalesKey(row.key)} />
-          ) : (
-            <div className="warehouse-report-stack">
-              {warehouseGroups.map((warehouse) => {
-                const rows = salesSummaryRows.filter((row) => row.warehouse_code === warehouse.warehouse_code);
-                return <SalesSummaryPanel key={warehouse.warehouse_code} title={`Báo cáo bán hàng - ${warehouse.warehouse_code}${warehouse.warehouse_name ? ` - ${warehouse.warehouse_name}` : ''}`} rows={rows} onOpen={(row) => setSelectedSalesKey(row.key)} />;
-              })}
-              {!warehouseGroups.length && <div className="report-table-panel"><h4>Không có kho</h4><p className="muted">Chưa có dữ liệu kho trong báo cáo.</p></div>}
-            </div>
-          )}
+          <SalesSummaryPanel title={selectedWarehouse ? `Báo cáo bán hàng - ${selectedWarehouse.warehouse_code}${selectedWarehouse.warehouse_name ? ` - ${selectedWarehouse.warehouse_name}` : ''}` : 'Báo cáo bán hàng - tất cả kho'} rows={salesSummaryRows} onOpen={(row) => setSelectedSalesKey(row.key)} />
         </div>
       )}
-
       {tab === 'ledger' && (
         <div className="allocation-report-layout single">
-          {viewMode === 'combined' ? (
-            <LedgerSectionsView title="Sổ chi tiết hàng hóa - tất cả kho" sections={ledgerSections} />
-          ) : (
-            <div className="warehouse-report-stack">
-              {warehouseGroups.map((warehouse) => <LedgerSectionsView key={warehouse.warehouse_code} title={`Sổ chi tiết - ${warehouse.warehouse_code}${warehouse.warehouse_name ? ` - ${warehouse.warehouse_name}` : ''}`} sections={ledgerSections.filter((section) => section.warehouse_code === warehouse.warehouse_code)} />)}
-              {!warehouseGroups.length && <div className="report-table-panel"><h4>Không có kho</h4><p className="muted">Chưa có dữ liệu kho trong sổ chi tiết.</p></div>}
-            </div>
-          )}
+          <LedgerSectionsView title={selectedWarehouse ? `Sổ chi tiết - ${selectedWarehouse.warehouse_code}${selectedWarehouse.warehouse_name ? ` - ${selectedWarehouse.warehouse_name}` : ''}` : 'Sổ chi tiết hàng hóa - tất cả kho'} sections={ledgerSections} cacheKey={ledgerRenderKey} cacheRef={reportRenderCache} />
         </div>
       )}
-
       {tab === 'inventory' && (
         <div className="allocation-report-layout single">
           <InventorySummaryPanel rows={inventorySummaryRows} selectedKey={selectedInventoryKey} onSelect={setSelectedInventoryKey} />
           {selectedInventoryKey && <InventoryDetailTable rows={inventoryDetailRows} />}
+        </div>
+      )}
+
+      {isReportSwitching && (
+        <div className="report-switch-overlay" aria-live="polite" aria-busy="true">
+          <div className="loading-spinner" />
+          <h3>Đang đổi báo cáo</h3>
+          <p>Đang chuẩn bị dữ liệu và dựng lại bảng...</p>
         </div>
       )}
 
@@ -325,8 +409,16 @@ function AllocationReportViewer({ reportView }: { reportView: InventoryAllocatio
   );
 }
 
+function ProgressiveRowsNotice({ colSpan, visibleCount, total }: { colSpan: number; visibleCount: number; total: number }) {
+  return <tr className="report-progressive-row"><td colSpan={colSpan}>Đang hiển thị {formatNumber(visibleCount)} / {formatNumber(total)} dòng...</td></tr>;
+}
+
+function ProgressiveSectionsNotice({ visibleCount, total }: { visibleCount: number; total: number }) {
+  return <div className="report-progressive-note">Đang hiển thị {formatNumber(visibleCount)} / {formatNumber(total)} nhóm sổ chi tiết...</div>;
+}
 function SalesSummaryPanel({ title, rows, onOpen }: { title: string; rows: InventorySalesSummaryRow[]; onOpen: (row: InventorySalesSummaryRow) => void }) {
   const totals = salesTotals(rows);
+  const { visibleRows, visibleCount, isRendering } = useProgressiveRows(rows);
   return (
     <div className="report-table-panel">
       <h4>{title}</h4>
@@ -334,12 +426,13 @@ function SalesSummaryPanel({ title, rows, onOpen }: { title: string; rows: Inven
         <table className="data-table report-table sales-report-table">
           <thead><tr><th>Kho</th><th>Mã VT</th><th>Tên hàng</th><th>ĐVT</th><th>SL</th><th>Tiền vốn</th><th>Tiền hàng</th><th>Lãi/lỗ</th><th>%</th><th>Thuế</th><th>Tổng TT</th></tr></thead>
           <tbody>
-            {rows.map((row) => (
+            {visibleRows.map((row) => (
               <tr key={row.key} onDoubleClick={() => onOpen(row)} title="Double-click để xem giải thích giá vốn">
                 <td>{row.warehouse_code}</td><td>{row.variant_code}</td><td>{row.product_name}</td><td>{row.unit_name}</td>
                 <td className="number-cell">{formatNumber(row.quantity)}</td><td className="number-cell">{formatNumber(row.cost_amount)}</td><td className="number-cell">{formatNumber(row.sale_amount)}</td><td className="number-cell">{formatNumber(row.profit_amount)}</td><td className="number-cell">{formatPercent(row.margin_percent)}</td><td className="number-cell">{formatNumber(row.tax_amount)}</td><td className="number-cell">{formatNumber(row.total_amount)}</td>
               </tr>
             ))}
+            {isRendering && <ProgressiveRowsNotice colSpan={11} visibleCount={visibleCount} total={rows.length} />}
             {!rows.length && <tr><td colSpan={11}>Chưa có dữ liệu báo cáo bán hàng.</td></tr>}
           </tbody>
           {!!rows.length && <tfoot><tr><td></td><td>Tổng cộng:</td><td></td><td></td><td className="number-cell">{formatNumber(totals.quantity)}</td><td className="number-cell">{formatNumber(totals.cost_amount)}</td><td className="number-cell">{formatNumber(totals.sale_amount)}</td><td className="number-cell">{formatNumber(totals.profit_amount)}</td><td className="number-cell">{formatPercent(totals.margin_percent)}</td><td className="number-cell">{formatNumber(totals.tax_amount)}</td><td className="number-cell">{formatNumber(totals.total_amount)}</td></tr></tfoot>}
@@ -351,6 +444,7 @@ function SalesSummaryPanel({ title, rows, onOpen }: { title: string; rows: Inven
 
 function InventorySummaryPanel({ rows, selectedKey, onSelect }: { rows: InventorySummaryRow[]; selectedKey: string; onSelect: (key: string) => void }) {
   const totals = inventoryTotals(rows);
+  const { visibleRows, visibleCount, isRendering } = useProgressiveRows(rows);
   return (
     <div className="report-table-panel">
       <h4>Tổng hợp nhập xuất tồn</h4>
@@ -358,12 +452,13 @@ function InventorySummaryPanel({ rows, selectedKey, onSelect }: { rows: Inventor
         <table className="data-table report-table inventory-report-table">
           <thead><tr><th>Kho</th><th>Mã VT</th><th>Tên hàng</th><th>ĐVT</th><th>Tồn đầu SL</th><th>Tồn đầu tiền</th><th>Nhập SL</th><th>Nhập tiền</th><th>Xuất SL</th><th>Xuất tiền</th><th>Tồn cuối SL</th><th>Tồn cuối tiền</th></tr></thead>
           <tbody>
-            {rows.map((row) => (
+            {visibleRows.map((row) => (
               <tr key={row.key} className={selectedKey === row.key ? 'selected-row' : ''} onDoubleClick={() => onSelect(row.key)}>
                 <td>{row.warehouse_code}</td><td>{row.variant_code}</td><td>{row.product_name}</td><td>{row.unit_name}</td>
                 <td className="number-cell">{formatNumber(row.opening_qty)}</td><td className="number-cell">{formatNumber(row.opening_amount)}</td><td className="number-cell">{formatNumber(row.in_qty)}</td><td className="number-cell">{formatNumber(row.in_amount)}</td><td className="number-cell">{formatNumber(row.out_qty)}</td><td className="number-cell">{formatNumber(row.out_amount)}</td><td className="number-cell">{formatNumber(row.ending_qty)}</td><td className="number-cell">{formatNumber(row.ending_amount)}</td>
               </tr>
             ))}
+            {isRendering && <ProgressiveRowsNotice colSpan={12} visibleCount={visibleCount} total={rows.length} />}
             {!rows.length && <tr><td colSpan={12}>Chưa có dữ liệu tổng hợp nhập xuất tồn.</td></tr>}
           </tbody>
           {!!rows.length && <tfoot><tr><td></td><td>Tổng cộng:</td><td></td><td></td><td className="number-cell">{formatNumber(totals.opening_qty)}</td><td className="number-cell">{formatNumber(totals.opening_amount)}</td><td className="number-cell">{formatNumber(totals.in_qty)}</td><td className="number-cell">{formatNumber(totals.in_amount)}</td><td className="number-cell">{formatNumber(totals.out_qty)}</td><td className="number-cell">{formatNumber(totals.out_amount)}</td><td className="number-cell">{formatNumber(totals.ending_qty)}</td><td className="number-cell">{formatNumber(totals.ending_amount)}</td></tr></tfoot>}
@@ -460,19 +555,25 @@ function InventoryDetailTable({ rows }: { rows: InventoryLedgerDetailRow[] }) {
   );
 }
 
-function LedgerSectionsView({ title, sections }: { title: string; sections: LedgerSection[] }) {
+function LedgerSectionsView({ title, sections, cacheKey, cacheRef }: { title: string; sections: LedgerSection[]; cacheKey: string; cacheRef: { current: Map<string, number> } }) {
+  const { visibleRows: visibleSections, visibleCount, isRendering } = useProgressiveRows(sections, true, REPORT_LEDGER_SECTION_BATCH_SIZE, `${cacheKey}|sections`, cacheRef);
+  const visibleTotals = useMemo(() => ledgerSectionTotals(visibleSections), [visibleSections]);
   return (
     <div className="report-table-panel ledger-panel">
       <h4>{title}</h4>
-      <div className="report-table-scroll ledger-sections">
-        {sections.map((section) => <LedgerSectionTable key={section.key} section={section} />)}
-        {!sections.length && <p className="muted">Chưa có dữ liệu sổ chi tiết.</p>}
+      <div className="ledger-scroll-shell">
+        <div className="report-table-scroll ledger-sections">
+          {visibleSections.map((section) => <LedgerSectionTable key={section.key} section={section} cacheKey={cacheKey} cacheRef={cacheRef} />)}
+          {!sections.length && <p className="muted">Chưa có dữ liệu sổ chi tiết.</p>}
+        </div>
+        {!!sections.length && <LedgerGrandTotal totals={visibleTotals} visibleCount={visibleCount} totalCount={sections.length} isRendering={isRendering} />}
       </div>
     </div>
   );
 }
 
-function LedgerSectionTable({ section }: { section: LedgerSection }) {
+function LedgerSectionTable({ section, cacheKey, cacheRef }: { section: LedgerSection; cacheKey: string; cacheRef: { current: Map<string, number> } }) {
+  const { visibleRows, visibleCount, isRendering } = useProgressiveRows(section.rows, true, REPORT_LEDGER_ROW_BATCH_SIZE, `${cacheKey}|row|${section.key}`, cacheRef);
   return (
     <section className="ledger-section">
       <div className="ledger-section-heading">
@@ -486,7 +587,8 @@ function LedgerSectionTable({ section }: { section: LedgerSection }) {
           <LedgerSummaryRow label="Nhập trong kỳ" qtyIn={section.in_qty} amountIn={section.in_amount} />
           <LedgerSummaryRow label="Xuất trong kỳ" qtyOut={section.out_qty} amountOut={section.out_amount} />
           <LedgerSummaryRow label="Tồn cuối kỳ" qtyIn={section.ending_qty} amountIn={section.ending_amount} runningQty={section.ending_qty} runningAmount={section.ending_amount} />
-          {section.rows.map((row) => <tr key={row.key} className={row.row_type === 'sale' ? 'ledger-sale-row' : row.row_type === 'purchase' || row.row_type === 'purchase_future_reorder' ? 'ledger-purchase-row' : ''}><td>{row.date}</td><td>{row.doc_no}</td><td>{row.customer}</td><td>{row.description}</td><td>{row.account}</td><td className="number-cell">{formatNumber(row.unit_price)}</td><td className="number-cell">{formatNumber(row.qty_in)}</td><td className="number-cell">{formatNumber(row.amount_in)}</td><td className="number-cell">{formatNumber(row.qty_out)}</td><td className="number-cell">{formatNumber(row.amount_out)}</td><td className="number-cell">{formatNumber(row.running_qty)}</td><td className="number-cell">{formatNumber(row.running_amount)}</td></tr>)}
+          {visibleRows.map((row) => <tr key={row.key} className={row.row_type === 'sale' ? 'ledger-sale-row' : row.row_type === 'purchase' || row.row_type === 'purchase_future_reorder' ? 'ledger-purchase-row' : ''}><td>{row.date}</td><td>{row.doc_no}</td><td>{row.customer}</td><td>{row.description}</td><td>{row.account}</td><td className="number-cell">{formatNumber(row.unit_price)}</td><td className="number-cell">{formatNumber(row.qty_in)}</td><td className="number-cell">{formatNumber(row.amount_in)}</td><td className="number-cell">{formatNumber(row.qty_out)}</td><td className="number-cell">{formatNumber(row.amount_out)}</td><td className="number-cell">{formatNumber(row.running_qty)}</td><td className="number-cell">{formatNumber(row.running_amount)}</td></tr>)}
+          {isRendering && <ProgressiveRowsNotice colSpan={12} visibleCount={visibleCount} total={section.rows.length} />}
         </tbody>
       </table>
     </section>
@@ -497,23 +599,90 @@ function LedgerSummaryRow({ label, qtyIn = '', amountIn = '', qtyOut = '', amoun
   return <tr className="ledger-summary-row"><td></td><td></td><td></td><td>{label}</td><td></td><td></td><td className="number-cell">{formatNumber(qtyIn)}</td><td className="number-cell">{formatNumber(amountIn)}</td><td className="number-cell">{formatNumber(qtyOut)}</td><td className="number-cell">{formatNumber(amountOut)}</td><td className="number-cell">{formatNumber(runningQty)}</td><td className="number-cell">{formatNumber(runningAmount)}</td></tr>;
 }
 
+function LedgerGrandTotal({ totals, visibleCount, totalCount, isRendering }: { totals: ReturnType<typeof ledgerSectionTotals>; visibleCount: number; totalCount: number; isRendering: boolean }) {
+  const progressPercent = totalCount ? Math.min(100, Math.round((visibleCount / totalCount) * 100)) : 0;
+  const inQty = formatNumber(totals.in_qty);
+  const inAmount = formatNumber(totals.in_amount);
+  const outQty = formatNumber(totals.out_qty);
+  const outAmount = formatNumber(totals.out_amount);
+  const endingQty = formatNumber(totals.ending_qty);
+  const endingAmount = formatNumber(totals.ending_amount);
+  return (
+    <div className="ledger-grand-total" aria-live="polite">
+      <div className="ledger-total-caption">
+        <strong>{isRendering ? `Đang hiển thị ${formatNumber(visibleCount)} / ${formatNumber(totalCount)} nhóm sổ chi tiết` : `Đã hiển thị đủ ${formatNumber(totalCount)} nhóm sổ chi tiết`}</strong>
+        <span>{isRendering ? `${progressPercent}%` : '100%'}</span>
+      </div>
+      <div className="ledger-render-progress" aria-hidden="true"><span style={{ width: `${progressPercent}%` }} /></div>
+      <table className="data-table report-table detail-table ledger-section-table">
+        <tbody>
+          <tr>
+            <td></td>
+            <td></td>
+            <td></td>
+            <td>Tổng cộng đang hiển thị:</td>
+            <td></td>
+            <td></td>
+            <td className="number-cell ledger-total-number" title={inQty}>{inQty}</td>
+            <td className="number-cell ledger-total-number" title={inAmount}>{inAmount}</td>
+            <td className="number-cell ledger-total-number" title={outQty}>{outQty}</td>
+            <td className="number-cell ledger-total-number" title={outAmount}>{outAmount}</td>
+            <td className="number-cell ledger-total-number" title={endingQty}>{endingQty}</td>
+            <td className="number-cell ledger-total-number" title={endingAmount}>{endingAmount}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function filterByWarehouse<T extends { warehouse_code?: string }>(rows: T[], warehouseCode: string) {
   return warehouseCode ? rows.filter((row) => row.warehouse_code === warehouseCode) : rows;
 }
 
 function filterSalesDetailsByDate(rows: InventorySalesDetailRow[], fromDate: string, toDate: string) {
-  return rows.filter((row) => dateInRange(row.invoice_date_iso, fromDate, toDate));
+  return rows.filter((row) => dateInRange(reportDateValue(row.invoice_date_iso, row.invoice_date), fromDate, toDate));
 }
 
 function filterLedgerDetailsByDate(rows: InventoryLedgerDetailRow[], fromDate: string, toDate: string) {
-  return rows.filter((row) => !row.date_iso || dateInRange(row.date_iso, fromDate, toDate));
+  return rows.filter((row) => isOpeningLedgerRow(row) || dateInRange(ledgerRowDate(row), fromDate, toDate));
+}
+
+function isOpeningLedgerRow(row: InventoryLedgerDetailRow) {
+  return row.row_type === 'opening' || row.description === 'Tồn đầu kỳ';
+}
+
+function ledgerRowDate(row: InventoryLedgerDetailRow) {
+  return reportDateValue(row.date_iso, row.date);
+}
+
+function reportDateValue(primary?: string, fallback?: string) {
+  return normalizeReportDate(primary) || normalizeReportDate(fallback);
+}
+
+function normalizeReportDate(value?: string) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const isoMatch = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+  const localMatch = raw.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (localMatch) return `${localMatch[3]}-${localMatch[2].padStart(2, '0')}-${localMatch[1].padStart(2, '0')}`;
+  return raw;
 }
 
 function dateInRange(value: string | undefined, fromDate: string, toDate: string) {
-  if (!value) return true;
-  return (!fromDate || value >= fromDate) && (!toDate || value <= toDate);
+  const date = normalizeReportDate(value);
+  const from = normalizeReportDate(fromDate);
+  const to = normalizeReportDate(toDate);
+  if (!date) return true;
+  return (!from || date >= from) && (!to || date <= to);
 }
 
+function isBeforeRange(value: string | undefined, fromDate: string) {
+  const date = normalizeReportDate(value);
+  const from = normalizeReportDate(fromDate);
+  return Boolean(date && from && date < from);
+}
 function buildSalesSummaryRows(details: InventorySalesDetailRow[], fallback: InventorySalesSummaryRow[]): InventorySalesSummaryRow[] {
   if (!details.length) return fallback;
   const grouped = new Map<string, InventorySalesSummaryRow>();
@@ -553,7 +722,7 @@ function buildSalesSummaryRows(details: InventorySalesDetailRow[], fallback: Inv
   return Array.from(grouped.values()).map((row, index) => ({ ...row, index: index + 1 }));
 }
 
-function buildInventorySummaryRows(details: InventoryLedgerDetailRow[], fallback: InventorySummaryRow[]): InventorySummaryRow[] {
+function buildInventorySummaryRows(details: InventoryLedgerDetailRow[], fallback: InventorySummaryRow[], fromDate = '', toDate = ''): InventorySummaryRow[] {
   if (!details.length) return fallback;
   const grouped = new Map<string, InventorySummaryRow>();
   details.forEach((row) => {
@@ -575,16 +744,19 @@ function buildInventorySummaryRows(details: InventoryLedgerDetailRow[], fallback
       ending_amount: 0,
       row_count: 0,
     };
-    const isOpening = row.row_type === 'opening' || !row.date_iso || row.description === 'Tồn đầu kỳ';
+    const rowDate = ledgerRowDate(row);
+    const isOpening = isOpeningLedgerRow(row) || isBeforeRange(rowDate, fromDate);
     if (isOpening) {
       item.opening_qty += Number(row.qty_in || 0) - Number(row.qty_out || 0);
       item.opening_amount += Number(row.amount_in || 0) - Number(row.amount_out || 0);
-    } else {
+    } else if (dateInRange(rowDate, fromDate, toDate)) {
       item.in_qty += Number(row.qty_in || 0);
       item.in_amount += Number(row.amount_in || 0);
       item.out_qty += Number(row.qty_out || 0);
       item.out_amount += Number(row.amount_out || 0);
       item.row_count = Number(item.row_count || 0) + 1;
+    } else {
+      return;
     }
     item.ending_qty = item.opening_qty + item.in_qty - item.out_qty;
     item.ending_amount = item.opening_amount + item.in_amount - item.out_amount;
@@ -612,7 +784,7 @@ type LedgerSection = {
   rows: InventoryLedgerDetailRow[];
 };
 
-function buildLedgerSections(rows: InventoryLedgerDetailRow[], warehouses: Array<{ warehouse_code: string; warehouse_name?: string; account?: string }>): LedgerSection[] {
+function buildLedgerSections(rows: InventoryLedgerDetailRow[], warehouses: Array<{ warehouse_code: string; warehouse_name?: string; account?: string }>, fromDate = '', toDate = ''): LedgerSection[] {
   const warehouseMap = new Map(warehouses.map((warehouse) => [warehouse.warehouse_code, warehouse]));
   const grouped = new Map<string, LedgerSection>();
   rows.forEach((row) => {
@@ -639,16 +811,19 @@ function buildLedgerSections(rows: InventoryLedgerDetailRow[], warehouses: Array
     if (!section.product_name && row.product_name) section.product_name = row.product_name;
     if (!section.unit_name && row.unit_name) section.unit_name = row.unit_name;
     if (!section.account && row.account) section.account = row.account;
-    const isOpening = row.row_type === 'opening' || !row.date_iso || row.description === 'Tồn đầu kỳ';
+    const rowDate = ledgerRowDate(row);
+    const isOpening = isOpeningLedgerRow(row) || isBeforeRange(rowDate, fromDate);
     if (isOpening) {
       section.opening_qty += Number(row.qty_in || 0) - Number(row.qty_out || 0);
       section.opening_amount += Number(row.amount_in || 0) - Number(row.amount_out || 0);
-    } else {
+    } else if (dateInRange(rowDate, fromDate, toDate)) {
       section.in_qty += Number(row.qty_in || 0);
       section.in_amount += Number(row.amount_in || 0);
       section.out_qty += Number(row.qty_out || 0);
       section.out_amount += Number(row.amount_out || 0);
       section.rows.push(row);
+    } else {
+      return;
     }
     section.ending_qty = section.opening_qty + section.in_qty - section.out_qty;
     section.ending_amount = section.opening_amount + section.in_amount - section.out_amount;
@@ -705,6 +880,20 @@ function inventoryTotals(rows: InventorySummaryRow[]) {
     acc.out_amount += Number(row.out_amount || 0);
     acc.ending_qty += Number(row.ending_qty || 0);
     acc.ending_amount += Number(row.ending_amount || 0);
+    return acc;
+  }, { opening_qty: 0, opening_amount: 0, in_qty: 0, in_amount: 0, out_qty: 0, out_amount: 0, ending_qty: 0, ending_amount: 0 });
+}
+
+function ledgerSectionTotals(sections: LedgerSection[]) {
+  return sections.reduce((acc, section) => {
+    acc.opening_qty += Number(section.opening_qty || 0);
+    acc.opening_amount += Number(section.opening_amount || 0);
+    acc.in_qty += Number(section.in_qty || 0);
+    acc.in_amount += Number(section.in_amount || 0);
+    acc.out_qty += Number(section.out_qty || 0);
+    acc.out_amount += Number(section.out_amount || 0);
+    acc.ending_qty += Number(section.ending_qty || 0);
+    acc.ending_amount += Number(section.ending_amount || 0);
     return acc;
   }, { opening_qty: 0, opening_amount: 0, in_qty: 0, in_amount: 0, out_qty: 0, out_amount: 0, ending_qty: 0, ending_amount: 0 });
 }

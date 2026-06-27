@@ -27,6 +27,10 @@ from flask.json.provider import DefaultJSONProvider
 
 APP_VERSION = "0.1"
 LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
+XLS_MAX_ROWS = 65536
+XLS_MAX_COLUMNS = 256
+XLS_MEDIA_TYPE = "application/vnd.ms-excel"
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 class CustomJSONProvider(DefaultJSONProvider):
     def default(self, o):
@@ -149,6 +153,9 @@ KEYGEN_ACTIVATION_REQUIRED_CODES = {
     "FINGERPRINT_SCOPE_MISMATCH",
     "MACHINE_SCOPE_MISMATCH",
 }
+DEFAULT_KEYGEN_SERVER_URL = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_SERVER", "http://license-server.local:3000")
+DEFAULT_KEYGEN_ACCOUNT_ID = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_ACCOUNT", "6f1f56e8-3b6f-4a86-9a31-9e0e7f62c001")
+DEFAULT_KEYGEN_PUBLIC_HOST = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_HOST", "license-server.local")
 
 MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
@@ -179,6 +186,7 @@ def empty_profile_config(profile_key_name=None):
         "price_range_rules": {},
         "price_adjust_all_percent": 0,
         "manual_code_overrides": {},
+        "product_review_merges": [],
         "vietmax_mua_vao_internal_merges": [],
         "vietmax_ban_ra_sales_internal_merges": [],
         "vietmax_ban_ra_purchase_match_rules": [],
@@ -190,7 +198,6 @@ def empty_profile_config(profile_key_name=None):
         "prefix_strategy": "last_2_words",
         "prefix_mst_digits": 3,
         "prefix_strategy_values": {},
-        "output_path": "",
         "columns": {},
     }
 
@@ -265,11 +272,12 @@ def normalize_products_map(value):
         return result
     for key, code in value.items():
         key = str(key)
+        clean_code = sanitize_product_code(code)
         if "|||" in key:
-            result[key] = str(code or "")
+            result[key] = clean_code
         elif "|" in key:
             mst, product = key.split("|", 1)
-            result[product_key(mst, product)] = str(code or "")
+            result[product_key(mst, product)] = clean_code
     return result
 
 
@@ -431,15 +439,52 @@ def normalize_license_config(value):
     return result
 
 
+def current_machine_name():
+    name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "windows"
+    return str(name or "windows").strip() or "windows"
+
+
+def legacy_machine_fingerprint():
+    return f"{current_machine_name()}-{uuid.getnode():012x}".upper()
+
+
+def windows_machine_guid():
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+    except Exception:
+        return ""
+    guid = re.sub(r"[^A-Za-z0-9-]+", "", raw_text(value)).strip("-")
+    return guid.upper()
+
+
 def local_machine_fingerprint():
-    return f"{os.environ.get('COMPUTERNAME') or 'windows'}-{uuid.getnode():012x}".upper()
+    machine_guid = windows_machine_guid()
+    if machine_guid:
+        return f"{current_machine_name()}-WIN-{machine_guid}".upper()
+    return legacy_machine_fingerprint()
+
+
+def license_fingerprint_matches(saved_fingerprint):
+    saved = str(saved_fingerprint or "").strip().upper()
+    if not saved:
+        return False
+    if saved == local_machine_fingerprint():
+        return True
+    if saved == legacy_machine_fingerprint():
+        return True
+    machine_name = re.escape(current_machine_name().upper())
+    return bool(re.fullmatch(rf"{machine_name}-[0-9A-F]{{12}}", saved))
 
 
 def license_has_local_activation(value):
     license_cfg = normalize_license_config(value)
     if not license_cfg.get("activated"):
         return False
-    return license_cfg.get("machine_fingerprint") == local_machine_fingerprint()
+    return license_fingerprint_matches(license_cfg.get("machine_fingerprint"))
 
 
 def license_company_match(value, allowed_companies):
@@ -513,9 +558,20 @@ def keygen_license_metadata(response):
     return metadata if isinstance(metadata, dict) else {}
 
 
+def normalize_keygen_server_url(server_url):
+    base = str(server_url or DEFAULT_KEYGEN_SERVER_URL).strip().rstrip("/")
+    if base and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", base):
+        base = f"http://{base}"
+    return base
+
+
+def normalize_keygen_account_id(account_id):
+    return str(account_id or DEFAULT_KEYGEN_ACCOUNT_ID).strip().strip("/")
+
+
 def keygen_url(server_url, account_id, path):
-    base = str(server_url or "").strip().rstrip("/")
-    account = str(account_id or "").strip().strip("/")
+    base = normalize_keygen_server_url(server_url)
+    account = normalize_keygen_account_id(account_id)
     if not base or not account:
         raise ValueError("Cần nhập địa chỉ server và account của Keygen.")
     parsed = urlparse(base)
@@ -542,6 +598,33 @@ def keygen_is_local_http_url(url):
     return parsed.scheme == "http" and keygen_allows_http_host(parsed.hostname)
 
 
+def keygen_host_header(url):
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "http" or not keygen_allows_http_host(parsed.hostname):
+        return ""
+    public_host = str(DEFAULT_KEYGEN_PUBLIC_HOST or "").strip()
+    if not public_host:
+        return ""
+    public_parsed = urlparse(public_host if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", public_host) else f"http://{public_host}")
+    host = public_parsed.hostname or public_host.strip("/")
+    port = public_parsed.port or parsed.port
+    return f"{host}:{port}" if port else host
+
+
+def keygen_forbidden_hint(url):
+    parsed = urlparse(str(url or ""))
+    host = str(parsed.hostname or "").strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return (
+            " Keygen đang chặn host này. Hãy nhập IP thật của máy license server "
+            "hoặc kiểm tra license_server/.env có KEYGEN_HOST=license-server.local."
+        )
+    return (
+        " Kiểm tra License server có đúng KEYGEN_HOST trong license_server/.env "
+        "và Account có đúng KEYGEN_ACCOUNT_ID không."
+    )
+
+
 def keygen_request(method, url, payload=None, license_key=None, timeout=10):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {
@@ -550,6 +633,9 @@ def keygen_request(method, url, payload=None, license_key=None, timeout=10):
     }
     if keygen_is_local_http_url(url):
         headers["X-Forwarded-Proto"] = "https"
+        host_header = keygen_host_header(url)
+        if host_header:
+            headers["Host"] = host_header
     if license_key:
         headers["Authorization"] = f"License {license_key}"
     request_obj = Request(url, data=data, headers=headers, method=method)
@@ -558,7 +644,8 @@ def keygen_request(method, url, payload=None, license_key=None, timeout=10):
             body = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(f"Keygen trả về lỗi {exc.code}: {detail or exc.reason}") from exc
+        hint = keygen_forbidden_hint(url) if exc.code == 403 else ""
+        raise ValueError(f"Keygen trả về lỗi {exc.code}: {detail or exc.reason}.{hint}") from exc
     except URLError as exc:
         raise ValueError(f"Không kết nối được license server: {exc.reason}") from exc
     return json.loads(body) if body else {}
@@ -632,8 +719,8 @@ def activate_keygen_license(server_url, account_id, license_key, timeout=10):
     if not validation["valid"]:
         raise ValueError(validation["detail"] or validation["code"] or "License chưa hợp lệ sau khi kích hoạt máy.")
     return {
-        "server_url": str(server_url or "").strip().rstrip("/"),
-        "account_id": str(account_id or "").strip(),
+        "server_url": normalize_keygen_server_url(server_url),
+        "account_id": normalize_keygen_account_id(account_id),
         "license_key": str(license_key or "").strip(),
         "machine_fingerprint": fingerprint,
         "machine_id": machine_id,
@@ -706,6 +793,99 @@ def normalize_prefix_strategy_values(raw):
     return values
 
 
+REVIEW_MERGE_CONFIG_TEXT_FIELDS = (
+    "product",
+    "similar_product",
+    "unit",
+    "similar_unit",
+    "company",
+    "mst",
+    "company_key",
+    "similar_company",
+    "similar_mst",
+    "similar_company_key",
+    "product_key",
+    "similar_product_key",
+    "review_group",
+    "review_type",
+)
+
+
+def _config_text(value):
+    return str(value or "").strip()
+
+
+def _config_review_scope(value, fallback=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    value = _config_text(value)
+    fallback = fallback if fallback in VIETMAX_COMPARISON_SCOPES else VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES
+    return value if value in VIETMAX_COMPARISON_SCOPES else fallback
+
+
+def _config_review_code_choice(value):
+    value = _config_text(value).lower()
+    return value if value in {"current", "similar", "split"} else "current"
+
+
+def sanitize_review_merge_rule_for_config(item, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    if not isinstance(item, dict):
+        return None
+    product = _config_text(item.get("product"))
+    similar_product = _config_text(item.get("similar_product"))
+    if not product or not similar_product:
+        return None
+    code_choice = _config_review_code_choice(item.get("code_choice"))
+    rule = {
+        "product": product,
+        "similar_product": similar_product,
+        "confirmed": item.get("confirmed") is True,
+        "code_choice": code_choice,
+        "comparison_scope": _config_review_scope(item.get("comparison_scope"), comparison_scope),
+    }
+    for field in REVIEW_MERGE_CONFIG_TEXT_FIELDS:
+        if field in {"product", "similar_product"}:
+            continue
+        text = _config_text(item.get(field))
+        if text:
+            rule[field] = text
+    if item.get("dimension_only"):
+        rule["dimension_only"] = True
+    # Literal manual codes are only valid for the explicit split action.
+    # Normal merge rules persist the selected side via code_choice and
+    # product -> similar_product, then regenerate current codes at runtime.
+    if code_choice == "split":
+        split_code = sanitize_product_code(item.get("split_code"))
+        similar_split_code = sanitize_product_code(item.get("similar_split_code"))
+        if split_code:
+            rule["split_code"] = split_code
+        if similar_split_code:
+            rule["similar_split_code"] = similar_split_code
+    return rule
+
+
+def sanitize_review_merge_rules_for_config(value, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for item in value:
+        rule = sanitize_review_merge_rule_for_config(item, comparison_scope)
+        if not rule:
+            continue
+        key = (
+            rule.get("comparison_scope"),
+            rule.get("review_group", ""),
+            rule.get("product", ""),
+            rule.get("similar_product", ""),
+            rule.get("company_key", ""),
+            rule.get("similar_company_key", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(rule)
+    return result
+
+
 def normalize_profile_config(profile_key_name, profile):
     defaults = empty_profile_config(profile_key_name)
     profile = profile if isinstance(profile, dict) else {}
@@ -732,8 +912,9 @@ def normalize_profile_config(profile_key_name, profile):
         "price_range_rules": price_ranges,
         "price_adjust_all_percent": legacy_price_adjust_all_percent(profile, price_groups, price_ranges),
         "manual_code_overrides": products,
-        "vietmax_mua_vao_internal_merges": list(profile.get("vietmax_mua_vao_internal_merges") or []),
-        "vietmax_ban_ra_sales_internal_merges": list(profile.get("vietmax_ban_ra_sales_internal_merges") or []),
+        "product_review_merges": sanitize_review_merge_rules_for_config(profile.get("product_review_merges") or []),
+        "vietmax_mua_vao_internal_merges": sanitize_review_merge_rules_for_config(profile.get("vietmax_mua_vao_internal_merges") or []),
+        "vietmax_ban_ra_sales_internal_merges": sanitize_review_merge_rules_for_config(profile.get("vietmax_ban_ra_sales_internal_merges") or []),
         "vietmax_ban_ra_purchase_match_rules": list(profile.get("vietmax_ban_ra_purchase_match_rules") or profile.get("sales_match_rules") or []),
         "inventory_pairs": normalize_inventory_pairs(profile.get("inventory_pairs") or []),
         "use_default_inventory_pair": bool(profile.get("use_default_inventory_pair")),
@@ -743,7 +924,6 @@ def normalize_profile_config(profile_key_name, profile):
         "prefix_strategy": normalize_prefix_strategy(profile.get("prefix_strategy") or defaults["prefix_strategy"]),
         "prefix_mst_digits": normalize_prefix_mst_digits(profile.get("prefix_mst_digits", defaults["prefix_mst_digits"])),
         "prefix_strategy_values": normalize_prefix_strategy_values(profile.get("prefix_strategy_values") or defaults["prefix_strategy_values"]),
-        "output_path": str(profile.get("output_path") or ""),
         "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
     }
 
@@ -885,6 +1065,7 @@ def index_to_excel_col(idx):
 
 def rm_accents(text):
     text = str(text)
+    text = text.replace("Ð", "D").replace("ð", "d")
     text = text.replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
     for ch in DIAMETER_CHARS:
         text = text.replace(ch, "F")
@@ -892,14 +1073,18 @@ def rm_accents(text):
     return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
 
 
+def normalize_code_decimal_separators(text):
+    return re.sub(r"(?<=\d),(?=\d)", ".", str(text or ""))
+
+
 def normalize_token(text):
-    text = rm_accents(text).upper()
+    text = normalize_code_decimal_separators(rm_accents(text).upper())
     text = re.sub(r"[^A-Z0-9.]+", "", text)
     return text
 
 
 def normalize_code_token(text, keep_slash=False, keep_hyphen=False):
-    text = rm_accents(text).upper()
+    text = normalize_code_decimal_separators(rm_accents(text).upper())
     allowed = "A-Z0-9."
     if keep_slash:
         allowed += "/"
@@ -1010,10 +1195,14 @@ VIETMAX_PRODUCT_CODE_OVERRIDES = (
 )
 
 
+def normalize_vietmax_exact_product_key(product):
+    return " ".join(normalize_rule_key(word) for word in code_words(product))
+
+
 def vietmax_product_code_override(product):
-    key = normalize_rule_key(product)
+    key = normalize_vietmax_exact_product_key(product)
     for source, code in VIETMAX_PRODUCT_CODE_OVERRIDES:
-        if normalize_rule_key(source) == key:
+        if normalize_vietmax_exact_product_key(source) == key:
             return code
     return None
 
@@ -1071,7 +1260,7 @@ VIETMAX_FALLBACK_PREFIX_RULES = (
     ("Giấy mỹ thuật", "GMYTHUAT"),
     ("Giấy Offset", "GOFFSET"),
     ("Màng tự dính", "MANGTUDINH"),
-    ("Tấm bản in bằng nhôm CTP", "TAMBANNHOMCTP"),
+    ("Tấm bản in bằng nhôm", "TAMBANNHOM"),
     ("Giấy tự dính", "GIAYTUDINH"),
 )
 
@@ -1204,16 +1393,27 @@ def vietmax_workbook_prefix_rules():
         return VIETMAX_FALLBACK_PREFIX_RULES
 
 
+def vietmax_prefix_phrase_match_end(words, phrase_words):
+    if not words or not phrase_words:
+        return None
+    phrase_keys = [normalize_rule_key(word) for word in phrase_words]
+    if len(words) < len(phrase_keys):
+        return None
+    for index, phrase_key in enumerate(phrase_keys):
+        if normalize_rule_key(words[index]) != phrase_key:
+            return None
+    return len(phrase_keys)
+
+
 def vietmax_prefix_rule_code(product, sales_style=False):
     words = code_words(product)
     for phrase, prefix in vietmax_workbook_prefix_rules():
         phrase_words = code_words(phrase)
-        if len(words) < len(phrase_words):
-            continue
-        if normalize_rule_key(" ".join(words[:len(phrase_words)])) != normalize_rule_key(phrase):
+        match_end = vietmax_prefix_phrase_match_end(words, phrase_words)
+        if match_end is None:
             continue
         suffix_parts = []
-        for word in words[len(phrase_words):]:
+        for word in words[match_end:]:
             word_key = normalize_rule_key(word)
             if word_key in {"dinh", "luong"}:
                 continue
@@ -1233,8 +1433,9 @@ def vietmax_early_prefix_rule_code(product):
         if normalize_rule_key(phrase) != "giay an hoa":
             continue
         phrase_words = code_words(phrase)
-        if len(words) >= len(phrase_words) and normalize_rule_key(" ".join(words[:len(phrase_words)])) == normalize_rule_key(phrase):
-            suffix = "".join(vietmax_suffix_token(word) for word in words[len(phrase_words):])
+        match_end = vietmax_prefix_phrase_match_end(words, phrase_words)
+        if match_end is not None:
+            suffix = "".join(vietmax_suffix_token(word) for word in words[match_end:])
             return f"{prefix}{suffix}" if suffix else None
     return None
 
@@ -1243,17 +1444,16 @@ def vietmax_manual_prefix_rule_code(product):
     rules = (
         ("Giấy Ivory", "GIVORY"),
         ("Màng tự dính", "MANGTUDINH"),
-        ("Tấm bản in bằng nhôm CTP", "TAMBANNHOMCTP"),
+        ("Tấm bản in bằng nhôm", "TAMBANNHOM"),
     )
     words = code_words(product)
     for phrase, prefix in rules:
         phrase_words = code_words(phrase)
-        if len(words) < len(phrase_words):
-            continue
-        if normalize_rule_key(" ".join(words[:len(phrase_words)])) != normalize_rule_key(phrase):
+        match_end = vietmax_prefix_phrase_match_end(words, phrase_words)
+        if match_end is None:
             continue
         suffix_parts = []
-        for word in words[len(phrase_words):]:
+        for word in words[match_end:]:
             word_key = normalize_rule_key(word)
             if word_key in {"dinh", "luong", "kho"}:
                 continue
@@ -1392,7 +1592,7 @@ def code_words(name):
     text = str(name or "")
     for ch in DIAMETER_CHARS:
         text = text.replace(ch, "F")
-    text = re.sub(r"(?i)(khổ|kho)(?=\d)", lambda match: match.group(1) + " ", text)
+    text = re.sub(r"(?i)(khổ|khá»•|kho)(?=\d)", lambda match: match.group(1) + " ", text)
     text = normalize_sep(text)
     return [w for w in re.split(r"\s+", text.strip()) if w]
 
@@ -1400,6 +1600,13 @@ def code_words(name):
 def trim_code(value):
     value = re.sub(r"\.+", ".", str(value or "")).strip(". ")
     return value[:MAX_CODE_LENGTH].rstrip(".")
+
+
+def sanitize_product_code(value):
+    text = normalize_code_decimal_separators(rm_accents(str(value or "")))
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^A-Za-z0-9.]+", "", text)
+    return trim_code(text)
 
 
 def is_volume_token(token):
@@ -1514,7 +1721,12 @@ def inventory_rule_priority(rule, order):
 
 
 def normalized_header_label(value):
-    return rm_accents(raw_text(value)).casefold().strip()
+    text = raw_text(value)
+    try:
+        text = text.encode("latin1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return rm_accents(text).casefold().strip()
 
 
 def inventory_column_indexes(df, header_index):
@@ -1538,10 +1750,8 @@ def apply_inventory_pairs(df, header_index, processed_row_indexes, data, exclude
     rules = normalize_inventory_pair_rules(data.get("inventory_pair_rules") or [])
     default_enabled = bool(data.get("use_default_inventory_pair"))
     default_pair_id = str(data.get("default_inventory_pair_id") or "").strip()
-    if default_enabled and default_pair_id not in pairs:
-        raise ValueError(f"Inventory default pair is missing: {default_pair_id}")
     fallback_pair = None
-    if default_enabled:
+    if default_enabled and default_pair_id in pairs:
         fallback_pair = pairs[default_pair_id]
     elif len(pairs) == 1:
         fallback_pair = next(iter(pairs.values()))
@@ -1552,7 +1762,7 @@ def apply_inventory_pairs(df, header_index, processed_row_indexes, data, exclude
             continue
         pair_id = rule.get("pair_id")
         if pair_id not in pairs:
-            raise ValueError(f"Inventory rule pair is missing: {pair_id}")
+            continue
         source_col = rule.get("source_col")
         try:
             source_index = excel_col_to_index(source_col)
@@ -1757,15 +1967,6 @@ def make_product_part(profile, product, word_rules, first_word_rules=None, repea
         if word_rules:
             words = apply_word_rules_to_words(words, word_rules)
             name = " ".join(words)
-        override = vietmax_product_code_override(name)
-        if override is not None:
-            return vietmax_preserve_dimension_unit_code(name, override)
-        all_words_code = vietmax_all_words_code(name)
-        if all_words_code is not None:
-            return vietmax_preserve_dimension_unit_code(name, all_words_code)
-        prefix_rule_code = vietmax_prefix_rule_code(name, sales_style=True)
-        if prefix_rule_code is not None:
-            return vietmax_preserve_dimension_unit_code(name, prefix_rule_code)
         return vietmax_preserve_dimension_unit_code(name, vietmax_ban_ra_fallback_code(words))
 
     if profile == "vietmax_mua_vao":
@@ -1850,9 +2051,9 @@ def make_code(mst, product, qty, prefix_map, profile, word_rules, first_word_rul
         return ""
     body = make_product_part(profile, product, word_rules, first_word_rules, repeated_phrase_removals)
     if not include_company_prefix:
-        return trim_code(body)
+        return sanitize_product_code(body)
     prefix = normalize_token(prefix_map[mst])
-    return trim_code(f"{prefix}.{body}")
+    return sanitize_product_code(f"{prefix}.{body}")
 
 
 def raw_price_group(price, rule):
@@ -1899,7 +2100,10 @@ def product_key(mst, product):
 def read_workbook(path):
     with open(path, "rb") as fh:
         raw = fh.read()
-    with pd.ExcelFile(BytesIO(raw), engine="openpyxl") as xl:
+    suffix = Path(path).suffix.lower()
+    legacy_xls = raw.startswith(b"\xd0\xcf\x11\xe0") or (suffix == ".xls" and not raw.startswith(b"PK"))
+    engine = "xlrd" if legacy_xls else "openpyxl"
+    with pd.ExcelFile(BytesIO(raw), engine=engine) as xl:
         sheet = xl.sheet_names[0]
         df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=object)
     return sheet, df
@@ -1970,11 +2174,54 @@ def vietmax_ban_ra_match_key(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def vietmax_normalize_unit_spelling_aliases(text):
+    text = str(text or "")
+    return re.sub(
+        r"(\d+(?:[,.]\d+)?)\s*(?:l|lit|liter|litre|liters|litres)\b",
+        lambda match: f"{norm_num(match.group(1))}l",
+        text,
+    )
+
+
 def vietmax_equivalent_product_key(value):
     text = normalize_sep(str(value or ""))
     text = rm_accents(text).casefold()
     text = re.sub(r"\bcabon\b", "cacbon", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def vietmax_unit_spelling_product_key(value):
+    text = normalize_sep(str(value or ""))
+    text = rm_accents(text).casefold()
+    text = vietmax_normalize_unit_spelling_aliases(text)
+    text = re.sub(r"\bcabon\b", "cacbon", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def vietmax_is_unit_spelling_only_diff(current, target):
+    current_norm = vietmax_equivalent_product_key(current)
+    target_norm = vietmax_equivalent_product_key(target)
+    if not current_norm or not target_norm or current_norm == target_norm:
+        return False
+    return vietmax_unit_spelling_product_key(current) == vietmax_unit_spelling_product_key(target)
+
+
+def vietmax_similar_form_key(value):
+    key = vietmax_ban_ra_match_key(value)
+    if key.startswith("giay in "):
+        tail = key[len("giay in "):].strip()
+        return f"giay {tail}" if tail else ""
+    if key.startswith("giay "):
+        tail = key[len("giay "):].strip()
+        if tail and not tail.startswith("in "):
+            return key
+    return ""
+
+
+def vietmax_is_optional_in_form(value):
+    return vietmax_ban_ra_match_key(value).startswith("giay in ")
 
 
 def vietmax_review_product_name(value):
@@ -2282,7 +2529,62 @@ def vietmax_has_dimension_diff(current, target):
     return False
 
 
-def vietmax_product_review_rows(products, product_key, unit_key, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, threshold=0.92, progress_callback=None):
+def vietmax_review_pair_row(left, right, similarity, review_group="other", dimension_only=False, extra=None):
+    review_row = dict(left)
+    review_row["similar_product"] = right.get("product", "")
+    review_row["similar_unit"] = right.get("unit", "")
+    review_row["similar_invoice_no"] = right.get("invoice_no", "")
+    review_row["similar_invoice_date"] = right.get("invoice_date", "")
+    review_row["similar_company"] = right.get("company", "")
+    review_row["similar_mst"] = right.get("mst", "")
+    review_row["similar_company_key"] = right.get("company_key", "")
+    review_row["similar_code"] = right.get("code", "")
+    review_row["similar_product_key"] = right.get("product_key", "")
+    review_row["similar_company_index"] = right.get("company_index")
+    review_row["similar_product_index"] = right.get("product_index")
+    review_row["similarity"] = f"{similarity * 100:.1f}%"
+    review_row["review_group"] = review_group
+    review_row["dimension_only"] = dimension_only
+    review_row["confirmed"] = False
+    if extra:
+        review_row.update(extra)
+    return review_row
+
+
+def vietmax_same_generated_code(left, right):
+    left_code = sanitize_product_code((left or {}).get("code"))
+    right_code = sanitize_product_code((right or {}).get("code"))
+    return bool(left_code and right_code and left_code == right_code)
+
+
+def vietmax_code_from_user_config(row):
+    row = row or {}
+    return bool(
+        row.get("code_from_user_config")
+        or row.get("purchase_code_from_user_config")
+        or row.get("sales_code_from_user_config")
+    )
+
+
+def vietmax_same_code_from_user_config(left, right):
+    return vietmax_same_generated_code(left, right) and (
+        vietmax_code_from_user_config(left) or vietmax_code_from_user_config(right)
+    )
+
+
+def vietmax_review_group_for_pair(left, right, allow_same_code_split=False):
+    if vietmax_same_code_from_user_config(left, right):
+        return None, False, None
+    if vietmax_is_unit_spelling_only_diff((left or {}).get("product"), (right or {}).get("product")):
+        return "unit_spelling_diff", False, {"review_type": "unit_spelling_diff"}
+    if allow_same_code_split and vietmax_same_generated_code(left, right):
+        return "same_code_split", False, {"review_type": "same_code_split"}
+    if vietmax_has_dimension_diff((left or {}).get("product"), (right or {}).get("product")):
+        return "dimension_diff", True, None
+    return "other", False, None
+
+
+def vietmax_product_review_rows(products, product_key, unit_key, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, threshold=0.92, progress_callback=None, allow_same_code_split=False):
     scope = normalize_vietmax_comparison_scope(comparison_scope)
     normalized = []
     key_counts = {}
@@ -2313,7 +2615,7 @@ def vietmax_product_review_rows(products, product_key, unit_key, comparison_scop
         equivalent_key = vietmax_equivalent_product_key(product)
         if product and key:
             row = {"product": product, "unit": unit, "invoice_no": invoice_no, "invoice_date": invoice_date, "company": company, "mst": mst, "company_key": company_key, "match_key": key, "equivalent_key": equivalent_key}
-            for extra_key in ("code", "product_key", "company_index", "product_index"):
+            for extra_key in ("code", "product_key", "company_index", "product_index", "code_from_user_config", "purchase_code_from_user_config", "sales_code_from_user_config"):
                 if extra_key in item:
                     row[extra_key] = item.get(extra_key)
             row_index = len(normalized)
@@ -2347,6 +2649,10 @@ def vietmax_product_review_rows(products, product_key, unit_key, comparison_scop
                 continue
             if row.get("equivalent_key") == other.get("equivalent_key"):
                 continue
+            row_form_key = vietmax_similar_form_key(row.get("product"))
+            other_form_key = vietmax_similar_form_key(other.get("product"))
+            if row_form_key and row_form_key == other_form_key and vietmax_is_optional_in_form(row.get("product")) != vietmax_is_optional_in_form(other.get("product")):
+                continue
             other_tokens = {token for token in str(other.get("match_key") or "").split() if len(token) >= 2}
             shared_token_count = len(row_tokens & other_tokens)
             required_shared_tokens = min(len(row_tokens), len(other_tokens))
@@ -2369,27 +2675,61 @@ def vietmax_product_review_rows(products, product_key, unit_key, comparison_scop
         if unique_key in seen_products:
             continue
         seen_products.add(unique_key)
-        review_row = dict(row)
-        review_row["similar_product"] = best.get("product", "")
-        review_row["similar_unit"] = best.get("unit", "")
-        review_row["similar_invoice_no"] = best.get("invoice_no", "")
-        review_row["similar_invoice_date"] = best.get("invoice_date", "")
-        review_row["similar_company"] = best.get("company", "")
-        review_row["similar_mst"] = best.get("mst", "")
-        review_row["similar_company_key"] = best.get("company_key", "")
-        review_row["similar_code"] = best.get("code", "")
-        review_row["similar_product_key"] = best.get("product_key", "")
-        review_row["similar_company_index"] = best.get("company_index")
-        review_row["similar_product_index"] = best.get("product_index")
-        review_row["similarity"] = f"{best_score * 100:.1f}%"
-        if vietmax_has_dimension_diff(row.get("product"), best.get("product")):
-            review_row["review_group"] = "dimension_diff"
-            review_row["dimension_only"] = True
-        else:
-            review_row["review_group"] = "other"
-            review_row["dimension_only"] = False
+        review_group, dimension_only, extra = vietmax_review_group_for_pair(row, best, allow_same_code_split)
+        if not review_group:
+            continue
+        review_row = vietmax_review_pair_row(row, best, best_score, review_group, dimension_only, extra)
         rows.append(review_row)
+    rows.extend(vietmax_similar_form_review_rows(normalized, seen_products, scope, allow_same_code_split=allow_same_code_split))
     rows.extend(vietmax_forced_purchase_review_rows(normalized, seen_products, scope))
+    return rows
+
+
+def vietmax_similar_form_review_rows(normalized, seen_products, scope, allow_same_code_split=False):
+    by_form = {}
+    for row in normalized:
+        row_scope = row.get("company_key") if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
+        form_key = vietmax_similar_form_key(row.get("product"))
+        if form_key:
+            by_form.setdefault((row_scope, form_key), []).append(row)
+    rows = []
+    for (row_scope, _), candidates in by_form.items():
+        if len(candidates) < 2:
+            continue
+        with_optional = [row for row in candidates if vietmax_is_optional_in_form(row.get("product"))]
+        without_optional = [row for row in candidates if not vietmax_is_optional_in_form(row.get("product"))]
+        for left in with_optional:
+            best = None
+            best_score = 0.0
+            for right in without_optional:
+                if left.get("equivalent_key") == right.get("equivalent_key"):
+                    continue
+                score = vietmax_ban_ra_match_score(left.get("product"), right.get("product"))
+                if score > best_score:
+                    best = right
+                    best_score = score
+            if not best:
+                continue
+            pair_key = tuple(sorted((left.get("match_key"), best.get("match_key"))))
+            unique_key = (row_scope, pair_key)
+            if unique_key in seen_products:
+                continue
+            seen_products.add(unique_key)
+            if vietmax_same_code_from_user_config(left, best):
+                continue
+            review_group = "similar_form"
+            extra = {"confirmed": False}
+            if allow_same_code_split and vietmax_same_generated_code(left, best):
+                review_group = "same_code_split"
+                extra["review_type"] = "same_code_split"
+            rows.append(vietmax_review_pair_row(
+                left,
+                best,
+                best_score,
+                review_group,
+                False,
+                extra,
+            ))
     return rows
 
 
@@ -2413,23 +2753,10 @@ def vietmax_forced_purchase_review_rows(normalized, seen_products, scope):
             if unique_key in seen_products:
                 continue
             seen_products.add(unique_key)
+            if vietmax_same_code_from_user_config(left, right):
+                continue
             score = vietmax_ban_ra_match_score(left.get("product"), right.get("product"))
-            review_row = dict(left)
-            review_row["similar_product"] = right.get("product", "")
-            review_row["similar_unit"] = right.get("unit", "")
-            review_row["similar_invoice_no"] = right.get("invoice_no", "")
-            review_row["similar_invoice_date"] = right.get("invoice_date", "")
-            review_row["similar_company"] = right.get("company", "")
-            review_row["similar_mst"] = right.get("mst", "")
-            review_row["similar_company_key"] = right.get("company_key", "")
-            review_row["similar_code"] = right.get("code", "")
-            review_row["similar_product_key"] = right.get("product_key", "")
-            review_row["similar_company_index"] = right.get("company_index")
-            review_row["similar_product_index"] = right.get("product_index")
-            review_row["similarity"] = f"{score * 100:.1f}%"
-            review_row["review_group"] = "other"
-            review_row["dimension_only"] = False
-            review_row["forced_review"] = True
+            review_row = vietmax_review_pair_row(left, right, score, "other", False, {"forced_review": True})
             rows.append(review_row)
     return rows
 
@@ -2610,6 +2937,7 @@ def vietmax_purchase_products_from_workbook(path, code_col=None, product_col=Non
             continue
         if not code or code in {"0", "0.0"}:
             code = make_product_part("vietmax_mua_vao", product, {})
+        code = sanitize_product_code(code)
         if not code:
             continue
         invoice_no = raw_text(cell(df, row_index, invoice_no_index)) if df.shape[1] > invoice_no_index else ""
@@ -2837,7 +3165,10 @@ def normalize_vietmax_internal_merges(value, comparison_scope=VIETMAX_COMPARISON
         return result
     scope = normalize_vietmax_comparison_scope(comparison_scope)
     for item in value:
-        if not isinstance(item, dict) or item.get("confirmed") is False:
+        item = sanitize_review_merge_rule_for_config(item, scope)
+        if not item or item.get("confirmed") is not True:
+            continue
+        if raw_text(item.get("code_choice")).lower() == "split":
             continue
         product = raw_text(item.get("product"))
         similar_product = raw_text(item.get("similar_product"))
@@ -2855,33 +3186,130 @@ def normalize_vietmax_internal_merges(value, comparison_scope=VIETMAX_COMPARISON
     return result
 
 
+def normalize_vietmax_split_code_overrides(value, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    result = {}
+    if not isinstance(value, list):
+        return result
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    for item in value:
+        item = sanitize_review_merge_rule_for_config(item, scope)
+        if not item or item.get("confirmed") is not True:
+            continue
+        if raw_text(item.get("code_choice")).lower() != "split":
+            continue
+        sides = (
+            ("product", "company", "mst", "company_key", "split_code"),
+            ("similar_product", "similar_company", "similar_mst", "similar_company_key", "similar_split_code"),
+        )
+        for product_field, company_field, mst_field, company_key_field, code_field in sides:
+            product = raw_text(item.get(product_field))
+            code = sanitize_product_code(item.get(code_field))
+            if not product or not code:
+                continue
+            key = vietmax_internal_merge_lookup_key(
+                product,
+                item.get(company_field),
+                item.get(mst_field),
+                item.get(company_key_field),
+                item.get("comparison_scope") or scope,
+            )
+            if key:
+                result[key] = code
+    return result
+
+
+def find_vietmax_split_code_override(overrides, product, company="", mst="", company_key="", comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    if not overrides:
+        return ""
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    key = vietmax_internal_merge_lookup_key(product, company, mst, company_key, scope)
+    return overrides.get(key) if key else ""
+
+
+def find_vietmax_internal_merge(merges, product, company="", mst="", company_key="", comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+    if not merges:
+        return None
+    scope = normalize_vietmax_comparison_scope(comparison_scope)
+    candidate_scopes = [scope]
+    for extra_scope in (VIETMAX_COMPARISON_SCOPE_SAME_COMPANY, VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
+        if extra_scope not in candidate_scopes:
+            candidate_scopes.append(extra_scope)
+    for candidate_scope in candidate_scopes:
+        key = vietmax_internal_merge_lookup_key(product, company, mst, company_key, candidate_scope)
+        if key and key in merges:
+            return merges[key]
+    return None
+
+
 def apply_vietmax_internal_merges_to_products(products, product_key_name, unit_key_name, merges, comparison_scope=VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES):
     if not merges:
         return list(products or [])
     scope = normalize_vietmax_comparison_scope(comparison_scope)
-    merged_products = []
-    seen = set()
+    product_rows = []
+    row_by_lookup = {}
     for item in products or []:
         row = dict(item) if isinstance(item, dict) else {product_key_name: raw_text(item)}
         product = raw_text(row.get(product_key_name) or row.get("product") or row.get("name"))
         company = raw_text(row.get("purchase_company") or row.get("sales_company"))
         mst = raw_text(row.get("purchase_mst") or row.get("sales_mst"))
         company_key = raw_text(row.get("purchase_company_key") or row.get("sales_company_key"))
+        product_rows.append((item, row, product, company, mst, company_key))
+        for candidate_scope in (scope, VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, VIETMAX_COMPARISON_SCOPE_SAME_COMPANY):
+            lookup = vietmax_internal_merge_lookup_key(product, company, mst, company_key, candidate_scope)
+            if lookup:
+                row_by_lookup.setdefault((candidate_scope, lookup), row)
+
+    def representative_row(merge):
+        merge_scope = normalize_vietmax_comparison_scope(merge.get("comparison_scope") or scope)
+        product = raw_text(merge.get("similar_product"))
+        company = raw_text(merge.get("similar_company"))
+        mst = raw_text(merge.get("similar_mst"))
+        company_key = raw_text(merge.get("similar_company_key"))
+        for candidate_scope in (merge_scope, scope, VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES, VIETMAX_COMPARISON_SCOPE_SAME_COMPANY):
+            lookup = vietmax_internal_merge_lookup_key(product, company, mst, company_key, candidate_scope)
+            found = row_by_lookup.get((candidate_scope, lookup)) if lookup else None
+            if found:
+                return found
+        return None
+
+    def row_code(row):
+        return raw_text(row.get("purchase_code") or row.get("sales_code") or row.get("code"))
+
+    def generated_merge_code(merge):
+        target_product = raw_text((merge or {}).get("similar_product"))
+        if not target_product:
+            return ""
+        target_profile = "vietmax_ban_ra" if product_key_name == "sales_product" else "vietmax_mua_vao"
+        return sanitize_product_code(make_product_part(target_profile, target_product, {}, {}, []))
+
+    merged_products = []
+    seen = set()
+    for item, original_row, product, company, mst, company_key in product_rows:
+        row = dict(original_row)
         merge_key = vietmax_internal_merge_lookup_key(product, company, mst, company_key, scope)
         merge = merges.get(merge_key) if merge_key else None
         if merge:
             row[f"original_{product_key_name}"] = product
             row[product_key_name] = raw_text(merge.get("similar_product"))
-            similar_code = raw_text(merge.get("similar_code"))
-            if similar_code and product_key_name == "purchase_product":
-                row["original_purchase_code"] = raw_text(row.get("purchase_code") or row.get("code"))
-                if "purchase_code" in row:
-                    row["purchase_code"] = similar_code
-                elif "code" in row:
-                    row["code"] = similar_code
-            if raw_text(merge.get("similar_unit")):
+            target_row = representative_row(merge)
+            target_code = row_code(target_row or {}) or generated_merge_code(merge)
+            if target_code:
+                if product_key_name == "purchase_product":
+                    row["original_purchase_code"] = raw_text(row.get("purchase_code") or row.get("code"))
+                    if "purchase_code" in row:
+                        row["purchase_code"] = target_code
+                    elif "code" in row:
+                        row["code"] = target_code
+                elif product_key_name == "sales_product":
+                    row["original_sales_code"] = raw_text(row.get("sales_code") or row.get("code"))
+                    if "sales_code" in row:
+                        row["sales_code"] = target_code
+                    elif "code" in row:
+                        row["code"] = target_code
+            target_unit = raw_text((target_row or {}).get(unit_key_name)) or raw_text(merge.get("similar_unit"))
+            if target_unit:
                 row[f"original_{unit_key_name}"] = raw_text(row.get(unit_key_name))
-                row[unit_key_name] = raw_text(merge.get("similar_unit"))
+                row[unit_key_name] = target_unit
         product_after_merge = raw_text(row.get(product_key_name))
         merged_company_key = raw_text(row.get("purchase_company_key") or row.get("sales_company_key")) if scope == VIETMAX_COMPARISON_SCOPE_SAME_COMPANY else ""
         unique_key = (merged_company_key, vietmax_ban_ra_match_key(product_after_merge))
@@ -3151,15 +3579,15 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
 
 
 def resolve_output_path(original, requested_path):
-    default_name = f"{Path(original).stem}_fdi.xlsx"
+    default_name = f"{Path(original).stem}_fdi.xls"
     requested_path = str(requested_path or "").strip().strip('"')
     if not requested_path:
         return OUTPUT_DIR / default_name
     p = Path(requested_path)
-    if p.suffix.lower() in {".xlsx", ".xlsm"}:
+    if p.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
         p.parent.mkdir(parents=True, exist_ok=True)
         stem = p.stem if p.stem.casefold().endswith("_fdi") else f"{p.stem}_fdi"
-        return p.with_name(f"{stem}.xlsx")
+        return p.with_name(f"{stem}.xls")
     p.mkdir(parents=True, exist_ok=True)
     return p / default_name
 
@@ -3201,7 +3629,11 @@ def validate_payload(data):
 
 
 def process_workbook(path, out, data, progress_callback=None):
+    if progress_callback:
+        progress_callback(0, 1, "Đang đọc workbook nguồn")
     sheet, df = read_workbook(path)
+    if progress_callback:
+        progress_callback(1, 1, f"Đã đọc workbook nguồn: {len(df)} dòng")
     company_col = data.get("company_col", "F").upper()
     mst_col = data.get("mst_col", "G").upper()
     product_col = data.get("product_col", "N").upper()
@@ -3244,8 +3676,10 @@ def process_workbook(path, out, data, progress_callback=None):
     vietmax_purchase_matches = normalize_vietmax_ban_ra_purchase_matches(vietmax_purchase_match_rows, vietmax_comparison_scope) if uses_vietmax_sales else {}
     vietmax_sales_internal_merges = normalize_vietmax_internal_merges(data.get("vietmax_ban_ra_sales_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_sales else {}
     vietmax_purchase_internal_merges = normalize_vietmax_internal_merges(data.get("vietmax_mua_vao_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_purchase else {}
+    vietmax_sales_split_code_overrides = normalize_vietmax_split_code_overrides(data.get("vietmax_ban_ra_sales_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_sales else {}
+    vietmax_purchase_split_code_overrides = normalize_vietmax_split_code_overrides(data.get("vietmax_mua_vao_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_purchase else {}
     prefix_map, selected_products = validate_payload(data)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values)
+    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values, progress_callback=progress_callback)
     processed_purchase_path = raw_text(data.get("vietmax_processed_purchase_path"))
     if uses_vietmax_sales and processed_purchase_path:
         processed_purchase_products = vietmax_purchase_products_from_workbook(
@@ -3288,12 +3722,28 @@ def process_workbook(path, out, data, progress_callback=None):
         if (include_company_prefix and mst not in prefix_map) or prod not in selected_products.get(mst, set()):
             continue
         key = product_key(mst, prod)
-        purchase_merge_key = vietmax_internal_merge_lookup_key(prod, r.get("company"), mst, comparison_scope=vietmax_comparison_scope) if uses_vietmax_purchase else ""
-        purchase_merge = vietmax_purchase_internal_merges.get(purchase_merge_key) if purchase_merge_key else None
+        purchase_merge = find_vietmax_internal_merge(
+            vietmax_purchase_internal_merges,
+            prod,
+            r.get("company"),
+            mst,
+            r.get("company_key"),
+            vietmax_comparison_scope,
+        ) if uses_vietmax_purchase else None
         effective_purchase_prod = raw_text(purchase_merge.get("similar_product")) if purchase_merge else prod
-        base_code = str(manual_code_overrides.get(key) or "").strip()
+        base_code = find_vietmax_split_code_override(
+            vietmax_purchase_split_code_overrides,
+            prod,
+            r.get("company"),
+            mst,
+            r.get("company_key"),
+            vietmax_comparison_scope,
+        ) if uses_vietmax_purchase else ""
+        if not base_code:
+            base_code = str(manual_code_overrides.get(key) or "").strip()
         if not base_code:
             base_code = make_code(mst, effective_purchase_prod, 1, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
+        base_code = sanitize_product_code(base_code)
         rule = price_rules.get(key) or price_range_rules.get(base_code)
         if not rule:
             continue
@@ -3314,11 +3764,23 @@ def process_workbook(path, out, data, progress_callback=None):
         prod = row["product"]
         key = product_key(mst, prod)
         qty = cell(df, i, qi) if qi is not None else 1
-        purchase_merge_key = vietmax_internal_merge_lookup_key(prod, row.get("company"), mst, comparison_scope=vietmax_comparison_scope) if uses_vietmax_purchase else ""
-        purchase_merge = vietmax_purchase_internal_merges.get(purchase_merge_key) if purchase_merge_key else None
+        purchase_merge = find_vietmax_internal_merge(
+            vietmax_purchase_internal_merges,
+            prod,
+            row.get("company"),
+            mst,
+            row.get("company_key"),
+            vietmax_comparison_scope,
+        ) if uses_vietmax_purchase else None
         purchase_effective_prod = raw_text(purchase_merge.get("similar_product")) if purchase_merge else prod
-        sales_merge_key = vietmax_internal_merge_lookup_key(prod, row.get("company"), mst, comparison_scope=vietmax_comparison_scope)
-        sales_merge = vietmax_sales_internal_merges.get(sales_merge_key) if sales_merge_key else None
+        sales_merge = find_vietmax_internal_merge(
+            vietmax_sales_internal_merges,
+            prod,
+            row.get("company"),
+            mst,
+            row.get("company_key"),
+            vietmax_comparison_scope,
+        )
         effective_prod = raw_text(sales_merge.get("similar_product")) if sales_merge else purchase_effective_prod
         same_company_match_key = vietmax_purchase_match_lookup_key(effective_prod, row.get("company"), mst, VIETMAX_COMPARISON_SCOPE_SAME_COMPANY)
         matched_purchase_match = vietmax_purchase_matches.get(same_company_match_key) if same_company_match_key else None
@@ -3329,13 +3791,33 @@ def process_workbook(path, out, data, progress_callback=None):
         if not selected_for_processing and not matched_purchase_match:
             continue
         code = matched_purchase_code if matched_purchase_match and not selected_for_processing else ""
+        if not code and uses_vietmax_purchase:
+            code = find_vietmax_split_code_override(
+                vietmax_purchase_split_code_overrides,
+                prod,
+                row.get("company"),
+                mst,
+                row.get("company_key"),
+                vietmax_comparison_scope,
+            )
+        if not code and uses_vietmax_sales:
+            code = find_vietmax_split_code_override(
+                vietmax_sales_split_code_overrides,
+                prod,
+                row.get("company"),
+                mst,
+                row.get("company_key"),
+                vietmax_comparison_scope,
+            )
         if not code:
             code = str(manual_code_overrides.get(key) or "").strip()
+        code = sanitize_product_code(code)
         if not code:
             code = make_code(mst, effective_prod, qty, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(code)
         if code and rule and pri is not None:
             code += price_group_suffix(parse_price(cell(df, i, pri)), rule, occupied.get(key))
+        code = sanitize_product_code(code)
         if code:
             df.iat[i, oi] = code
             if purchase_merge:
@@ -3381,8 +3863,7 @@ def process_workbook(path, out, data, progress_callback=None):
 
     if progress_callback:
         progress_callback(1, 2, "Đang ghi file Excel chính")
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        df.to_excel(w, sheet_name=sheet, index=False, header=False)
+    write_dataframe_workbook(df, sheet, out)
     if progress_callback:
         progress_callback(2, 2, "Đã ghi file Excel chính")
     return df
@@ -3399,11 +3880,20 @@ def up_ban_ra_tax_values(value):
     return f"{percent:02g}", percent
 
 
-def up_ban_ra_template_sheet(workbook):
+def up_template_sheet(workbook, expected_title=None):
+    expected = rm_accents(expected_title).casefold() if expected_title else ""
     for ws in workbook.worksheets:
-        if rm_accents(ws.title).casefold() == "up ban ra":
+        if expected and rm_accents(ws.title).casefold() == expected:
             return ws
     return workbook.worksheets[0]
+
+
+def up_ban_ra_template_sheet(workbook):
+    return up_template_sheet(workbook, "UP Bán ra")
+
+
+def up_mua_vao_template_sheet(workbook):
+    return up_template_sheet(workbook, "UP Mua vào")
 
 
 def processed_inventory_column_indexes(processed_df, output_code_index):
@@ -3422,88 +3912,807 @@ def processed_inventory_column_indexes(processed_df, output_code_index):
     return {"tk_vat_tu": labels["tk vat tu"], "ma_kho": labels["ma kho"]}
 
 
-def create_up_ban_ra_workbook(processed_df, progress_callback=None):
+def up_workbook_template_path(*names):
+    for name in names:
+        path = RESOURCE_DIR / name
+        if path.exists():
+            return path
+    return None
+
+
+def prepare_up_workbook(template_path, sheet_title, expected_title=None):
     from openpyxl import load_workbook
 
-    template_path = RESOURCE_DIR / "mau HD ban ra.xlsx"
-    if not template_path.exists():
-        raise ValueError("Không tìm thấy file mẫu mau HD ban ra.xlsx để tạo file UP bán ra.")
-
     wb = load_workbook(template_path)
-    ws = up_ban_ra_template_sheet(wb)
-    ws.title = "UP Bán ra"
+    ws = up_template_sheet(wb, expected_title or sheet_title)
+    ws.title = sheet_title
     for other in list(wb.worksheets):
         if other is not ws:
             wb.remove(other)
 
     max_column = ws.max_column
-    data_styles = [copy(ws.cell(2, col)._style) for col in range(1, max_column + 1)]
-    data_number_formats = [ws.cell(2, col).number_format for col in range(1, max_column + 1)]
+    style_row = 2 if ws.max_row >= 2 else 1
+    data_styles = [copy(ws.cell(style_row, col)._style) for col in range(1, max_column + 1)]
+    data_number_formats = [ws.cell(style_row, col).number_format for col in range(1, max_column + 1)]
     if ws.max_row > 1:
         ws.delete_rows(2, ws.max_row - 1)
+    return wb, ws, max_column, data_styles, data_number_formats
 
-    source_indexes = {name: excel_col_to_index(name) for name in ["C", "D", "J", "L", "O", "P", "Q", "R", "W"]}
+
+def clean_up_cell_value(value, default=""):
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def ensure_xls_dimensions(row_count, column_count, label="Workbook"):
+    if row_count > XLS_MAX_ROWS:
+        raise ValueError(f"{label} có {row_count} dòng, vượt giới hạn {XLS_MAX_ROWS} dòng của định dạng .xls.")
+    if column_count > XLS_MAX_COLUMNS:
+        raise ValueError(f"{label} có {column_count} cột, vượt giới hạn {XLS_MAX_COLUMNS} cột của định dạng .xls.")
+
+
+def coerce_xls_value(value):
+    value = clean_up_cell_value(value)
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if value is None:
+        return ""
+    return value
+
+
+def write_dataframe_xls(df, sheet_name, out):
+    import xlwt
+
+    ensure_xls_dimensions(len(df), int(df.shape[1]), Path(out).name)
+    workbook = xlwt.Workbook(encoding="utf-8")
+    used_names = set()
+    ws = workbook.add_sheet(safe_excel_sheet_name(sheet_name, used_names))
+    for row_index in range(len(df)):
+        for column_index in range(int(df.shape[1])):
+            ws.write(row_index, column_index, coerce_xls_value(df.iat[row_index, column_index]))
+    workbook.save(str(out))
+
+
+def write_dataframe_workbook(df, sheet_name, out):
+    if Path(out).suffix.lower() == ".xls":
+        write_dataframe_xls(df, sheet_name, out)
+        return
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, sheet_name=sheet_name, index=False, header=False)
+
+
+def openpyxl_workbook_to_xls_stream(path):
+    import xlwt
+    from datetime import date, datetime
+    from openpyxl import load_workbook
+
+    source = load_workbook(path, data_only=True)
+    output = BytesIO()
+    try:
+        workbook = xlwt.Workbook(encoding="utf-8")
+        used_names = set()
+        date_style = xlwt.easyxf(num_format_str="DD/MM/YYYY")
+        datetime_style = xlwt.easyxf(num_format_str="DD/MM/YYYY HH:MM:SS")
+        for sheet in source.worksheets:
+            ensure_xls_dimensions(sheet.max_row, sheet.max_column, f"{Path(path).name}/{sheet.title}")
+            target = workbook.add_sheet(safe_excel_sheet_name(sheet.title, used_names))
+            for row in sheet.iter_rows():
+                for cell_obj in row:
+                    value = coerce_xls_value(cell_obj.value)
+                    if isinstance(value, datetime):
+                        target.write(cell_obj.row - 1, cell_obj.column - 1, value, datetime_style)
+                    elif isinstance(value, date):
+                        target.write(cell_obj.row - 1, cell_obj.column - 1, value, date_style)
+                    else:
+                        target.write(cell_obj.row - 1, cell_obj.column - 1, value)
+        workbook.save(output)
+    finally:
+        source.close()
+    output.seek(0)
+    return output
+
+
+def write_up_output_row(ws, output_row, max_column, data_styles, data_number_formats, values):
+    for column, value in values.items():
+        column_index = excel_col_to_index(column) + 1
+        if column_index > max_column:
+            continue
+        output_cell = ws.cell(output_row, column_index)
+        output_cell._style = copy(data_styles[column_index - 1])
+        output_cell.number_format = data_number_formats[column_index - 1]
+        output_cell.value = clean_up_cell_value(value)
+
+
+def is_processed_product_data_row(processed_df, row, code_col, invoice_col, qty_col):
+    code = raw_text(cell(processed_df, row, code_col))
+    invoice_no = raw_text(cell(processed_df, row, invoice_col))
+    quantity = parse_price(cell(processed_df, row, qty_col))
+    if not code or not invoice_no or quantity is None:
+        return False
+    return rm_accents(code).casefold() != "ma vt"
+
+
+def up_source_value(processed_df, row, col, default=""):
+    return clean_up_cell_value(cell(processed_df, row, col), default)
+
+
+def up_source_number(processed_df, row, col, default=""):
+    value = parse_price(cell(processed_df, row, col))
+    return default if value is None else value
+
+
+def create_up_mua_vao_workbook(processed_df, progress_callback=None):
+    template_path = up_workbook_template_path("mau_mua_vao_up.xlsx")
+    if not template_path:
+        raise ValueError("Không tìm thấy file mẫu mau_mua_vao_up.xlsx để tạo file UP mua vào.")
+    validate_fast_import_processed_dataframe(processed_df, "FDI mua vào đã xử lý")
+
+    wb, ws, max_column, data_styles, data_number_formats = prepare_up_workbook(template_path, "UP Mua vào", "UP Mua vào")
+    source_indexes = {name: excel_col_to_index(name) for name in ["A", "B", "C", "D", "F", "G", "L", "O", "P", "R", "V", "AQ", "AR"]}
     inventory_indexes = processed_inventory_column_indexes(processed_df, source_indexes["L"])
     output_row = 2
     for row in range(len(processed_df)):
-        report_loop_progress(progress_callback, row + 1, len(processed_df), "Đang dựng file nhập kho", interval=200)
-        code = raw_text(cell(processed_df, row, source_indexes["L"]))
-        invoice_no = raw_text(cell(processed_df, row, source_indexes["C"]))
-        quantity = parse_price(cell(processed_df, row, source_indexes["O"]))
-        if not code or not invoice_no or quantity is None or rm_accents(code).casefold() == "ma vt":
+        report_loop_progress(progress_callback, row + 1, len(processed_df), "Đang dựng file UP mua vào", interval=200)
+        if not is_processed_product_data_row(processed_df, row, source_indexes["L"], source_indexes["C"], source_indexes["O"]):
             continue
 
-        tax_code, tax_rate = up_ban_ra_tax_values(cell(processed_df, row, source_indexes["R"]))
+        seller_mst = up_source_value(processed_df, row, source_indexes["G"])
+        invoice_no = up_source_value(processed_df, row, source_indexes["C"])
+        invoice_date = up_source_value(processed_df, row, source_indexes["D"])
+        tax_code, _ = up_ban_ra_tax_values(cell(processed_df, row, source_indexes["R"]))
         values = {
-            "A": cell(processed_df, row, source_indexes["J"]),
-            "E": cell(processed_df, row, source_indexes["C"]),
-            "F": cell(processed_df, row, source_indexes["D"]),
-            "H": cell(processed_df, row, source_indexes["O"]),
-            "O": cell(processed_df, row, source_indexes["P"]),
-            "P": cell(processed_df, row, source_indexes["Q"]),
+            "A": seller_mst,
+            "B": "",
+            "F": invoice_no,
+            "G": invoice_date,
+            "H": "",
+            "I": "",
+            "J": up_source_value(processed_df, row, inventory_indexes["ma_kho"]) if inventory_indexes["ma_kho"] is not None else "",
+            "K": up_source_value(processed_df, row, source_indexes["L"]),
+            "L": up_source_value(processed_df, row, source_indexes["O"]),
+            "M": up_source_value(processed_df, row, source_indexes["P"]),
+            "N": up_source_value(processed_df, row, source_indexes["V"]),
+            "O": up_source_value(processed_df, row, inventory_indexes["tk_vat_tu"]) if inventory_indexes["tk_vat_tu"] is not None else "",
+            "R": invoice_no,
+            "S": invoice_date,
+            "T": up_source_value(processed_df, row, source_indexes["A"]),
+            "U": up_source_value(processed_df, row, source_indexes["B"]),
             "V": tax_code,
-            "W": tax_rate,
-            "Y": cell(processed_df, row, source_indexes["W"]),
-            "Z": "1311",
-            "AA": "",
-            "AB": cell(processed_df, row, inventory_indexes["tk_vat_tu"]) if inventory_indexes["tk_vat_tu"] is not None else "",
-            "AC": "632",
-            "AE": "33311",
-            "AF": cell(processed_df, row, inventory_indexes["ma_kho"]) if inventory_indexes["ma_kho"] is not None else "",
-            "AG": cell(processed_df, row, source_indexes["L"]),
-            "AH": "Xuất bán hàng",
-            "AK": 1,
-            "AQ": "CTY",
-            "AS": 1,
         }
-        for col in range(1, max_column + 1):
-            output_cell = ws.cell(output_row, col)
-            output_cell._style = copy(data_styles[col - 1])
-            output_cell.number_format = data_number_formats[col - 1]
-            output_cell.value = ""
-        for column, value in values.items():
-            ws[f"{column}{output_row}"] = "" if pd.isna(value) else value
+        write_up_output_row(ws, output_row, max_column, data_styles, data_number_formats, values)
         output_row += 1
 
     stream = BytesIO()
     if progress_callback:
-        progress_callback(1, 2, "Đang lưu bộ nhớ file nhập kho")
+        progress_callback(1, 2, "Đang lưu bộ nhớ file UP mua vào")
     wb.save(stream)
     if progress_callback:
-        progress_callback(2, 2, "Đã tạo file nhập kho")
+        progress_callback(2, 2, "Đã tạo file UP mua vào")
     stream.seek(0)
     return stream
 
 
-def up_ban_ra_output_path(formatted_path):
-    return formatted_path.with_name(f"{formatted_path.stem}_nhap_kho.xlsx")
+def create_up_ban_ra_workbook(processed_df, progress_callback=None):
+    template_path = up_workbook_template_path("mau_ban_ra_up.xlsx", "mau HD ban ra.xlsx")
+    if not template_path:
+        raise ValueError("Không tìm thấy file mẫu UP bán ra để tạo file UP bán ra.")
+    validate_fast_import_processed_dataframe(processed_df, "FDI bán ra đã xử lý")
+
+    wb, ws, max_column, data_styles, data_number_formats = prepare_up_workbook(template_path, "UP Bán ra", "UP Bán ra")
+    source_indexes = {name: excel_col_to_index(name) for name in ["C", "D", "I", "J", "L", "M", "O", "P", "R", "S", "V", "W", "AQ", "AR"]}
+    inventory_indexes = processed_inventory_column_indexes(processed_df, source_indexes["L"])
+    output_row = 2
+    for row in range(len(processed_df)):
+        report_loop_progress(progress_callback, row + 1, len(processed_df), "Đang dựng file UP bán ra", interval=200)
+        if not is_processed_product_data_row(processed_df, row, source_indexes["L"], source_indexes["C"], source_indexes["O"]):
+            continue
+
+        tax_code, tax_rate = up_ban_ra_tax_values(cell(processed_df, row, source_indexes["R"]))
+        values = {
+            "A": up_source_value(processed_df, row, source_indexes["J"]),
+            "B": "",
+            "E": up_source_value(processed_df, row, source_indexes["C"]),
+            "F": up_source_value(processed_df, row, source_indexes["D"]),
+            "H": up_source_value(processed_df, row, source_indexes["O"]),
+            "I": up_source_value(processed_df, row, source_indexes["P"]),
+            "J": up_source_value(processed_df, row, source_indexes["S"]),
+            "M": "",
+            "N": "",
+            "O": up_source_value(processed_df, row, source_indexes["P"]),
+            "P": up_source_value(processed_df, row, source_indexes["V"]),
+            "V": tax_code,
+            "W": tax_rate,
+            "Y": up_source_value(processed_df, row, source_indexes["W"]),
+            "AB": up_source_value(processed_df, row, inventory_indexes["tk_vat_tu"]) if inventory_indexes["tk_vat_tu"] is not None else "",
+            "AF": up_source_value(processed_df, row, inventory_indexes["ma_kho"]) if inventory_indexes["ma_kho"] is not None else "",
+            "AG": up_source_value(processed_df, row, source_indexes["L"]),
+            "AH": up_source_value(processed_df, row, source_indexes["M"]),
+        }
+        write_up_output_row(ws, output_row, max_column, data_styles, data_number_formats, values)
+        output_row += 1
+
+    stream = BytesIO()
+    if progress_callback:
+        progress_callback(1, 2, "Đang lưu bộ nhớ file UP bán ra")
+    wb.save(stream)
+    if progress_callback:
+        progress_callback(2, 2, "Đã tạo file UP bán ra")
+    stream.seek(0)
+    return stream
 
 
-def process_zip_stream(formatted_path, up_path):
+FAST_HOA_DON_BAN_HANG_HEADERS = [
+    "Mã khách hàng (ma_kh)",
+    "Người mua hàng (ong_ba)",
+    "Quyển sổ (ma_qs)",
+    "Số seri (so_seri)",
+    "Số chứng từ (so_ct)",
+    "Ngày chứng từ (ngay_ct)",
+    "NVBH (ma_bp)",
+    "Số lượng:Q (so_luong)",
+    "Giá bán n.tệ:P1 (gia_nt2)",
+    "Tiền bán n.tệ:N1 (tien_nt2)",
+    "Giá vốn n.tệ:P1 (gia_nt)",
+    "Tiền vốn n.tệ:N1 (tien_nt)",
+    "Mã n.tệ (ma_nt)",
+    "Tỷ giá:R (ty_gia)",
+    "Giá bán:P0 (gia2)",
+    "Tiền bán:N0 (tien2)",
+    "Giá vốn:P0 (gia)",
+    "Tiền vốn:N0 (tien)",
+    "Tỷ lệ chiết khấu (tl_ck)",
+    "Tiền chiết khấu n.tệ:N1 (tien_ck_nt)",
+    "Tiền chiết khấu:N0 (tien_ck)",
+    "Mã thuế (ma_thue)",
+    "Thuế suất (thue_suat)",
+    "Tiền thuế n.tệ:N1 (tien_thue_nt)",
+    "Tiền thuế:N0 (tien_thue)",
+    "Mã nx (Tk nợ) (ma_nx)",
+    "Tk doanh thu (tk_dt)",
+    "Tk vật tư (tk_vt)",
+    "Tk giá vốn (tk_gv)",
+    "Tk chiết khấu (tk_ck)",
+    "Tài khoản thuế (tk_thue_co)",
+    "Mã kho  (ma_kho)",
+    "Mã vật tư (ma_vt)",
+    "Diễn giải (dien_giai)",
+    "Hạn thanh toán:N (han_tt)",
+    "Hình thức tt (ht_tt)",
+    "Loại hoá đơn (ma_gd)",
+    "Mã dự án (ma_vv_i)",
+    "Mã phí (ma_phi_i)",
+    "Mã bpht (ma_bpht_i)",
+    "Khuyến mại (km_ck)",
+    "Tk cp km (tk_km_i)",
+    "Mã ĐVCS (ma_dvcs)",
+    "Sử dụng HĐĐT (sd_hddt_yn)",
+    "Tỷ giá hđ:R (ty_gia_hd)",
+    "Thêm thông tin (xu_ly_hddt)",
+    "Thông tin thêm (gc_dc_hddt)",
+    "Mã loại (ma_loai)",
+]
+
+
+FAST_HOA_DON_MUA_HANG_HEADERS = [
+    "Mã khách hàng (ma_kh)",
+    "Người mua hàng (ong_ba)",
+    "Diễn giải (dien_giai)",
+    "Quyển sổ (ma_qs)",
+    "Mã nx (Tk có) (ma_nx)",
+    "Số chứng từ (so_ct)",
+    "Ngày chứng từ (ngay_ct)",
+    "Mã ngoại tệ (ma_nt)",
+    "Tỷ giá (ty_gia)",
+    "Mã kho  (ma_kho)",
+    "Mã vật tư (ma_vt)",
+    "Số lượng:Q (so_luong)",
+    "Giá mua chưa thuế:P0 (gia0)",
+    "Tiền mua:N0 (tien0)",
+    "Tk vật tư (tk_vt)",
+    "Mã dự án (ma_vv_i)",
+    "Mã ĐVCS (ma_dvcs)",
+    "Số HĐ thuế (so_ct0)",
+    "Ngày HĐ (ngay_ct0)",
+    "Mẫu HĐ (kh_mau_hd)",
+    "Số seri (so_seri0)",
+    "Mã thuế (ma_thue)",
+]
+
+
+FAST_DM_VAT_TU_HEADERS = [
+    "Mã vật tư (ma_vt)",
+    "Tên vật tư (ten_vt)",
+    "Đơn vị tính (dvt)",
+    "Theo dõi tồn kho (vt_ton_kho)",
+    "Tk vật tư (tk_vt)",
+    "Tk giá vốn (tk_gv)",
+    "Tk doanh thu (tk_dt)",
+    "Tk hàng bán bị trả lại (tk_tl)",
+    "Tk sp dở dang (tk_spdd)",
+    "Loại vật tư (loai_vt)",
+    "Cho sửa tk kho (sua_tk_vt)",
+    "Tk NVL (tk_nvl)",
+    "Tk chiết khấu (tk_ck)",
+    "Tk khuyến mại (tk_km)",
+    "Mã phụ (part_no)",
+    "Tên 2 (ten_vt2)",
+    "Cách tính giá tồn kho (gia_ton)",
+    "Nhóm vt 1 (nh_vt1)",
+    "Nhóm vt 2 (nh_vt2)",
+    "Nhóm vt 3 (nh_vt3)",
+    "Số lượng tồn tối thiểu:Q (sl_min)",
+    "Số lượng tồn tối đa:Q (sl_max)",
+    "Tk chênh lệch vật tư (tk_cl_vt)",
+    "Tk doanh thu nội bộ (tk_dtnb)",
+    "Ghi chú (ghi_chu)",
+    "Mã tra cứu (ma_tra_cuu)",
+    "Mã kho (ma_kho_def)",
+    "Mã t.suất (ma_thue)",
+    "Thuế suất (thue_suat)",
+    "Chỉ có ở kho này (chi_co_kho_nay)",
+]
+
+
+FAST_DM_KHACH_HANG_HEADERS = [
+    "Mã khách hàng (ma_kh)",
+    "Tên khách hàng (ten_kh)",
+    "Tên 2 (ten_kh2)",
+    "Mã số thuế (ma_so_thue)",
+    "Địa chỉ (dia_chi)",
+    "Điện thoại (dien_thoai)",
+    "Fax (fax)",
+    "Mail (e_mail)",
+    "Đối tác (doi_tac)",
+    "Tên ngân hàng (ten_nh)",
+    "Ghi chú (ghi_chu)",
+    "Mã điều khoản thanh toán ngầm định (ma_thck)",
+    "Tk mặc định (tk)",
+    "Nhóm kh 1 (nh_kh1)",
+    "Nhóm kh 2 (nh_kh2)",
+    "Nhóm kh 3 (nh_kh3)",
+    "Tài khoản ngân hàng (tk_nh)",
+    "Tỉnh thành (tinh_thanh)",
+    "Mã tra cứu (ma_tra_cuu)",
+]
+
+FAST_DUPLICATE_PURCHASE_REPORT_HEADERS = [
+    "Số chứng từ",
+    "Mã khách hàng",
+    "Tên công ty",
+    "Ngày chứng từ",
+    "Dòng FDI",
+    "Mã VT",
+    "Mã kho",
+    "TK vật tư",
+    "Sheet FAST",
+]
+
+
+def processed_vietmax_source_indexes():
+    return {name: excel_col_to_index(name) for name in ["A", "B", "C", "D", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "R", "S", "V", "W", "AQ", "AR"]}
+
+
+def fast_import_cell_value(processed_df, row, column, indexes):
+    return up_source_value(processed_df, row, indexes[column])
+
+
+def fast_import_cell_number(processed_df, row, column, indexes):
+    return up_source_number(processed_df, row, indexes[column], 0)
+
+
+def fast_import_tax_info(processed_df, row, indexes):
+    tax_code, tax_rate = up_ban_ra_tax_values(cell(processed_df, row, indexes["R"]))
+    return tax_code, tax_rate or 0
+
+
+def validate_fast_import_processed_dataframe(processed_df, label="FDI đã xử lý"):
+    indexes = processed_vietmax_source_indexes()
+    if processed_df is None or processed_df.empty:
+        raise ValueError(f"File {label} không có dữ liệu.")
+    required_indexes = [indexes["C"], indexes["L"], indexes["O"]]
+    if processed_df.shape[1] <= max(required_indexes):
+        raise ValueError(f"File {label} không đủ cột FDI mặc định để đọc số hóa đơn, mã VT và số lượng.")
+    inventory_indexes = processed_inventory_column_indexes(processed_df, indexes["L"])
+    missing_columns = []
+    if inventory_indexes["tk_vat_tu"] is None:
+        missing_columns.append("TK vật tư")
+    if inventory_indexes["ma_kho"] is None:
+        missing_columns.append("Mã kho")
+    if missing_columns:
+        raise ValueError(f"File {label} thiếu cột {', '.join(missing_columns)}. Hãy dùng file FDI đã xử lý từ app, có đủ TK vật tư và Mã kho.")
+
+    total_rows = 0
+    missing_rows = []
+    for row in range(len(processed_df)):
+        if not is_processed_product_data_row(processed_df, row, indexes["L"], indexes["C"], indexes["O"]):
+            continue
+        total_rows += 1
+        tk_vat_tu = raw_text(cell(processed_df, row, inventory_indexes["tk_vat_tu"]))
+        ma_kho = raw_text(cell(processed_df, row, inventory_indexes["ma_kho"]))
+        if not tk_vat_tu or not ma_kho:
+            missing_rows.append({
+                "row": row + 1,
+                "invoice_no": raw_text(cell(processed_df, row, indexes["C"])),
+                "ma_vt": raw_text(cell(processed_df, row, indexes["L"])),
+                "tk_vat_tu": tk_vat_tu,
+                "ma_kho": ma_kho,
+            })
+    if not total_rows:
+        raise ValueError(f"File {label} chưa có dòng hàng hóa FDI đã xử lý hợp lệ.")
+    if missing_rows:
+        examples = ", ".join(
+            f"dòng {item['row']} HD {item['invoice_no']} mã {item['ma_vt']}"
+            for item in missing_rows[:5]
+        )
+        raise ValueError(f"File {label} có {len(missing_rows)}/{total_rows} dòng hàng hóa thiếu TK vật tư hoặc Mã kho. Ví dụ: {examples}.")
+    return {
+        "valid_rows": total_rows,
+        "tk_vat_tu_col": index_to_excel_col(inventory_indexes["tk_vat_tu"]),
+        "ma_kho_col": index_to_excel_col(inventory_indexes["ma_kho"]),
+    }
+
+
+def fast_tk_doanh_thu(tk_vat_tu):
+    tk = raw_text(tk_vat_tu)
+    if tk.startswith("152"):
+        return "5111"
+    if tk.startswith("155"):
+        return "5112"
+    return "5112"
+
+
+def fast_loai_vat_tu(tk_vat_tu):
+    tk = raw_text(tk_vat_tu)
+    return "21" if tk.startswith("152") else "51"
+
+
+def fast_processed_rows(processed_df, progress_callback=None, label="Đang đọc file đã xử lý"):
+    indexes = processed_vietmax_source_indexes()
+    validate_fast_import_processed_dataframe(processed_df, label)
+    inventory_indexes = processed_inventory_column_indexes(processed_df, indexes["L"])
+    rows = []
+    for row in range(len(processed_df)):
+        report_loop_progress(progress_callback, row + 1, len(processed_df), label, interval=500)
+        if not is_processed_product_data_row(processed_df, row, indexes["L"], indexes["C"], indexes["O"]):
+            continue
+        ma_vt = fast_import_cell_value(processed_df, row, "L", indexes)
+        product = fast_import_cell_value(processed_df, row, "M", indexes)
+        unit = fast_import_cell_value(processed_df, row, "N", indexes)
+        qty = fast_import_cell_number(processed_df, row, "O", indexes)
+        price = fast_import_cell_number(processed_df, row, "P", indexes)
+        amount = fast_import_cell_number(processed_df, row, "V", indexes)
+        tax_amount = fast_import_cell_number(processed_df, row, "W", indexes)
+        tk_vat_tu = up_source_value(processed_df, row, inventory_indexes["tk_vat_tu"]) if inventory_indexes["tk_vat_tu"] is not None else ""
+        ma_kho = up_source_value(processed_df, row, inventory_indexes["ma_kho"]) if inventory_indexes["ma_kho"] is not None else ""
+        tax_code, tax_rate = fast_import_tax_info(processed_df, row, indexes)
+        rows.append({
+            "row_index": row,
+            "mau_hd": fast_import_cell_value(processed_df, row, "A", indexes),
+            "seri": fast_import_cell_value(processed_df, row, "B", indexes),
+            "invoice_no": fast_import_cell_value(processed_df, row, "C", indexes),
+            "invoice_date": fast_import_cell_value(processed_df, row, "D", indexes),
+            "seller_name": fast_import_cell_value(processed_df, row, "F", indexes),
+            "seller_mst": fast_import_cell_value(processed_df, row, "G", indexes),
+            "seller_address": fast_import_cell_value(processed_df, row, "H", indexes),
+            "buyer_name": fast_import_cell_value(processed_df, row, "I", indexes),
+            "buyer_mst": fast_import_cell_value(processed_df, row, "J", indexes),
+            "buyer_address": fast_import_cell_value(processed_df, row, "K", indexes),
+            "ma_vt": ma_vt,
+            "product": product,
+            "unit": unit,
+            "qty": qty,
+            "price": price,
+            "amount": amount,
+            "tax_amount": tax_amount,
+            "currency": fast_import_cell_value(processed_df, row, "AQ", indexes) or "VND",
+            "exchange_rate": fast_import_cell_number(processed_df, row, "AR", indexes) or 1,
+            "tax_code": tax_code,
+            "tax_rate": tax_rate,
+            "tk_vat_tu": tk_vat_tu,
+            "ma_kho": ma_kho,
+        })
+    return rows
+
+
+def fast_import_fill_sheet(workbook, headers, rows, title):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    ws = workbook.create_sheet(title[:31])
+    ws.title = title[:31]
+    header_fill = PatternFill("solid", fgColor="D9EAD3")
+    for col_index, header in enumerate(headers, start=1):
+        header_cell = ws.cell(1, col_index, header)
+        header_cell.fill = header_fill
+        header_cell.font = Font(bold=True)
+        header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, row_values in enumerate(rows, start=2):
+        for col_index, value in enumerate(row_values, start=1):
+            ws.cell(row_index, col_index, clean_up_cell_value(value))
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col_index, header in enumerate(headers, start=1):
+        letter = get_column_letter(col_index)
+        width = min(max(len(str(header)) + 2, 12), 32)
+        ws.column_dimensions[letter].width = width
+    return ws
+
+
+def write_tabular_xls_sheet(workbook, used_names, headers, rows, title):
+    import xlwt
+
+    rows = rows if isinstance(rows, list) else []
+    headers = headers if isinstance(headers, list) else []
+    ensure_xls_dimensions(len(rows) + 1, len(headers), title)
+    ws = workbook.add_sheet(safe_excel_sheet_name(title, used_names))
+    header_style = xlwt.easyxf("font: bold on; align: horiz center, vert center, wrap on; pattern: pattern solid, fore_colour pale_blue;")
+    for col_index, header in enumerate(headers):
+        ws.write(0, col_index, coerce_xls_value(header), header_style)
+    width_samples = [len(str(header or "")) for header in headers]
+    for row_index, row_values in enumerate(rows, start=1):
+        for col_index, value in enumerate(row_values):
+            ws.write(row_index, col_index, coerce_xls_value(value))
+            if col_index < len(width_samples) and row_index <= 200:
+                width_samples[col_index] = max(width_samples[col_index], len(str(clean_up_cell_value(value, ""))))
+    for col_index, width in enumerate(width_samples):
+        ws.col(col_index).width = min(max(width + 2, 10), 36) * 256
+    return ws
+
+
+def tabular_xls_workbook(sheets):
+    import xlwt
+
+    workbook = xlwt.Workbook(encoding="utf-8")
+    used_names = set()
+    iterable = sheets.items() if hasattr(sheets, "items") else sheets
+    for title, (headers, rows) in iterable:
+        write_tabular_xls_sheet(workbook, used_names, headers, rows, title)
+    stream = BytesIO()
+    workbook.save(stream)
+    stream.seek(0)
+    return stream
+
+
+def fast_import_workbook(headers, rows, title):
+    return tabular_xls_workbook({title: (headers, rows)})
+
+
+def fast_import_row(headers, values_by_column):
+    row = [""] * len(headers)
+    for column, value in values_by_column.items():
+        column_index = int(column) - 1
+        if 0 <= column_index < len(row):
+            row[column_index] = value
+    return row
+
+
+def fast_import_invoice_sort_key(value):
+    text = raw_text(value)
+    numeric = parse_price(text)
+    if numeric is not None:
+        return (0, numeric, text)
+    return (1, text.casefold())
+
+
+def split_fast_purchase_invoice_rows(items):
+    invoice_companies = {}
+    for item in items:
+        source = item.get("source") or {}
+        invoice_no = raw_text(source.get("invoice_no"))
+        company_key = raw_text(source.get("seller_mst")) or raw_text(source.get("seller_name"))
+        if not invoice_no or not company_key:
+            continue
+        invoice_companies.setdefault(invoice_no, [])
+        if company_key not in invoice_companies[invoice_no]:
+            invoice_companies[invoice_no].append(company_key)
+
+    conflict_invoices = {
+        invoice_no
+        for invoice_no, companies in invoice_companies.items()
+        if len(companies) > 1
+    }
+    if not conflict_invoices:
+        return {"Hoadonmuahang": [item["row"] for item in items]}, []
+
+    max_sheets = max(len(invoice_companies[invoice_no]) for invoice_no in conflict_invoices)
+    sheet_items = [[] for _ in range(max_sheets)]
+    target_sheet_by_item = {}
+    for index, item in enumerate(items):
+        source = item.get("source") or {}
+        invoice_no = raw_text(source.get("invoice_no"))
+        company_key = raw_text(source.get("seller_mst")) or raw_text(source.get("seller_name"))
+        if invoice_no in conflict_invoices:
+            companies = sorted(invoice_companies[invoice_no], key=lambda value: value.casefold())
+            sheet_index = companies.index(company_key) if company_key in companies else 0
+        else:
+            sheet_index = 0
+        sheet_name = f"Hoadonmuahang-{sheet_index + 1}"
+        sheet_items[sheet_index].append(item["row"])
+        target_sheet_by_item[index] = sheet_name
+
+    report_rows = []
+    for invoice_no in sorted(conflict_invoices, key=fast_import_invoice_sort_key):
+        conflict_items = [
+            (index, item)
+            for index, item in enumerate(items)
+            if raw_text((item.get("source") or {}).get("invoice_no")) == invoice_no
+        ]
+        conflict_items.sort(key=lambda pair: (
+            raw_text((pair[1].get("source") or {}).get("seller_mst")).casefold(),
+            int((pair[1].get("source") or {}).get("row_index") or 0),
+        ))
+        for index, item in conflict_items:
+            source = item.get("source") or {}
+            report_rows.append([
+                source.get("invoice_no"),
+                source.get("seller_mst"),
+                source.get("seller_name"),
+                source.get("invoice_date"),
+                int(source.get("row_index") or 0) + 1,
+                source.get("ma_vt"),
+                source.get("ma_kho"),
+                source.get("tk_vat_tu"),
+                target_sheet_by_item.get(index, "Hoadonmuahang-1"),
+            ])
+
+    purchase_sheets = {
+        f"Hoadonmuahang-{index + 1}": rows
+        for index, rows in enumerate(sheet_items)
+        if rows or index == 0
+    }
+    return purchase_sheets, report_rows
+
+
+def fast_import_sheet_rows(purchase_df=None, sales_df=None, progress_callback=None):
+    purchase_rows = fast_processed_rows(purchase_df, progress_callback, "Đang đọc FDI mua vào") if purchase_df is not None else []
+    sales_rows = fast_processed_rows(sales_df, progress_callback, "Đang đọc FDI bán ra") if sales_df is not None else []
+    total_steps = 4
+    done_steps = 0
+
+    def mark(label):
+        nonlocal done_steps
+        done_steps += 1
+        if progress_callback:
+            progress_callback(done_steps, total_steps, label)
+
+    mua_vao_items = []
+    for row in purchase_rows:
+        import_row = fast_import_row(FAST_HOA_DON_MUA_HANG_HEADERS, {
+            1: row["seller_mst"],
+            3: f"Mua hàng nhập kho HD{row['invoice_no']}",
+            5: "331",
+            6: row["invoice_no"],
+            7: row["invoice_date"],
+            8: row["currency"] or "VND",
+            9: row["exchange_rate"] or 1,
+            10: row["ma_kho"],
+            11: row["ma_vt"],
+            12: row["qty"],
+            13: row["price"],
+            14: row["amount"],
+            15: row["tk_vat_tu"],
+            17: "CTY",
+            18: row["invoice_no"],
+            19: row["invoice_date"],
+            22: row["tax_code"],
+        })
+        mua_vao_items.append({"row": import_row, "source": row})
+    purchase_sheet_rows, duplicate_purchase_report_rows = split_fast_purchase_invoice_rows(mua_vao_items)
+    mark("Đã dựng dữ liệu Hoadonmuahang")
+
+    ban_ra_rows = []
+    for row in sales_rows:
+        tk_dt = fast_tk_doanh_thu(row["tk_vat_tu"])
+        ban_ra_rows.append(fast_import_row(FAST_HOA_DON_BAN_HANG_HEADERS, {
+            1: row["buyer_mst"],
+            5: row["invoice_no"],
+            6: row["invoice_date"],
+            8: row["qty"],
+            15: row["price"],
+            16: row["amount"],
+            22: row["tax_code"],
+            25: row["tax_amount"],
+            26: "131",
+            27: tk_dt,
+            28: row["tk_vat_tu"],
+            29: "632",
+            31: "33311",
+            32: row["ma_kho"],
+            33: row["ma_vt"],
+            34: "Xuất bán hàng",
+            37: "1",
+            43: "CTY",
+            45: row["exchange_rate"] or 1,
+        }))
+    mark("Đã dựng dữ liệu Hoadonbanhang")
+
+    product_rows_by_code = {}
+    for row in purchase_rows + sales_rows:
+        ma_vt = raw_text(row.get("ma_vt"))
+        if not ma_vt or ma_vt in product_rows_by_code:
+            continue
+        tk_vat_tu = row.get("tk_vat_tu") or ""
+        product_rows_by_code[ma_vt] = fast_import_row(FAST_DM_VAT_TU_HEADERS, {
+            1: ma_vt,
+            2: row.get("product") or "",
+            3: row.get("unit") or "",
+            4: 1,
+            5: tk_vat_tu,
+            6: "632",
+            7: fast_tk_doanh_thu(tk_vat_tu),
+            10: fast_loai_vat_tu(tk_vat_tu),
+            11: 1,
+            17: 4,
+            23: "632",
+        })
+    dm_vat_tu_rows = list(product_rows_by_code.values())
+    mark("Đã dựng dữ liệu DMvat tu")
+
+    customer_rows_by_mst = {}
+    for row, role in [(row, "seller") for row in purchase_rows] + [(row, "buyer") for row in sales_rows]:
+        mst = raw_text(row.get(f"{role}_mst"))
+        if not mst or mst in customer_rows_by_mst:
+            continue
+        name = row.get(f"{role}_name") or ""
+        address = row.get(f"{role}_address") or ""
+        customer_rows_by_mst[mst] = fast_import_row(FAST_DM_KHACH_HANG_HEADERS, {
+            1: mst,
+            2: name,
+            4: mst,
+            5: address,
+        })
+    dm_khach_hang_rows = list(customer_rows_by_mst.values())
+    mark("Đã dựng dữ liệu DMkhachhang")
+
+    result = {}
+    for title, rows in purchase_sheet_rows.items():
+        result[title] = (FAST_HOA_DON_MUA_HANG_HEADERS, rows)
+    result["Bao_cao_trung_so_ct"] = (FAST_DUPLICATE_PURCHASE_REPORT_HEADERS, duplicate_purchase_report_rows)
+    result.update({
+        "Hoadonbanhang": (FAST_HOA_DON_BAN_HANG_HEADERS, ban_ra_rows),
+        "DMvat_tu": (FAST_DM_VAT_TU_HEADERS, dm_vat_tu_rows),
+        "DMkhachhang": (FAST_DM_KHACH_HANG_HEADERS, dm_khach_hang_rows),
+    })
+    return result
+
+
+def fast_import_multi_sheet_workbook(purchase_df=None, sales_df=None, progress_callback=None):
+    sheets = fast_import_sheet_rows(purchase_df, sales_df, progress_callback)
+    return tabular_xls_workbook(sheets)
+
+
+def fast_import_package_zip(purchase_df=None, sales_df=None, progress_callback=None):
+    sheets = fast_import_sheet_rows(purchase_df, sales_df, progress_callback)
+
     stream = BytesIO()
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(formatted_path, formatted_path.name)
-        archive.write(up_path, up_path.name)
+        for title, (headers, rows) in sheets.items():
+            archive.writestr(f"{title}.xls", fast_import_workbook(headers, rows, title).getvalue())
+    stream.seek(0)
+    return stream
+
+
+def up_mua_vao_output_path(formatted_path):
+    return formatted_path.with_name(f"{formatted_path.stem}_UP_mua_vao.xlsx")
+
+
+def up_ban_ra_output_path(formatted_path):
+    return formatted_path.with_name(f"{formatted_path.stem}_UP_ban_ra.xlsx")
+
+
+def process_zip_stream(*paths):
+    stream = BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in paths:
+            archive.write(path, path.name)
     stream.seek(0)
     return stream
 
@@ -3560,9 +4769,9 @@ def safe_excel_sheet_name(value, used_names):
 
 
 def safe_excel_filename(value):
-    stem = Path(str(value or "bao_cao_ban_hang.xlsx")).stem or "bao_cao_ban_hang"
+    stem = Path(str(value or "bao_cao_ban_hang.xls")).stem or "bao_cao_ban_hang"
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .") or "bao_cao_ban_hang"
-    return f"{stem}.xlsx"
+    return f"{stem}.xls"
 
 
 def coerce_excel_value(value):
@@ -3574,61 +4783,25 @@ def coerce_excel_value(value):
 
 
 def make_excel_workbook(sheets):
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    used_names = set()
-    header_fill = PatternFill("solid", fgColor="EAF4FF")
-    total_fill = PatternFill("solid", fgColor="F7FBFF")
-    bold_font = Font(bold=True)
-
+    tabular_sheets = []
     for sheet in sheets:
         rows = sheet.get("rows") if isinstance(sheet, dict) else []
         rows = rows if isinstance(rows, list) else []
-        ws = wb.create_sheet(safe_excel_sheet_name(sheet.get("name") if isinstance(sheet, dict) else "Sheet", used_names))
+        title = sheet.get("name") if isinstance(sheet, dict) else "Sheet"
         headers = sheet.get("headers") if isinstance(sheet, dict) and isinstance(sheet.get("headers"), list) else []
         headers = [str(header) for header in headers if str(header).strip()]
         if not headers:
             headers = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
         if not headers:
-            ws.append(["Không có dữ liệu"])
+            tabular_sheets.append((title, (["Không có dữ liệu"], [])))
             continue
-
-        ws.append(headers)
-        for cell in ws[1]:
-            cell.font = bold_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
+        table_rows = []
         for row in rows:
-            values = [coerce_excel_value(row.get(header)) if isinstance(row, dict) else "" for header in headers]
-            ws.append(values)
-            if str(row.get(headers[0], "") if isinstance(row, dict) else "").upper() == "TỔNG CỘNG":
-                for cell in ws[ws.max_row]:
-                    cell.font = bold_font
-                    cell.fill = total_fill
-
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for column_index, header in enumerate(headers, start=1):
-            letter = get_column_letter(column_index)
-            width = min(max(len(str(header)) + 4, 12), 36)
-            for cell in ws[letter][1: min(ws.max_row, 50)]:
-                width = min(max(width, len(str(cell.value or "")) + 2), 36)
-                if isinstance(cell.value, (int, float)):
-                    cell.number_format = '#,##0.00'
-                    cell.alignment = Alignment(horizontal="right")
-            ws.column_dimensions[letter].width = width
-
-    if not wb.worksheets:
-        wb.create_sheet("Bao cao")
-    stream = BytesIO()
-    wb.save(stream)
-    stream.seek(0)
-    return stream
+            table_rows.append([coerce_excel_value(row.get(header)) if isinstance(row, dict) else "" for header in headers])
+        tabular_sheets.append((title, (headers, table_rows)))
+    if not tabular_sheets:
+        tabular_sheets.append(("Bao cao", (["Không có dữ liệu"], [])))
+    return tabular_xls_workbook(tabular_sheets)
 
 
 @app.route("/api/config", methods=["GET"])
@@ -3661,8 +4834,8 @@ def mapping():
         return jsonify({"error": "No file uploaded."}), 400
     original = f.filename
     ext = Path(original).suffix.lower()
-    if ext not in [".xlsx", ".xlsm"]:
-        return jsonify({"error": "Please upload .xlsx or .xlsm only."}), 400
+    if ext not in [".xls", ".xlsx", ".xlsm"]:
+        return jsonify({"error": "Please upload .xls, .xlsx or .xlsm only."}), 400
     saved = f"{uuid.uuid4().hex}{ext}"
     path = UPLOAD_DIR / saved
     f.save(path)
@@ -3747,14 +4920,14 @@ def export_price_report():
         return jsonify({"error": "Không có dữ liệu để xuất Excel."}), 400
     try:
         workbook = make_excel_workbook(sheets)
-        filename = safe_excel_filename(data.get("filename") or "bao_cao_ban_hang.xlsx")
+        filename = safe_excel_filename(data.get("filename") or "bao_cao_ban_hang.xls")
     except Exception as e:
         return jsonify({"error": str(e)}), 400
     return send_file(
         workbook,
         as_attachment=True,
         download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype=XLS_MEDIA_TYPE,
     )
 
 
@@ -3767,11 +4940,8 @@ def process():
     if not path.exists():
         return jsonify({"error": "Uploaded file was not found. Please upload again."}), 400
     try:
-        out = resolve_output_path(original, data.get("output_path", ""))
-        processed_df = process_workbook(path, out, data)
-        up_stream = create_up_ban_ra_workbook(processed_df)
-        up_out = up_ban_ra_output_path(out)
-        up_out.write_bytes(up_stream.getvalue())
+        out = resolve_output_path(original, "")
+        process_workbook(path, out, data)
         cfg = load_config()
         profile = profile_key(data.get("profile", cfg.get("selected_profile", "son_phuong")))
         uses_price_rules = profile == "cao_thanh"
@@ -3796,17 +4966,15 @@ def process():
             "default_inventory_pair_id": str(data.get("default_inventory_pair_id", old_profile.get("default_inventory_pair_id", "")) or "").strip(),
             "inventory_pair_rules": normalize_inventory_pair_rules(data.get("inventory_pair_rules") or old_profile.get("inventory_pair_rules") or []),
             "include_company_prefix": data.get("include_company_prefix") is not False,
-            "output_path": data.get("output_path", ""),
         })
         save_config(cfg)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-    zip_name = f"{Path(original).stem}_ket_qua_xu_ly.zip"
     return send_file(
-        process_zip_stream(out, up_out),
+        out,
         as_attachment=True,
-        download_name=zip_name,
-        mimetype="application/zip",
+        download_name=out.name,
+        mimetype=XLS_MEDIA_TYPE,
     )
 
 

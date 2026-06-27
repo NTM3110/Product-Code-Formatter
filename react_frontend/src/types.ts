@@ -28,7 +28,7 @@ export type OperationProgress = {
 };
 
 export type ProcessResult = {
-  blob: Blob;
+  blob?: Blob;
   processedSavedName: string;
 };
 
@@ -50,6 +50,9 @@ export type GenericAnalyzeResult = {
   prefix_strategy?: string;
   prefix_mst_digits?: number;
   prefix_strategy_values?: Record<string, Record<string, string>>;
+  product_review_merges?: unknown[];
+  price_range_rules?: Record<string, unknown>;
+  price_adjust_all_percent?: number;
   columns?: Record<string, unknown>;
 };
 
@@ -258,7 +261,8 @@ export type InventoryRule = {
 export type ReviewRow = {
   confirmed?: boolean;
   code_choice?: 'current' | 'similar' | 'split' | string;
-  review_group?: 'dimension_diff' | string;
+  review_group?: 'dimension_diff' | 'similar_form' | string;
+  comparison_scope?: 'all_companies' | 'same_company' | string;
   dimension_only?: boolean;
   product?: string;
   code?: string;
@@ -271,6 +275,7 @@ export type ReviewRow = {
   similar_unit?: string;
   similar_company?: string;
   similar_mst?: string;
+  similar_company_key?: string;
   diff_html?: string;
   similarity?: number | string;
   invoice_no?: string;
