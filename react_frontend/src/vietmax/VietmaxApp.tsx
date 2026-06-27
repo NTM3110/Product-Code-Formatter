@@ -2,19 +2,9 @@ import { Fragment, useEffect, useMemo, useState } from 'react';
 import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel, validateFastImportProcessedFile } from '../api';
 import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, LicenseStatus, MatchRow, OperationProgress, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from '../types';
 import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
+import { StageNavigation } from './StageNavigation';
+import { isGenericProfileKey, isStageId, profiles, stagesForProfile, type PrefixPresetStrategy, type ProfileKey, type StageDefinition, type StageId, type StagePhase } from './workflowStages';
 
-type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax';
-type StageId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
-type StagePhase = 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'fast';
-
-type StageDefinition = {
-  id: StageId;
-  label: string;
-  phase: StagePhase;
-  short: string;
-};
-
-type PrefixPresetStrategy = 'last_2_words' | 'last_3_mst' | '2_words_mst';
 type PrefixStrategyValues = Record<PrefixPresetStrategy, Record<string, string>>;
 type InventoryConfigScope = 'purchase' | 'sales' | 'generic';
 
@@ -29,10 +19,6 @@ type GenericColumns = {
   invoice_status_col: string;
   invoice_status_skip_values: string[];
 };
-
-function isStageId(value: unknown): value is StageId {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 15;
-}
 
 type WorkflowState = {
   stage: StageId;
@@ -135,63 +121,6 @@ function defaultGenericColumns(): GenericColumns {
     invoice_status_col: 'AJ',
     invoice_status_skip_values: defaultInvoiceStatusSkipValues,
   };
-}
-
-const profiles: Array<{ key: ProfileKey; label: string; note: string }> = [
-  { key: 'son_phuong', label: 'Sơn Phương', note: 'Sẽ migrate sau Vietmax.' },
-  { key: 'cao_thanh', label: 'Cao Thành', note: 'Sẽ migrate sau Vietmax, gồm stage lọc đơn giá.' },
-  { key: 'quang_thinh', label: 'Quang Thịnh', note: 'Sẽ migrate sau Vietmax.' },
-  { key: 'vietmax', label: 'Vietmax', note: 'Đang migrate trước: mua vào rồi bán ra, stage 1-11.' },
-];
-
-const vietmaxStages: StageDefinition[] = [
-  { id: 1, label: 'Tải file mua vào', phase: 'purchase', short: 'Tải mua vào' },
-  { id: 2, label: 'Chọn cột / preview / trạng thái', phase: 'purchase', short: 'Chọn cột' },
-  { id: 3, label: 'Công ty & prefix', phase: 'purchase', short: 'Công ty' },
-  { id: 4, label: 'Review Mã VT', phase: 'purchase', short: 'Review Mã VT' },
-  { id: 5, label: 'Tạo file mua vào', phase: 'purchase', short: 'Tạo mua vào' },
-  { id: 6, label: 'Tải file bán ra', phase: 'sales', short: 'Tải bán ra' },
-  { id: 7, label: 'Chọn cột / preview / trạng thái', phase: 'sales', short: 'Cột bán ra' },
-  { id: 8, label: 'Khớp HD mua vào', phase: 'sales', short: 'Khớp mua vào' },
-  { id: 9, label: 'Công ty & prefix', phase: 'sales', short: 'Công ty' },
-  { id: 10, label: 'Review Mã VT', phase: 'sales', short: 'Review bán ra' },
-  { id: 11, label: 'Tạo file bán ra', phase: 'sales', short: 'Tạo bán ra' },
-  { id: 12, label: 'Phân bổ tồn kho', phase: 'inventory', short: 'Phân bổ' },
-  { id: 13, label: 'Xem báo cáo tồn kho', phase: 'inventory', short: 'Báo cáo' },
-  { id: 14, label: 'Xuất file phân bổ', phase: 'inventory', short: 'Xuất file' },
-  { id: 15, label: 'Xuất FAST', phase: 'fast', short: 'Xuất FAST' },
-];
-
-const commonProfileStages: StageDefinition[] = [
-  { id: 1, label: 'Tải file', phase: 'generic', short: 'Tải file' },
-  { id: 2, label: 'Chọn cột', phase: 'generic', short: 'Chọn cột' },
-  { id: 3, label: 'Công ty & hàng hóa', phase: 'generic', short: 'Công ty' },
-  { id: 4, label: 'Xuất file', phase: 'generic', short: 'Xuất file' },
-];
-
-const priceProfileStage: StageDefinition = { id: 1, label: 'Workflow Cao Thành bán ra', phase: 'price', short: 'Cao Thành' };
-
-const caoThanhStages: StageDefinition[] = [
-  { id: 1, label: 'Tai file ban ra', phase: 'generic', short: 'Tai file' },
-  { id: 2, label: 'Chon cot', phase: 'generic', short: 'Chon cot' },
-  { id: 3, label: 'Cong ty & hang hoa', phase: 'generic', short: 'Cong ty' },
-  { id: 4, label: 'Review Ma VT', phase: 'generic', short: 'Review Ma VT' },
-  { id: 5, label: 'Loc don gia', phase: 'price', short: 'Loc gia' },
-  { id: 6, label: 'Xuat file', phase: 'generic', short: 'Xuat file' },
-];
-
-function isGenericProfileKey(value: ProfileKey) {
-  return value === 'son_phuong' || value === 'quang_thinh' || value === 'cao_thanh';
-}
-
-function stagesForProfile(profile: ProfileKey): StageDefinition[] {
-  if (profile === 'vietmax') return vietmaxStages;
-  if (profile === 'cao_thanh') return caoThanhStages;
-  return [
-    ...commonProfileStages.slice(0, 3),
-    { id: 4, label: 'Review Ma VT', phase: 'generic', short: 'Review Ma VT' },
-    { id: 5, label: 'Xuat file', phase: 'generic', short: 'Xuat file' },
-  ];
 }
 
 function initialWorkflowState(): WorkflowState {
@@ -2119,53 +2048,6 @@ export function VietmaxApp() {
     }
     return <LegacyProfileWorkspace profile={profile} label={selectedProfile.label} licenseReady={licenseReady} setShellStatus={setStatus} />;
   }
-}
-
-function StageNavigation({ stages, stage, busy, canEnterStage, goToStage }: { stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void }) {
-  const purchaseStages = stages.filter((item) => item.phase === 'purchase');
-  const salesStages = stages.filter((item) => item.phase === 'sales');
-  const inventoryStages = stages.filter((item) => item.phase === 'inventory');
-  const fastStages = stages.filter((item) => item.phase === 'fast');
-  const shellStages = stages.filter((item) => item.phase === 'generic' || item.phase === 'price');
-
-  if (purchaseStages.length || salesStages.length || inventoryStages.length || fastStages.length) {
-    return (
-      <div className="stage-groups" aria-label="Stage navigation">
-        <StageGroup title="Mua vào" stages={purchaseStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
-        <StageGroup title="Bán ra" stages={salesStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
-        <StageGroup title="Tồn kho" stages={inventoryStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
-        <StageGroup title="Xuất FAST" stages={fastStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
-      </div>
-    );
-  }
-
-  return (
-    <div className="stage-groups" aria-label="Stage navigation">
-      <StageGroup title="Profile" stages={shellStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
-    </div>
-  );
-}
-
-function StageGroup({ title, stages, stage, busy, canEnterStage, goToStage }: { title: string; stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void }) {
-  return (
-    <div className="stage-group">
-      <span className="stage-group-label">{title}</span>
-      <div className="stage-group-pills">
-        {stages.map((item) => (
-          <button
-            key={item.id}
-            className={`step-pill ${item.id === stage ? 'active' : ''} ${item.phase}`}
-            disabled={!canEnterStage(item.id) || busy}
-            onClick={() => goToStage(item.id)}
-            type="button"
-            title={`${item.id}. ${item.label}`}
-          >
-            <span>{item.id}.</span> {item.short}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 function phaseLabel(phase: StagePhase) {
@@ -4898,8 +4780,10 @@ async function saveBlob(blob: Blob, filename: string) {
       const pickerType: { description: string; accept: Record<string, string[]> } = lowerName.endsWith('.json')
         ? { description: 'JSON config', accept: { 'application/json': ['.json'] } }
         : lowerName.endsWith('.xls')
-          ? { description: 'Excel 97-2003 workbook', accept: { 'application/vnd.ms-excel': ['.xls'] } }
-          : { description: 'Excel workbook', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } };
+          ? { description: 'Excel workbook', accept: { 'application/vnd.ms-excel': ['.xls'] } }
+          : lowerName.endsWith('.xlsm')
+            ? { description: 'Excel macro workbook', accept: { 'application/vnd.ms-excel.sheet.macroEnabled.12': ['.xlsm'] } }
+            : { description: 'Excel workbook', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } };
       const handle = await window.showSaveFilePicker({
         suggestedName: filename,
         types: [pickerType],

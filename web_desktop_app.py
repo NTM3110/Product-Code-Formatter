@@ -34,10 +34,10 @@ class DesktopApi:
             file_types = ("JSON config (*.json)", "All files (*.*)")
             default_suffix = ".json"
         elif requested_suffix == ".xls":
-            file_types = ("Excel 97-2003 workbook (*.xls)", "All files (*.*)")
+            file_types = ("Excel workbook (*.xls)", "All files (*.*)")
             default_suffix = ".xls"
         elif requested_suffix == ".xlsm":
-            file_types = ("Excel macro-enabled workbook (*.xlsm)", "All files (*.*)")
+            file_types = ("Excel macro workbook (*.xlsm)", "All files (*.*)")
             default_suffix = ".xlsm"
         else:
             file_types = ("Excel workbook (*.xlsx)", "All files (*.*)")

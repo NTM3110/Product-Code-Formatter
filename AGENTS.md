@@ -2,6 +2,8 @@
 
 This file is the durable handoff for future AI coding sessions. It describes the project architecture, conventions, build/test processes, and current product constraints. Treat it as the source of truth when starting new work.
 
+For fast orientation after reading this file, read `docs/AI_START_HERE.md`, then use `docs/CHANGE_MAP.md` to jump from a user request to the right file/function owner.
+
 ## Project Overview
 
 Product Code Formatter is a Windows-first web application that reads Vietnamese Excel invoice workbooks and generates formatted product codes (`Mã VT`) for accounting/ERP import. It groups sellers by `MST` (tax ID), suggests company prefixes, lets users include/skip companies and products, applies profile-specific code-generation rules, and exports a processed Excel workbook plus a companion `nhập kho` workbook.

@@ -47,6 +47,14 @@ Avoid editing these by hand:
 
 ## Common Edit Targets
 
+Fast task routing:
+
+- `docs/AI_START_HERE.md` - first file to read after `AGENTS.md` in future AI sessions.
+- `docs/CHANGE_MAP.md` - user request -> exact file/function owner.
+- `docs/PROFILE_EXTENSION_GUIDE.md` - how to add a company profile or a new workflow.
+- `docs/REFACTOR_ROADMAP.md` - safe order for future code extraction.
+- `product_code/workflows/registry.py` - lightweight workflow/profile ownership map.
+
 Prefix/company selection:
 
 - React state and UI: `react_frontend/src/vietmax/VietmaxApp.tsx`
@@ -104,4 +112,3 @@ If a new persisted field is added, add it to:
 2. `normalize_profile_config()` in `app.py`
 3. API save/load in `web_api.py`
 4. TypeScript type/state in `react_frontend/src/types.ts` or `VietmaxApp.tsx`
-

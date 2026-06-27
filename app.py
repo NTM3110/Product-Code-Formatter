@@ -25,6 +25,9 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask.json.provider import DefaultJSONProvider
 
+from product_code import code_normalization, config_store
+from product_code import license_client as product_license_client
+
 APP_VERSION = "0.1"
 LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 XLS_MAX_ROWS = 65536
@@ -735,6 +738,73 @@ def activate_keygen_license(server_url, account_id, license_key, timeout=10):
     }
 
 
+# Compatibility facade: runtime Keygen behavior now lives in
+# product_code/license_client.py. Keep the legacy function names stable for
+# existing routes/tests while future edits can target the smaller module.
+current_machine_name = product_license_client.current_machine_name
+legacy_machine_fingerprint = product_license_client.legacy_machine_fingerprint
+windows_machine_guid = product_license_client.windows_machine_guid
+local_machine_fingerprint = product_license_client.local_machine_fingerprint
+keygen_license_metadata = product_license_client.keygen_license_metadata
+normalize_keygen_server_url = product_license_client.normalize_keygen_server_url
+normalize_keygen_account_id = product_license_client.normalize_keygen_account_id
+keygen_url = product_license_client.keygen_url
+keygen_allows_http_host = product_license_client.keygen_allows_http_host
+keygen_is_local_http_url = product_license_client.keygen_is_local_http_url
+keygen_host_header = product_license_client.keygen_host_header
+keygen_forbidden_hint = product_license_client.keygen_forbidden_hint
+extract_allowed_companies = product_license_client.extract_allowed_companies
+extract_allowed_profiles = product_license_client.extract_allowed_profiles
+extract_supported_profiles = product_license_client.extract_supported_profiles
+
+
+def keygen_request(method, url, payload=None, license_key=None, timeout=10):
+    return product_license_client.keygen_request(
+        method,
+        url,
+        payload=payload,
+        license_key=license_key,
+        timeout=timeout,
+        opener=urlopen,
+    )
+
+
+def keygen_validate_license(server_url, account_id, license_key, fingerprint=None, timeout=10):
+    return product_license_client.keygen_validate_license(
+        server_url,
+        account_id,
+        license_key,
+        fingerprint=fingerprint,
+        timeout=timeout,
+        requester=keygen_request,
+        fingerprint_func=local_machine_fingerprint,
+    )
+
+
+def keygen_activate_machine(server_url, account_id, license_key, license_id, fingerprint=None, timeout=10):
+    return product_license_client.keygen_activate_machine(
+        server_url,
+        account_id,
+        license_key,
+        license_id,
+        fingerprint=fingerprint,
+        timeout=timeout,
+        requester=keygen_request,
+        fingerprint_func=local_machine_fingerprint,
+    )
+
+
+def activate_keygen_license(server_url, account_id, license_key, timeout=10):
+    return product_license_client.activate_keygen_license(
+        server_url,
+        account_id,
+        license_key,
+        timeout=timeout,
+        requester=keygen_request,
+        fingerprint_func=local_machine_fingerprint,
+    )
+
+
 def price_ranges_from_groups(price_group_rules):
     ranges = {}
     for rule in price_group_rules.values():
@@ -958,18 +1028,11 @@ def normalize_config(data):
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        return default_config()
-    try:
-        return normalize_config(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-    except Exception:
-        return default_config()
+    return config_store.load_config_file(CONFIG_PATH, default_config, normalize_config)
 
 
 def save_config(cfg):
-    cfg = normalize_config(cfg)
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return cfg
+    return config_store.save_config_file(CONFIG_PATH, cfg, normalize_config)
 
 
 def normalize_word_rules(value):
@@ -1603,10 +1666,7 @@ def trim_code(value):
 
 
 def sanitize_product_code(value):
-    text = normalize_code_decimal_separators(rm_accents(str(value or "")))
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"[^A-Za-z0-9.]+", "", text)
-    return trim_code(text)
+    return code_normalization.sanitize_product_code(value, accent_normalizer=rm_accents, trim=trim_code)
 
 
 def is_volume_token(token):

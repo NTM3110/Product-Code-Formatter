@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -104,6 +105,41 @@ def diagnostic_log(message: str) -> None:
             fh.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
+
+
+def is_zip_excel_bytes(content: bytes) -> bool:
+    return bytes(content or b"").startswith(b"PK")
+
+
+def dataframe_to_openpyxl_bytes(sheet_name: str, df: pd.DataFrame) -> bytes:
+    stream = BytesIO()
+    safe_sheet = (raw_text(sheet_name) or "Sheet1")[:31]
+    with pd.ExcelWriter(stream, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=safe_sheet, index=False, header=False)
+    return stream.getvalue()
+
+
+def workbook_content_for_openpyxl(path: Path) -> bytes:
+    content = path.read_bytes()
+    if is_zip_excel_bytes(content):
+        return content
+    sheet, df = read_workbook(path)
+    diagnostic_log(f"convert workbook for openpyxl path={path.name} rows={len(df)} cols={df.shape[1]}")
+    return dataframe_to_openpyxl_bytes(sheet, df)
+
+
+def uploaded_workbook_content_for_openpyxl(content: bytes, filename: str = "") -> bytes:
+    content = bytes(content or b"")
+    if not content or is_zip_excel_bytes(content):
+        return content
+    suffix = Path(filename or "").suffix.lower()
+    legacy_xls = content.startswith(b"\xd0\xcf\x11\xe0") or (suffix == ".xls" and not is_zip_excel_bytes(content))
+    engine = "xlrd" if legacy_xls else "openpyxl"
+    with pd.ExcelFile(BytesIO(content), engine=engine) as xl:
+        sheet = xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=object)
+    diagnostic_log(f"convert uploaded workbook for openpyxl filename={filename or '-'} rows={len(df)} cols={df.shape[1]}")
+    return dataframe_to_openpyxl_bytes(sheet, df)
 
 
 def has_config_value(value) -> bool:
@@ -1124,14 +1160,18 @@ def create_app() -> FastAPI:
             raw_mapping = json.loads(mapping or "{}")
             allocation_policy = json.loads(policy or "{}")
             opening_content = await opening_file.read() if opening_file and opening_file.filename else None
+            if opening_content:
+                opening_content = uploaded_workbook_content_for_openpyxl(opening_content, opening_file.filename)
+            purchase_content = workbook_content_for_openpyxl(purchase_path)
+            sales_content = workbook_content_for_openpyxl(sales_path)
             job_id = uuid.uuid4().hex
             update_inventory_analysis_job(job_id, status="queued", progress=0, done=0, total=0, label="Đã nhận file. Đang xếp hàng phân bổ tồn kho...")
             worker = threading.Thread(
                 target=run_inventory_analysis_job,
                 args=(
                     job_id,
-                    purchase_path.read_bytes(),
-                    sales_path.read_bytes(),
+                    purchase_content,
+                    sales_content,
                     opening_content,
                     raw_mapping,
                     allocation_policy,
