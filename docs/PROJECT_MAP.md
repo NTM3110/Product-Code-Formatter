@@ -7,12 +7,17 @@ This repository has a few large files, so start here before editing.
 Product Code Formatter desktop app:
 
 - `react_frontend/src/vietmax/VietmaxApp.tsx` - active React wizard UI.
+- `react_frontend/src/vietmax/basicStages.tsx` - reusable Vietmax upload/mapping/process/loading/FAST stage components.
 - `react_frontend/src/vietmax/InventoryAllocationStage.tsx` - inventory allocation UI, report view, export stage.
+- `react_frontend/src/vietmax/StageNavigation.tsx` - stage navigation groups and buttons.
+- `react_frontend/src/vietmax/workflowStages.ts` - profile/stage definitions.
 - `react_frontend/src/api.ts` - frontend HTTP client.
 - `react_frontend/src/types.ts` - shared frontend data shapes.
 - `react_frontend/src/styles.css` - active UI styling.
 - `web_api.py` - FastAPI API used by React and desktop app.
 - `app.py` - shared Excel/business logic used by `web_api.py`.
+- `product_code/excel_io.py` - workbook byte conversion helpers used by FastAPI uploads/cache.
+- `product_code/license_client.py` - Keygen client and license status shaping helpers.
 - `web_desktop_app.py` - pywebview desktop wrapper.
 - `ProductCodeFormatterWeb.spec` - PyInstaller build spec.
 
@@ -76,8 +81,10 @@ Khớp mua vào/bán ra:
 
 Create processed purchase/sales files:
 
-- UI: `react_frontend/src/vietmax/VietmaxApp.tsx`
+- UI orchestration: `react_frontend/src/vietmax/VietmaxApp.tsx`
+- Basic upload/process/loading components: `react_frontend/src/vietmax/basicStages.tsx`
 - API endpoint: `web_api.py` `/api/vietmax/process`
+- API workbook byte helpers: `product_code/excel_io.py`
 - Core logic: `app.py` `process_workbook`
 
 Stage 12 inventory allocation:
@@ -88,7 +95,8 @@ Stage 12 inventory allocation:
 
 License/admin:
 
-- Desktop license client logic: `app.py`
+- Desktop license facade/wrappers: `app.py`
+- Keygen client logic: `product_code/license_client.py`
 - License API wrapper: `web_api.py`
 - Admin app: `license_server_admin.py`
 
