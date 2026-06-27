@@ -301,26 +301,3 @@ def activate_keygen_license(server_url, account_id, license_key, timeout=10, req
         "allowed_profiles": validation["allowed_profiles"],
         "supported_profiles": validation["supported_profiles"],
     }
-
-
-def public_license_status(config, allows_profile_func, local_activation_func):
-    """Return the UI-safe license shape used by the React shell."""
-    license_cfg = (config or {}).get("license") or {}
-    allowed_profiles = license_cfg.get("allowed_profiles") or []
-    activated = local_activation_func(license_cfg)
-    return {
-        "activated": activated,
-        "status": str(license_cfg.get("status") or ("Kích hoạt thành công" if activated else "Chưa kích hoạt")),
-        "allowed_profiles": allowed_profiles,
-        "allowed_companies": license_cfg.get("allowed_companies") or [],
-        "supported_profiles": license_cfg.get("supported_profiles") or [],
-        "product_code": str(license_cfg.get("product_code") or ""),
-        "application": str(license_cfg.get("application") or ""),
-        "vietmax_allowed": activated and (
-            allows_profile_func("vietmax", allowed_profiles)
-            or allows_profile_func("vietmax_mua_vao", allowed_profiles)
-            or allows_profile_func("vietmax_ban_ra", allowed_profiles)
-        ),
-        "server_url": str(license_cfg.get("server_url") or ""),
-        "account_id": str(license_cfg.get("account_id") or ""),
-    }

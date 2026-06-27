@@ -29,20 +29,15 @@ Backend:
 API:
 
 - React backend: `web_api.py`
-- Workbook upload/cache conversion helpers: `product_code/excel_io.py`
 - Vietmax endpoints: search `/api/vietmax`
 - Inventory endpoints: search `/api/inventory-allocation`
 - License endpoints: search `license`
-- License client/status helpers: `product_code/license_client.py`
 - FAST endpoints: search `fast`
 
 React:
 
 - Main wizard: `react_frontend/src/vietmax/VietmaxApp.tsx`
 - Stage rendering: search `renderStage`
-- Reusable basic stages: `react_frontend/src/vietmax/basicStages.tsx`
-- Stage definitions/navigation: `react_frontend/src/vietmax/workflowStages.ts`,
-  `react_frontend/src/vietmax/StageNavigation.tsx`
 - Company/prefix UI: `CompanyRulesStage`
 - Review UI: `ReviewStage`
 - FAST UI: `FastImportExportStage`

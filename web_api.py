@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -84,21 +85,61 @@ from inventory_allocation_app.app import (
     run_analysis_job as run_inventory_analysis_job,
     update_analysis_job as update_inventory_analysis_job,
 )
-from product_code.excel_io import (
-    diagnostic_log,
-    uploaded_workbook_content_for_openpyxl,
-    workbook_content_for_openpyxl,
-)
-from product_code.license_client import public_license_status as build_public_license_status
 
 APP_DIR = Path(__file__).resolve().parent
 REACT_DIST_DIR = APP_DIR / "react_frontend" / "dist"
 PROGRESS_LOCK = threading.Lock()
 PROGRESS_JOBS: dict[str, dict] = {}
 PROGRESS_TTL_SECONDS = 900
+DIAGNOSTIC_LOG_PATH = UPLOAD_DIR.parent / "diagnostics.log"
 
 
 PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst")
+
+
+def diagnostic_log(message: str) -> None:
+    try:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        DIAGNOSTIC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DIAGNOSTIC_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+
+def is_zip_excel_bytes(content: bytes) -> bool:
+    return bytes(content or b"").startswith(b"PK")
+
+
+def dataframe_to_openpyxl_bytes(sheet_name: str, df: pd.DataFrame) -> bytes:
+    stream = BytesIO()
+    safe_sheet = (raw_text(sheet_name) or "Sheet1")[:31]
+    with pd.ExcelWriter(stream, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=safe_sheet, index=False, header=False)
+    return stream.getvalue()
+
+
+def workbook_content_for_openpyxl(path: Path) -> bytes:
+    content = path.read_bytes()
+    if is_zip_excel_bytes(content):
+        return content
+    sheet, df = read_workbook(path)
+    diagnostic_log(f"convert workbook for openpyxl path={path.name} rows={len(df)} cols={df.shape[1]}")
+    return dataframe_to_openpyxl_bytes(sheet, df)
+
+
+def uploaded_workbook_content_for_openpyxl(content: bytes, filename: str = "") -> bytes:
+    content = bytes(content or b"")
+    if not content or is_zip_excel_bytes(content):
+        return content
+    suffix = Path(filename or "").suffix.lower()
+    legacy_xls = content.startswith(b"\xd0\xcf\x11\xe0") or (suffix == ".xls" and not is_zip_excel_bytes(content))
+    engine = "xlrd" if legacy_xls else "openpyxl"
+    with pd.ExcelFile(BytesIO(content), engine=engine) as xl:
+        sheet = xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=object)
+    diagnostic_log(f"convert uploaded workbook for openpyxl filename={filename or '-'} rows={len(df)} cols={df.shape[1]}")
+    return dataframe_to_openpyxl_bytes(sheet, df)
 
 
 def has_config_value(value) -> bool:
@@ -1211,7 +1252,26 @@ def workbook_summary(df, original_name: str, saved_name: str) -> dict:
 
 
 def public_license_status(config: dict) -> dict:
-    return build_public_license_status(config, license_allows_profile, license_has_local_activation)
+    license_cfg = config.get("license") or {}
+    allowed_profiles = license_cfg.get("allowed_profiles") or []
+    activated = license_has_local_activation(license_cfg)
+    return {
+        "activated": activated,
+        "status": str(license_cfg.get("status") or ("Kích hoạt thành công" if activated else "Chưa kích hoạt")),
+        "allowed_profiles": allowed_profiles,
+        "allowed_companies": license_cfg.get("allowed_companies") or [],
+        "supported_profiles": license_cfg.get("supported_profiles") or [],
+        "product_code": str(license_cfg.get("product_code") or ""),
+        "application": str(license_cfg.get("application") or ""),
+        "vietmax_allowed": activated and (
+            license_allows_profile("vietmax", allowed_profiles)
+            or license_allows_profile("vietmax_mua_vao", allowed_profiles)
+            or license_allows_profile("vietmax_ban_ra", allowed_profiles)
+        ),
+        "server_url": str(license_cfg.get("server_url") or ""),
+        "account_id": str(license_cfg.get("account_id") or ""),
+    }
+
 
 def inspect_vietmax_processed_file(path: Path, phase: str) -> dict:
     _, df = read_workbook(path)
