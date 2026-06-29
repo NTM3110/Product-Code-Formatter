@@ -53,6 +53,7 @@ from app import (
     normalize_vietmax_comparison_scope,
     normalize_inventory_pair_rules,
     normalize_inventory_pairs,
+    normalize_missing_mst_prefix_strategy,
     normalize_phrase_list,
     normalized_header_label,
     openpyxl_workbook_to_xls_stream,
@@ -90,6 +91,7 @@ from product_code.excel_io import (
     workbook_content_for_openpyxl,
 )
 from product_code.license_client import public_license_status as build_public_license_status
+from workflows.estimate_extractor.logic import analyze_estimate_workbook, create_estimate_output_workbook, list_estimate_workbook_sheets
 
 APP_DIR = Path(__file__).resolve().parent
 REACT_DIST_DIR = APP_DIR / "react_frontend" / "dist"
@@ -98,7 +100,7 @@ PROGRESS_JOBS: dict[str, dict] = {}
 PROGRESS_TTL_SECONDS = 900
 
 
-PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst")
+PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst", "all_name_words")
 
 
 def has_config_value(value) -> bool:
@@ -169,6 +171,9 @@ VIETMAX_CONFIG_PROFILE_KEYS = {
     "include_company_prefix",
     "prefix_strategy",
     "prefix_mst_digits",
+    "prefix_name_words",
+    "prefix_name_chars",
+    "prefix_missing_mst_strategy",
     "prefix_strategy_values",
     "columns",
 }
@@ -197,6 +202,9 @@ def vietmax_profile_from_process_payload(payload: dict, phase: str) -> dict:
         "include_company_prefix",
         "prefix_strategy",
         "prefix_mst_digits",
+        "prefix_name_words",
+        "prefix_name_chars",
+        "prefix_missing_mst_strategy",
         "prefix_strategy_values",
         "columns",
         "word_rules",
@@ -460,6 +468,44 @@ class LicenseActivationRequest(BaseModel):
     license_key: str
 
 
+class EstimateWorkbookRequest(BaseModel):
+    saved_name: str
+    original_name: str = "du_toan.xlsx"
+    bid_sheet_index: int | None = None
+    detail_sheet_index: int | None = None
+    bid_header_row: int | None = None
+    detail_header_row: int | None = None
+    bid_columns: dict | None = None
+    detail_columns: dict | None = None
+
+
+def estimate_warning_payload(result) -> dict:
+    fields = [
+        "identity_mismatches",
+        "calculation_mismatches",
+        "unclassified_rows",
+        "thvt_mismatches",
+        "thvt_key_mismatches",
+        "thvt_missing_rows",
+        "thvt_extra_rows",
+    ]
+    return {field: getattr(result, field, [])[:50] for field in fields}
+
+
+def estimate_analysis_payload(result) -> dict:
+    return {
+        "summary": result.summary(),
+        "warnings": estimate_warning_payload(result),
+        "sheet_names": list(getattr(result, "sheet_names", []) or []),
+    }
+
+
+def safe_xlsx_download_name(original_name: str, suffix: str) -> str:
+    stem = Path(original_name or "du_toan").stem or "du_toan"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")[:80] or "du_toan"
+    return f"{safe_stem}{suffix}.xlsx"
+
+
 def create_app() -> FastAPI:
     api = FastAPI(title="ProductCodeFormatter API", version="0.1.0")
     api.add_middleware(
@@ -468,7 +514,7 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Processed-Saved-Name", "X-Up-Saved-Name"],
+        expose_headers=["X-Processed-Saved-Name", "X-Up-Saved-Name", "X-Estimate-Summary"],
     )
 
     @api.get("/api/health")
@@ -547,6 +593,70 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return workbook_summary(df, original, saved_name)
 
+    @api.post("/api/estimate/upload")
+    async def upload_estimate_workbook(file: UploadFile = File(...)) -> dict:
+        original = file.filename or ""
+        ext = Path(original).suffix.lower()
+        if ext not in {".xls", ".xlsx", ".xlsm"}:
+            raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file Excel .xls, .xlsx hoặc .xlsm.")
+        saved_name = f"estimate_{uuid.uuid4().hex}{ext}"
+        path = UPLOAD_DIR / saved_name
+        path.write_bytes(await file.read())
+        try:
+            sheet_info = list_estimate_workbook_sheets(str(path))
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return json_safe({
+            "original_name": original,
+            "saved_name": saved_name,
+            "size": path.stat().st_size,
+            **sheet_info,
+        })
+
+    @api.post("/api/estimate/analyze")
+    def analyze_estimate(payload: EstimateWorkbookRequest) -> dict:
+        path = uploaded_path(payload.saved_name)
+        try:
+            analysis = analyze_estimate_workbook(
+                str(path),
+                bid_sheet_index=payload.bid_sheet_index,
+                detail_sheet_index=payload.detail_sheet_index,
+                thvt_sheet_index=None,
+                bid_header_row=payload.bid_header_row,
+                detail_header_row=payload.detail_header_row,
+                bid_columns=payload.bid_columns,
+                detail_columns=payload.detail_columns,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return json_safe(estimate_analysis_payload(analysis))
+
+    @api.post("/api/estimate/export")
+    def export_estimate(payload: EstimateWorkbookRequest) -> Response:
+        path = uploaded_path(payload.saved_name)
+        try:
+            content, summary = create_estimate_output_workbook(
+                str(path),
+                bid_sheet_index=payload.bid_sheet_index,
+                detail_sheet_index=payload.detail_sheet_index,
+                bid_header_row=payload.bid_header_row,
+                detail_header_row=payload.detail_header_row,
+                bid_columns=payload.bid_columns,
+                detail_columns=payload.detail_columns,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        filename = safe_xlsx_download_name(payload.original_name, "_boc_tach")
+        return Response(
+            content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Estimate-Summary": json.dumps(summary, ensure_ascii=False),
+            },
+        )
+
     @api.get("/api/files/download/{saved_name}")
     def download_uploaded_or_cached_file(saved_name: str) -> FileResponse:
         path = uploaded_path(saved_name)
@@ -594,7 +704,8 @@ def create_app() -> FastAPI:
         removed = profile_cfg.get("removed_companies") or {}
         for company in result.get("companies", []):
             mst = raw_text(company.get("mst"))
-            process = not bool(removed.get(mst))
+            company_id = raw_text(company.get("company_id")) or mst
+            process = not bool(removed.get(company_id) or (mst and removed.get(mst)))
             company["process"] = process
             company["pending_process"] = process
             company["committed_prefix"] = company.get("value") or ""
@@ -612,6 +723,9 @@ def create_app() -> FastAPI:
             "include_company_prefix": profile_cfg.get("include_company_prefix") is not False,
             "prefix_strategy": profile_cfg.get("prefix_strategy") or "last_2_words",
             "prefix_mst_digits": profile_cfg.get("prefix_mst_digits") or 3,
+            "prefix_name_words": profile_cfg.get("prefix_name_words") or 2,
+            "prefix_name_chars": profile_cfg.get("prefix_name_chars") or 1,
+            "prefix_missing_mst_strategy": profile_cfg.get("prefix_missing_mst_strategy") or "all_name_words",
             "prefix_strategy_values": profile_cfg.get("prefix_strategy_values") or {},
             "product_review_merges": profile_cfg.get("product_review_merges") or [],
             "price_range_rules": profile_cfg.get("price_range_rules") or {},
@@ -713,7 +827,8 @@ def create_app() -> FastAPI:
             removed = profile_cfg.get("removed_companies") or {}
             for company in result.get("companies", []):
                 mst = raw_text(company.get("mst"))
-                process = not bool(removed.get(mst))
+                company_id = raw_text(company.get("company_id")) or mst
+                process = not bool(removed.get(company_id) or (mst and removed.get(mst)))
                 company["process"] = process
                 company["pending_process"] = process
             result["manual_code_overrides"] = profile_cfg.get("manual_code_overrides") or {}
@@ -729,6 +844,9 @@ def create_app() -> FastAPI:
             result["include_company_prefix"] = profile_cfg.get("include_company_prefix") is not False
             result["prefix_strategy"] = profile_cfg.get("prefix_strategy") or "last_2_words"
             result["prefix_mst_digits"] = profile_cfg.get("prefix_mst_digits") or 3
+            result["prefix_name_words"] = profile_cfg.get("prefix_name_words") or 2
+            result["prefix_name_chars"] = profile_cfg.get("prefix_name_chars") or 1
+            result["prefix_missing_mst_strategy"] = profile_cfg.get("prefix_missing_mst_strategy") or "all_name_words"
             result["prefix_strategy_values"] = profile_cfg.get("prefix_strategy_values") or {}
             return json_safe(result)
         except Exception as exc:
@@ -800,6 +918,9 @@ def create_app() -> FastAPI:
                 "include_company_prefix": process_payload.get("include_company_prefix") is not False,
                 "prefix_strategy": process_payload.get("prefix_strategy", old_profile.get("prefix_strategy", "last_2_words")),
                 "prefix_mst_digits": process_payload.get("prefix_mst_digits", old_profile.get("prefix_mst_digits", 3)),
+                "prefix_name_words": process_payload.get("prefix_name_words", old_profile.get("prefix_name_words", 2)),
+                "prefix_name_chars": process_payload.get("prefix_name_chars", old_profile.get("prefix_name_chars", 1)),
+                "prefix_missing_mst_strategy": normalize_missing_mst_prefix_strategy(process_payload.get("prefix_missing_mst_strategy", old_profile.get("prefix_missing_mst_strategy", "all_name_words"))),
                 "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(process_payload, old_profile, "prefix_strategy_values", "prefix_strategy_values", {})),
                 "columns": columns,
             })
@@ -986,6 +1107,9 @@ def create_app() -> FastAPI:
             "include_company_prefix": payload.get("include_company_prefix") is not False,
             "prefix_strategy": payload.get("prefix_strategy", profile_cfg.get("prefix_strategy", "last_2_words")),
             "prefix_mst_digits": payload.get("prefix_mst_digits", profile_cfg.get("prefix_mst_digits", 3)),
+            "prefix_name_words": payload.get("prefix_name_words", profile_cfg.get("prefix_name_words", 2)),
+            "prefix_name_chars": payload.get("prefix_name_chars", profile_cfg.get("prefix_name_chars", 1)),
+            "prefix_missing_mst_strategy": normalize_missing_mst_prefix_strategy(payload.get("prefix_missing_mst_strategy", profile_cfg.get("prefix_missing_mst_strategy", "all_name_words"))),
             "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(payload, profile_cfg, "prefix_strategy_values", "prefix_strategy_values", {})),
             "columns": payload.get("columns", {}),
             "word_rules": keep_existing_when_empty(payload, profile_cfg, "word_rules", {}),

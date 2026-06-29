@@ -1,9 +1,62 @@
+export type InvoiceStatusOption = { value: string; count: number; skip: boolean };
+
 export type UploadSummary = {
   original_name: string;
   saved_name: string;
   columns: Array<{ letter: string; label: string }>;
   preview: Array<Record<string, string>>;
-  invoice_statuses: Array<{ value: string; count: number; skip: boolean }>;
+  invoice_statuses: InvoiceStatusOption[];
+};
+
+export type EstimateAnalysisSummary = {
+  path: string;
+  bid_rows: number;
+  detail_blocks: number;
+  identity_mismatches: number;
+  calculation_mismatches: number;
+  helper_mismatches: number;
+  unclassified_rows: number;
+  thvt_rows: number;
+  generated_thvt_rows: number;
+  thvt_mismatches: number;
+  thvt_key_mismatches: number;
+  thvt_missing_rows: number;
+  thvt_extra_rows: number;
+  ok: boolean;
+};
+
+export type EstimateAnalysis = {
+  summary: EstimateAnalysisSummary;
+  warnings: Record<string, unknown[]>;
+  sheet_names: string[];
+};
+
+export type EstimateSheetInfo = {
+  index: number;
+  name: string;
+  rows: number;
+  cols: number;
+};
+
+export type EstimateColumnConfig = Record<string, string>;
+
+export type EstimateSheetSelection = {
+  bid_sheet_index?: number | null;
+  detail_sheet_index?: number | null;
+  bid_header_row?: number | null;
+  detail_header_row?: number | null;
+  bid_columns?: EstimateColumnConfig;
+  detail_columns?: EstimateColumnConfig;
+};
+
+export type EstimateUploadSummary = {
+  original_name: string;
+  saved_name: string;
+  size: number;
+  analysis?: EstimateAnalysis;
+  sheet_names?: string[];
+  sheets?: EstimateSheetInfo[];
+  suggested_sheets?: EstimateSheetSelection;
 };
 
 export type ProcessedFileStats = {
@@ -36,6 +89,8 @@ export type GenericAnalyzeResult = {
   rows_to_process: number;
   company_count: number;
   companies: CompanyRow[];
+  missing_mst_companies?: MissingMstCompanyWarning[];
+  missing_mst_row_count?: number;
   original_name?: string;
   saved_name?: string;
   manual_code_overrides?: Record<string, string>;
@@ -49,11 +104,21 @@ export type GenericAnalyzeResult = {
   include_company_prefix?: boolean;
   prefix_strategy?: string;
   prefix_mst_digits?: number;
+  prefix_name_words?: number;
+  prefix_name_chars?: number;
+  prefix_missing_mst_strategy?: string;
   prefix_strategy_values?: Record<string, Record<string, string>>;
   product_review_merges?: unknown[];
   price_range_rules?: Record<string, unknown>;
   price_adjust_all_percent?: number;
   columns?: Record<string, unknown>;
+};
+
+export type MissingMstCompanyWarning = {
+  company: string;
+  count: number;
+  rows?: Array<number | string>;
+  invoice_nos?: string[];
 };
 
 export type InventoryAllocationMappingSection = {
@@ -231,6 +296,8 @@ export type InventoryAllocationJob = {
 
 export type CompanyRow = {
   mst: string;
+  company_id?: string;
+  missing_mst?: boolean;
   company: string;
   safe_id: string;
   value: string;

@@ -1,6 +1,7 @@
 import unittest
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
@@ -38,6 +39,123 @@ class XlsWorkbookAdapter:
 
 
 class ProcessWorkbookTests(unittest.TestCase):
+    def test_invoice_status_filter_keeps_new_invoices(self):
+        self.assertFalse(app.ignored_invoice_status("Hóa đơn mới"))
+        self.assertFalse(app.ignored_invoice_status("Hóa đơn mới", ["Hóa đơn đã bị hủy"]))
+        self.assertTrue(app.ignored_invoice_status("Hóa đơn đã bị hủy"))
+        self.assertTrue(app.ignored_invoice_status("Hóa đơn đã bị hủy", ["Hóa đơn đã bị hủy"]))
+    def test_analyze_includes_missing_mst_new_invoices_as_companies(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "missing_mst.xlsx"
+            wb = Workbook()
+            ws = wb.active
+
+            def write_row(row, invoice_no, company, mst, product, qty, status):
+                ws.cell(row=row, column=3, value=invoice_no)
+                ws.cell(row=row, column=6, value=company)
+                ws.cell(row=row, column=7, value=mst)
+                ws.cell(row=row, column=13, value=product)
+                ws.cell(row=row, column=15, value=qty)
+                ws.cell(row=row, column=36, value=status)
+
+            write_row(1, "283", "Công ty Không MST", "", "Hàng hóa mới", 1, "Hóa đơn mới")
+            write_row(2, "302", "Công ty Không MST", None, "Hàng hóa mới 2", 2, "Hóa đơn mới")
+            write_row(3, "999", "Công ty Không MST", "", "Hàng bị hủy", 1, "Hóa đơn đã bị hủy")
+            write_row(4, "100", "Công ty Có MST", "0100100100", "Hàng xử lý", 1, "Hóa đơn mới")
+            wb.save(path)
+
+            result = app.analyze(str(path), "F", "G", "H", "M", "O", "", {}, invoice_status_col="AJ", invoice_status_skip_values=["Hóa đơn đã bị hủy"])
+
+        self.assertEqual(result["rows_to_process"], 3)
+        self.assertEqual(result["company_count"], 2)
+        self.assertEqual(result["missing_mst_row_count"], 0)
+        self.assertEqual(result["missing_mst_companies"], [])
+        missing_company = next(company for company in result["companies"] if not company["mst"])
+        self.assertEqual(missing_company["company"], "Công ty Không MST")
+        self.assertTrue(missing_company["missing_mst"])
+        self.assertTrue(missing_company["company_id"].startswith("__NO_MST__:"))
+        self.assertEqual(missing_company["count"], 2)
+        self.assertEqual({product["name"] for product in missing_company["all_products"]}, {"Hàng hóa mới", "Hàng hóa mới 2"})
+
+    def test_process_workbook_can_select_or_skip_missing_mst_company(self):
+        outputs = Path(__file__).parent / "outputs"
+        outputs.mkdir(exist_ok=True)
+        run_id = uuid4().hex
+        source = outputs / f"_test_missing_mst_source_{run_id}.xlsx"
+        selected_result = outputs / f"_test_missing_mst_selected_{run_id}.xlsx"
+        skipped_result = outputs / f"_test_missing_mst_skipped_{run_id}.xlsx"
+        try:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Invoices"
+            sheet.cell(2, 12, "Ma VT")
+            sheet.cell(2, 13, "Ten hang")
+            sheet.cell(2, 15, "So luong")
+            sheet.cell(3, 3, "HD-NO-MST")
+            sheet.cell(3, 6, "Cong ty Khong MST")
+            sheet.cell(3, 7, "")
+            sheet.cell(3, 12, 0)
+            sheet.cell(3, 13, "Hang Khong MST")
+            sheet.cell(3, 15, 1)
+            workbook.save(source)
+            workbook.close()
+
+            company_id = app.company_selection_key("Cong ty Khong MST", "")
+            process_workbook(source, selected_result, {
+                "company_col": "F",
+                "mst_col": "G",
+                "product_col": "M",
+                "qty_col": "O",
+                "output_col": "L",
+                "profile": "vietmax",
+                "vietmax_phase": "sales",
+                "include_company_prefix": True,
+                "all_mst": [company_id],
+                "process_mst": [company_id],
+                "mst_safe_id": [f"{company_id}|||0"],
+                "prefix_0": "CTKM",
+                "selected_products_0": ["Hang Khong MST"],
+            })
+            selected_output = load_workbook(selected_result, data_only=True)
+            try:
+                selected_sheet = selected_output["Invoices"]
+                self.assertEqual(selected_sheet.max_row, 3)
+                self.assertTrue(str(selected_sheet.cell(3, 12).value).startswith("CTKM."))
+                self.assertIsNone(selected_sheet.cell(3, 7).value)
+                customer_code_col = next(
+                    col
+                    for col in range(1, selected_sheet.max_column + 1)
+                    if app.normalized_header_label(selected_sheet.cell(2, col).value) == "ma khach hang"
+                )
+                self.assertEqual(selected_sheet.cell(3, customer_code_col).value, "CTKM")
+            finally:
+                selected_output.close()
+
+            process_workbook(source, skipped_result, {
+                "company_col": "F",
+                "mst_col": "G",
+                "product_col": "M",
+                "qty_col": "O",
+                "output_col": "L",
+                "profile": "vietmax",
+                "vietmax_phase": "sales",
+                "include_company_prefix": True,
+                "all_mst": [company_id],
+                "process_mst": [],
+                "mst_safe_id": [f"{company_id}|||0"],
+                "prefix_0": "CTKM",
+                "selected_products_0": ["Hang Khong MST"],
+            })
+            skipped_output = load_workbook(skipped_result, data_only=True)
+            try:
+                skipped_sheet = skipped_output["Invoices"]
+                self.assertEqual(skipped_sheet.max_row, 2)
+            finally:
+                skipped_output.close()
+        finally:
+            source.unlink(missing_ok=True)
+            selected_result.unlink(missing_ok=True)
+            skipped_result.unlink(missing_ok=True)
     def test_vietmax_profiles_are_available_by_default(self):
         config = default_config()
         self.assertEqual(profile_key("vietmax"), "vietmax")
@@ -2190,6 +2308,7 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "AR": "Tỷ giá",
                 "AS": "TK vật tư",
                 "AT": "Mã kho",
+                "AU": "Mã khách hàng",
             }.items():
                 sheet.cell(2, app.excel_col_to_index(col) + 1, header)
             for row_index, values in enumerate(row_values, start=3):
@@ -2269,6 +2388,30 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "AR": 1,
                 "AS": "1552",
                 "AT": "KGCI",
+            }, {
+                "A": "01GTKT0",
+                "B": "BB/26E",
+                "C": "142",
+                "D": "15/01/2026",
+                "F": "VIETMAX",
+                "G": "010SELL",
+                "H": "Äá»‹a chá»‰ bÃ¡n",
+                "I": "CÃ”NG TY KHONG MST",
+                "J": "",
+                "K": "Äá»‹a chá»‰ khÃ¡ch 3",
+                "L": "KHM.HANG",
+                "M": "HÃ ng khÃ´ng MST",
+                "N": "CÃ¡i",
+                "O": 2,
+                "P": 5000,
+                "R": 0.08,
+                "V": 10000,
+                "W": 800,
+                "AQ": "VND",
+                "AR": 1,
+                "AS": "155",
+                "AT": "KTP",
+                "AU": "KHM",
             }])
             _, purchase_df = app.read_workbook(purchase_source)
             _, sales_df = app.read_workbook(sales_source)
@@ -2304,12 +2447,14 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertEqual(sheet.cell(3, 28).value, "1552")
                 self.assertEqual(sheet.cell(3, 32).value, "KGCI")
                 self.assertEqual(sheet.cell(3, 33).value, "CONGIN")
+                self.assertEqual(sheet.cell(4, 1).value, "KHM")
+                self.assertEqual(sheet.cell(4, 5).value, "142")
                 for col in [2, 3, 4, 7, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 30, 35, 36, 38, 39, 40, 41, 42, 44, 46, 47, 48]:
                     self.assertIn(sheet.cell(2, col).value, (None, ""))
 
                 sheet = workbook["DMvat_tu"]
                 codes = {sheet.cell(row, 1).value for row in range(2, sheet.max_row + 1)}
-                self.assertEqual(codes, {"GIAYIN", "INTG", "CONGIN"})
+                self.assertEqual(codes, {"GIAYIN", "INTG", "CONGIN", "KHM.HANG"})
                 for row in range(2, sheet.max_row + 1):
                     for col in [8, 9, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30]:
                         self.assertIn(sheet.cell(row, col).value, (None, ""))
@@ -2317,9 +2462,12 @@ class ProcessWorkbookTests(unittest.TestCase):
                 sheet = workbook["DMkhachhang"]
                 self.assertEqual(sheet.max_column, len(app.FAST_DM_KHACH_HANG_HEADERS))
                 customers = {sheet.cell(row, 1).value for row in range(2, sheet.max_row + 1)}
-                self.assertEqual(customers, {"010SELL", "010CUSTOMER", "010CUSTOMER2"})
+                self.assertEqual(customers, {"010SELL", "010CUSTOMER", "010CUSTOMER2", "KHM"})
                 for row in range(2, sheet.max_row + 1):
                     mst = sheet.cell(row, 1).value
+                    if mst == "KHM":
+                        self.assertIn(sheet.cell(row, 4).value, (None, ""))
+                        continue
                     self.assertEqual(sheet.cell(row, 4).value, mst)
                     self.assertIn(sheet.cell(row, 2).value, {"CÔNG TY BÁN", "CÔNG TY MUA", "CÔNG TY GIA CÔNG"})
                     self.assertIn(sheet.cell(row, 5).value, {"Địa chỉ bán", "Địa chỉ khách", "Địa chỉ khách 2"})

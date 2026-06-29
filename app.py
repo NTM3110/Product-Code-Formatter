@@ -83,6 +83,7 @@ PROFILE_LABELS = {
     "cao_thanh": "Cao Thành",
     "quang_thinh": "Quang Thịnh",
     "vietmax": "Vietmax",
+    "ho_guom": "Hồ Gươm",
     "vietmax_mua_vao": "Vietmax mua vào",
     "vietmax_ban_ra": "Vietmax bán ra",
 }
@@ -90,13 +91,14 @@ PROFILE_LABELS = {
 PROFILE_ALIASES = {
     "quang_thinh_1": "quang_thinh",
     "quang_thinh_2": "quang_thinh",
+    "boc_tach_du_toan": "ho_guom",
 }
 
 VIETMAX_PROFILE = "vietmax"
 VIETMAX_PHASE_PURCHASE = "purchase"
 VIETMAX_PHASE_SALES = "sales"
 VIETMAX_PROFILES = {"vietmax", "vietmax_mua_vao", "vietmax_ban_ra"}
-PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst")
+PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst", "all_name_words")
 VIETMAX_BAN_RA_MATCH_MA_KHO = "KVT"
 VIETMAX_BAN_RA_MATCH_TK_VAT_TU = "152"
 VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES = "all_companies"
@@ -164,15 +166,9 @@ MAX_CODE_LENGTH = 50
 DIAMETER_CHARS = "\u03a6\u03c6\u03d5\u00d8\u00f8\u2205\u2300\u0424\u0444\uff06"
 DEFAULT_INVOICE_STATUS_COL = "AJ"
 DEFAULT_INVOICE_STATUS_SKIP_VALUES = [
-    "Hóa đơn đã bị điều chỉnh",
-    "Hóa đơn bị thay thế",
-    "Hóa đơn đã bị thay thế",
     "Hóa đơn đã bị hủy",
 ]
 IGNORED_INVOICE_STATUSES = {
-    "hoa don da bi dieu chinh",
-    "hoa don bi thay the",
-    "hoa don da bi thay the",
     "hoa don da bi huy",
 }
 
@@ -200,6 +196,9 @@ def empty_profile_config(profile_key_name=None):
         "include_company_prefix": True,
         "prefix_strategy": "last_2_words",
         "prefix_mst_digits": 3,
+        "prefix_name_words": 2,
+        "prefix_name_chars": 1,
+        "prefix_missing_mst_strategy": "all_name_words",
         "prefix_strategy_values": {},
         "columns": {},
     }
@@ -839,12 +838,33 @@ def normalize_prefix_strategy(value):
     return value if value in PREFIX_STRATEGIES else "last_2_words"
 
 
+def normalize_missing_mst_prefix_strategy(value):
+    value = str(value or "").strip()
+    return value if value in {"last_2_words", "all_name_words"} else "all_name_words"
+
+
 def normalize_prefix_mst_digits(value):
     try:
         digits = int(value or 3)
     except Exception:
         digits = 3
     return max(1, min(10, digits))
+
+
+def normalize_prefix_name_words(value):
+    try:
+        words = int(value or 2)
+    except Exception:
+        words = 2
+    return max(1, min(20, words))
+
+
+def normalize_prefix_name_chars(value):
+    try:
+        chars = int(value or 1)
+    except Exception:
+        chars = 1
+    return max(1, min(10, chars))
 
 
 def normalize_prefix_strategy_values(raw):
@@ -993,6 +1013,9 @@ def normalize_profile_config(profile_key_name, profile):
         "include_company_prefix": profile.get("include_company_prefix") is not False,
         "prefix_strategy": normalize_prefix_strategy(profile.get("prefix_strategy") or defaults["prefix_strategy"]),
         "prefix_mst_digits": normalize_prefix_mst_digits(profile.get("prefix_mst_digits", defaults["prefix_mst_digits"])),
+        "prefix_name_words": normalize_prefix_name_words(profile.get("prefix_name_words", defaults["prefix_name_words"])),
+        "prefix_name_chars": normalize_prefix_name_chars(profile.get("prefix_name_chars", defaults["prefix_name_chars"])),
+        "prefix_missing_mst_strategy": normalize_missing_mst_prefix_strategy(profile.get("prefix_missing_mst_strategy", defaults["prefix_missing_mst_strategy"])),
         "prefix_strategy_values": normalize_prefix_strategy_values(profile.get("prefix_strategy_values") or defaults["prefix_strategy_values"]),
         "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
     }
@@ -1592,8 +1615,38 @@ def suggest_prefix(company):
     return prefix or normalize_token(company)[:2]
 
 
+def prefix_last_n_words(company, n=2):
+    words = re.sub(r"[^A-Za-z0-9À-ỹĐđ ]+", " ", str(company)).split()
+    meaningful = remove_company_location_phrases([normalize_token(w) for w in words if normalize_token(w)])
+    if not meaningful:
+        meaningful = [normalize_token(w) for w in words if normalize_token(w)]
+    selected = meaningful[-max(1, int(n or 2)):]
+    prefix = "".join(w[:1] for w in selected)
+    return prefix or normalize_token(company)[:2]
+
+
+def prefix_last_n_words_chars(company, word_count=2, chars_per_word=1):
+    words = re.sub(r"[^A-Za-z0-9Ã€-á»¹ÄÄ‘ ]+", " ", str(company)).split()
+    meaningful = remove_company_location_phrases([normalize_token(w) for w in words if normalize_token(w)])
+    if not meaningful:
+        meaningful = [normalize_token(w) for w in words if normalize_token(w)]
+    selected = meaningful[-max(1, int(word_count or 2)):]
+    chars = max(1, int(chars_per_word or 1))
+    prefix = "".join(w[:chars] for w in selected)
+    return prefix or normalize_token(company)[:2]
+
+
+def prefix_all_name_words(company):
+    words = re.sub(r"[^A-Za-z0-9À-ỹĐđ ]+", " ", str(company)).split()
+    meaningful = remove_company_location_phrases([normalize_token(w) for w in words if normalize_token(w)])
+    if not meaningful:
+        meaningful = [normalize_token(w) for w in words if normalize_token(w)]
+    prefix = "".join(w[:1] for w in meaningful)
+    return prefix or normalize_token(company)[:2]
+
+
 def prefix_last_2_words(company):
-    return suggest_prefix(company)
+    return prefix_last_n_words(company, 2)
 
 
 def prefix_last_n_mst(mst, n=3):
@@ -1612,6 +1665,7 @@ def compute_prefix_strategies(company, mst):
         "last_2_words": prefix_last_2_words(company),
         "last_3_mst": prefix_last_n_mst(mst, 3),
         "2_words_mst": prefix_2_words_mst(company, mst, 3),
+        "all_name_words": prefix_all_name_words(company),
     }
 
 
@@ -1803,6 +1857,31 @@ def inventory_column_indexes(df, header_index):
     df.iat[header_index, labels["tk vat tu"]] = "TK vật tư"
     df.iat[header_index, labels["ma kho"]] = "Mã kho"
     return labels["tk vat tu"], labels["ma kho"]
+
+
+def customer_code_column_index(df, header_index):
+    label_key = "ma khach hang"
+    column_index = None
+    if 0 <= header_index < len(df):
+        for col in range(df.shape[1]):
+            if normalized_header_label(cell(df, header_index, col)) == label_key:
+                column_index = col
+                break
+    if column_index is None:
+        column_index = df.shape[1]
+        df[df.shape[1]] = ""
+    df.iat[header_index, column_index] = "Mã khách hàng"
+    return column_index
+
+
+def apply_fast_customer_codes(df, header_index, row_customer_codes):
+    if not row_customer_codes:
+        return df
+    customer_index = customer_code_column_index(df, header_index)
+    for row_index, customer_code in row_customer_codes.items():
+        if 0 <= row_index < len(df):
+            df.iat[row_index, customer_index] = raw_text(customer_code)
+    return df
 
 
 def apply_inventory_pairs(df, header_index, processed_row_indexes, data, excluded_row_indexes=None):
@@ -2174,6 +2253,19 @@ def report_loop_progress(progress_callback, done, total, label, interval=200):
         progress_callback(done, total, label)
 
 
+NO_MST_COMPANY_KEY_PREFIX = "__NO_MST__:"
+
+
+def company_selection_key(company="", mst=""):
+    mst_text = raw_text(mst)
+    if mst_text:
+        return mst_text
+    company_text = raw_text(company)
+    company_key = rm_accents(company_text).casefold()
+    company_key = re.sub(r"[^a-z0-9]+", "_", company_key).strip("_")
+    return f"{NO_MST_COMPANY_KEY_PREFIX}{company_key}" if company_key else ""
+
+
 def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None):
     ci, mi, pi = map(excel_col_to_index, [company_col, mst_col, product_col])
     qi = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
@@ -2199,9 +2291,11 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
             continue
         if qi is not None and not should_process_qty(cell(df, i, qi)):
             continue
+        company = "" if pd.isna(cell(df, i, ci)) else str(cell(df, i, ci)).strip()
         mst = "" if pd.isna(cell(df, i, mi)) else str(cell(df, i, mi)).strip()
         product = "" if pd.isna(cell(df, i, pi)) else str(cell(df, i, pi)).strip()
-        if not mst or not product:
+        selection_key = company_selection_key(company, mst)
+        if not product or not selection_key:
             continue
         quantity = parse_quantity(cell(df, i, qi)) if qi is not None else 1
         price = parse_price(cell(df, i, pri)) if pri is not None else None
@@ -2216,7 +2310,9 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
             "invoice_no": raw_text(cell(df, i, 2)),
             "invoice_date": raw_text(cell(df, i, 3)),
             "mst": mst,
-            "company": "" if pd.isna(cell(df, i, ci)) else str(cell(df, i, ci)).strip(),
+            "selection_key": selection_key,
+            "company_key": vietmax_company_identity_key(company, mst),
+            "company": company,
             "address": "" if ai is None or pd.isna(cell(df, i, ai)) else str(cell(df, i, ai)).strip(),
             "product": product,
             "unit": raw_text(cell(df, i, unit_index)),
@@ -2225,6 +2321,39 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
             "amount": amount,
         })
     return rows
+
+
+def missing_mst_company_warnings(df, company_col, mst_col, product_col, qty_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None):
+    ci, mi, pi = map(excel_col_to_index, [company_col, mst_col, product_col])
+    qi = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
+    status_col = str(invoice_status_col or "").strip().upper()
+    status_index = excel_col_to_index(status_col) if status_col else None
+    indexes = [ci, mi, pi]
+    if qi is not None:
+        indexes.append(qi)
+    if status_index is not None and df.shape[1] > status_index:
+        indexes.append(status_index)
+    if df.shape[1] <= max(indexes):
+        return []
+    warnings = {}
+    for i in range(len(df)):
+        if status_index is not None and df.shape[1] > status_index and ignored_invoice_status(cell(df, i, status_index), invoice_status_skip_values):
+            continue
+        if qi is not None and not should_process_qty(cell(df, i, qi)):
+            continue
+        company = raw_text(cell(df, i, ci))
+        mst = raw_text(cell(df, i, mi))
+        product = raw_text(cell(df, i, pi))
+        if mst or not company or not product:
+            continue
+        item = warnings.setdefault(company, {"company": company, "count": 0, "rows": [], "invoice_nos": []})
+        item["count"] += 1
+        if len(item["rows"]) < 20:
+            item["rows"].append(i + 1)
+        invoice_no = raw_text(cell(df, i, 2)) if df.shape[1] > 2 else ""
+        if invoice_no and invoice_no not in item["invoice_nos"] and len(item["invoice_nos"]) < 20:
+            item["invoice_nos"].append(invoice_no)
+    return sorted(warnings.values(), key=lambda item: item["company"].casefold())
 
 
 def vietmax_ban_ra_match_key(value):
@@ -3573,26 +3702,31 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
     by = {}
     addresses = {}
     products = {}
+    msts = {}
     for row_index, r in enumerate(rows):
         report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang gom công ty và hàng hóa")
-        by.setdefault(r["mst"], []).append(r["company"])
+        company_id = r.get("selection_key") or company_selection_key(r.get("company"), r.get("mst"))
+        by.setdefault(company_id, []).append(r["company"])
+        msts.setdefault(company_id, []).append(r["mst"])
         if r["address"]:
-            addresses.setdefault(r["mst"], []).append(r["address"])
-        products.setdefault(r["mst"], {}).setdefault(r["product"], []).append(r)
+            addresses.setdefault(company_id, []).append(r["address"])
+        products.setdefault(company_id, {}).setdefault(r["product"], []).append(r)
 
-    mst_company = {mst: choose_company(names) for mst, names in by.items()}
-    suggestions = {mst: suggest_prefix(comp) for mst, comp in mst_company.items()}
+    mst_company = {company_id: choose_company(names) for company_id, names in by.items()}
+    suggestions = {company_id: suggest_prefix(comp) for company_id, comp in mst_company.items()}
     cnt = Counter(s for s in suggestions.values() if s)
     companies_data = []
     saved_prefixes = profile_cfg.get("prefixes") or {}
     saved_selected = profile_cfg.get("selected_products") or {}
 
-    for company_index, mst in enumerate(mst_company):
+    for company_index, company_id in enumerate(mst_company):
         report_loop_progress(progress_callback, company_index + 1, len(mst_company), "Đang dựng danh sách công ty", interval=50)
-        suggested = saved_prefixes.get(mst) or suggestions[mst]
-        prefix_strategies = compute_prefix_strategies(mst_company[mst], mst)
+        mst_values = unique_values(msts.get(company_id, []))
+        mst = raw_text(mst_values[0]) if mst_values else ""
+        suggested = saved_prefixes.get(company_id) or (saved_prefixes.get(mst) if mst else "") or suggestions[company_id]
+        prefix_strategies = compute_prefix_strategies(mst_company[company_id], mst)
         product_items = []
-        for name, product_rows in products.get(mst, {}).items():
+        for name, product_rows in products.get(company_id, {}).items():
             prices = [r["price"] for r in product_rows if r["price"] is not None]
             price_rows = [{
                 "price": r["price"],
@@ -3613,29 +3747,33 @@ def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price
                 "priceCount": len(set(prices)),
                 "priceRows": price_rows,
             })
-        skipped_list = saved_selected.get(mst)
+        skipped_list = saved_selected.get(company_id)
+        if skipped_list is None and mst:
+            skipped_list = saved_selected.get(mst)
         skipped_set = set(skipped_list) if isinstance(skipped_list, list) else set()
         companies_data.append({
             "mst": str(mst),
-            "company": str(mst_company[mst]),
-            "address": unique_values(addresses.get(mst, []))[0] if addresses.get(mst) else "",
-            "addresses": unique_values(addresses.get(mst, [])),
-            "all_names": [str(n) for n in unique_values(by[mst])],
+            "company_id": str(company_id),
+            "missing_mst": not bool(mst),
+            "company": str(mst_company[company_id]),
+            "address": unique_values(addresses.get(company_id, []))[0] if addresses.get(company_id) else "",
+            "addresses": unique_values(addresses.get(company_id, [])),
+            "all_names": [str(n) for n in unique_values(by[company_id])],
             "all_products": product_items,
             "selected_product_names": [p["name"] for p in product_items if p["name"] not in skipped_set],
-            "count": int(len(by[mst])),
-            "default_prefix": str(suggestions[mst]),
+            "count": int(len(by[company_id])),
+            "default_prefix": str(suggestions[company_id]),
             "suggested": str(suggested),
             "value": str(suggested),
-            "needs_manual": (not suggested) or cnt[suggestions[mst]] > 1,
-            "status": "OK" if suggested and cnt[suggestions[mst]] <= 1 else "Need manual check",
+            "needs_manual": (not suggested) or cnt[suggestions[company_id]] > 1,
+            "status": "OK" if suggested and cnt[suggestions[company_id]] <= 1 else "Need manual check",
             "prefix_strategies": prefix_strategies,
         })
 
-    companies_data.sort(key=lambda x: (x["mst"], x["company"]))
+    companies_data.sort(key=lambda x: (x["mst"] or "~~~~", x["company"]))
     for idx, item in enumerate(companies_data):
         item["safe_id"] = str(idx)
-    return {"rows_to_process": int(len(rows)), "company_count": int(len(companies_data)), "companies": companies_data}
+    return {"rows_to_process": int(len(rows)), "company_count": int(len(companies_data)), "companies": companies_data, "missing_mst_companies": [], "missing_mst_row_count": 0}
 
 
 def resolve_output_path(original, requested_path):
@@ -3778,10 +3916,11 @@ def process_workbook(path, out, data, progress_callback=None):
     for row_index, r in enumerate(rows):
         report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang kiểm tra quy tắc giá")
         mst = r["mst"]
+        company_id = r.get("selection_key") or company_selection_key(r.get("company"), mst)
         prod = r["product"]
-        if (include_company_prefix and mst not in prefix_map) or prod not in selected_products.get(mst, set()):
+        if (include_company_prefix and company_id not in prefix_map) or prod not in selected_products.get(company_id, set()):
             continue
-        key = product_key(mst, prod)
+        key = product_key(company_id, prod)
         purchase_merge = find_vietmax_internal_merge(
             vietmax_purchase_internal_merges,
             prod,
@@ -3802,7 +3941,7 @@ def process_workbook(path, out, data, progress_callback=None):
         if not base_code:
             base_code = str(manual_code_overrides.get(key) or "").strip()
         if not base_code:
-            base_code = make_code(mst, effective_purchase_prod, 1, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
+            base_code = make_code(company_id, effective_purchase_prod, 1, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=False, include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         base_code = sanitize_product_code(base_code)
         rule = price_rules.get(key) or price_range_rules.get(base_code)
         if not rule:
@@ -3813,6 +3952,7 @@ def process_workbook(path, out, data, progress_callback=None):
 
     processed_row_indexes = set()
     vietmax_purchase_match_row_indexes = set()
+    sales_customer_codes = {}
     sales_amount_index = qi + 4 if uses_vietmax_sales and qi is not None else None
     sales_tax_rate_index = qi + 3 if uses_vietmax_sales and qi is not None else None
     sales_tax_amount_index = qi + 5 if uses_vietmax_sales and qi is not None else None
@@ -3821,8 +3961,9 @@ def process_workbook(path, out, data, progress_callback=None):
         report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang tạo mã VT cho dòng xử lý")
         i = row["excel_row"] - 1
         mst = row["mst"]
+        company_id = row.get("selection_key") or company_selection_key(row.get("company"), mst)
         prod = row["product"]
-        key = product_key(mst, prod)
+        key = product_key(company_id, prod)
         qty = cell(df, i, qi) if qi is not None else 1
         purchase_merge = find_vietmax_internal_merge(
             vietmax_purchase_internal_merges,
@@ -3847,7 +3988,7 @@ def process_workbook(path, out, data, progress_callback=None):
         if not matched_purchase_match and vietmax_comparison_scope != VIETMAX_COMPARISON_SCOPE_SAME_COMPANY:
             matched_purchase_match = vietmax_purchase_matches.get(vietmax_ban_ra_match_key(effective_prod))
         matched_purchase_code = raw_text(matched_purchase_match.get("purchase_code")) if matched_purchase_match else ""
-        selected_for_processing = not ((include_company_prefix and mst not in prefix_map) or prod not in selected_products.get(mst, set()))
+        selected_for_processing = not ((include_company_prefix and company_id not in prefix_map) or prod not in selected_products.get(company_id, set()))
         if not selected_for_processing and not matched_purchase_match:
             continue
         code = matched_purchase_code if matched_purchase_match and not selected_for_processing else ""
@@ -3873,13 +4014,17 @@ def process_workbook(path, out, data, progress_callback=None):
             code = str(manual_code_overrides.get(key) or "").strip()
         code = sanitize_product_code(code)
         if not code:
-            code = make_code(mst, effective_prod, qty, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
+            code = make_code(company_id, effective_prod, qty, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         rule = price_rules.get(key) or price_range_rules.get(code)
         if code and rule and pri is not None:
             code += price_group_suffix(parse_price(cell(df, i, pri)), rule, occupied.get(key))
         code = sanitize_product_code(code)
         if code:
             df.iat[i, oi] = code
+            if uses_vietmax_sales:
+                customer_code = raw_text(mst) or raw_text(prefix_map.get(company_id))
+                if customer_code:
+                    sales_customer_codes[i] = customer_code
             if purchase_merge:
                 df.iat[i, pi] = purchase_effective_prod
                 similar_unit = raw_text(purchase_merge.get("similar_unit"))
@@ -3914,6 +4059,8 @@ def process_workbook(path, out, data, progress_callback=None):
 
     df = apply_inventory_pairs(df, header_index, processed_row_indexes, data, excluded_row_indexes=vietmax_purchase_match_row_indexes)
     df = apply_vietmax_ban_ra_match_inventory(df, header_index, vietmax_purchase_match_row_indexes)
+    if uses_vietmax_sales:
+        df = apply_fast_customer_codes(df, header_index, sales_customer_codes)
 
     keep_indexes = [
         i for i in range(len(df))
@@ -3970,6 +4117,20 @@ def processed_inventory_column_indexes(processed_df, output_code_index):
         if key in labels and labels[key] is None:
             labels[key] = col
     return {"tk_vat_tu": labels["tk vat tu"], "ma_kho": labels["ma kho"]}
+
+
+def processed_customer_code_column_index(processed_df, output_code_index):
+    header_index = None
+    for row in range(len(processed_df)):
+        if "ma vt" in normalized_header_label(cell(processed_df, row, output_code_index)):
+            header_index = row
+            break
+    if header_index is None:
+        return None
+    for col in range(processed_df.shape[1]):
+        if normalized_header_label(cell(processed_df, header_index, col)) == "ma khach hang":
+            return col
+    return None
 
 
 def up_workbook_template_path(*names):
@@ -4438,6 +4599,7 @@ def fast_processed_rows(processed_df, progress_callback=None, label="Đang đọ
     indexes = processed_vietmax_source_indexes()
     validate_fast_import_processed_dataframe(processed_df, label)
     inventory_indexes = processed_inventory_column_indexes(processed_df, indexes["L"])
+    customer_code_index = processed_customer_code_column_index(processed_df, indexes["L"])
     rows = []
     for row in range(len(processed_df)):
         report_loop_progress(progress_callback, row + 1, len(processed_df), label, interval=500)
@@ -4464,6 +4626,7 @@ def fast_processed_rows(processed_df, progress_callback=None, label="Đang đọ
             "seller_address": fast_import_cell_value(processed_df, row, "H", indexes),
             "buyer_name": fast_import_cell_value(processed_df, row, "I", indexes),
             "buyer_mst": fast_import_cell_value(processed_df, row, "J", indexes),
+            "buyer_customer_code": up_source_value(processed_df, row, customer_code_index) if customer_code_index is not None else "",
             "buyer_address": fast_import_cell_value(processed_df, row, "K", indexes),
             "ma_vt": ma_vt,
             "product": product,
@@ -4671,8 +4834,9 @@ def fast_import_sheet_rows(purchase_df=None, sales_df=None, progress_callback=No
     ban_ra_rows = []
     for row in sales_rows:
         tk_dt = fast_tk_doanh_thu(row["tk_vat_tu"])
+        buyer_customer_code = raw_text(row.get("buyer_customer_code")) or row["buyer_mst"]
         ban_ra_rows.append(fast_import_row(FAST_HOA_DON_BAN_HANG_HEADERS, {
-            1: row["buyer_mst"],
+            1: buyer_customer_code,
             5: row["invoice_no"],
             6: row["invoice_date"],
             8: row["qty"],
@@ -4716,20 +4880,22 @@ def fast_import_sheet_rows(purchase_df=None, sales_df=None, progress_callback=No
     dm_vat_tu_rows = list(product_rows_by_code.values())
     mark("Đã dựng dữ liệu DMvat tu")
 
-    customer_rows_by_mst = {}
+    customer_rows_by_code = {}
     for row, role in [(row, "seller") for row in purchase_rows] + [(row, "buyer") for row in sales_rows]:
         mst = raw_text(row.get(f"{role}_mst"))
-        if not mst or mst in customer_rows_by_mst:
+        customer_code = raw_text(row.get(f"{role}_customer_code")) if role == "buyer" else ""
+        ma_kh = customer_code or mst
+        if not ma_kh or ma_kh in customer_rows_by_code:
             continue
         name = row.get(f"{role}_name") or ""
         address = row.get(f"{role}_address") or ""
-        customer_rows_by_mst[mst] = fast_import_row(FAST_DM_KHACH_HANG_HEADERS, {
-            1: mst,
+        customer_rows_by_code[ma_kh] = fast_import_row(FAST_DM_KHACH_HANG_HEADERS, {
+            1: ma_kh,
             2: name,
             4: mst,
             5: address,
         })
-    dm_khach_hang_rows = list(customer_rows_by_mst.values())
+    dm_khach_hang_rows = list(customer_rows_by_code.values())
     mark("Đã dựng dữ liệu DMkhachhang")
 
     result = {}
@@ -5116,4 +5282,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
