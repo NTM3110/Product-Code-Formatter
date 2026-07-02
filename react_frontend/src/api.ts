@@ -1,4 +1,4 @@
-import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from './types';
+import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from './types';
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
@@ -8,10 +8,25 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   throw new Error(String(payload.detail || payload.error || response.statusText));
 }
 
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Request took too long and was stopped. Please try again or check whether the workbook is open in Excel.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 export async function uploadExcel(file: File): Promise<UploadSummary> {
   const form = new FormData();
   form.append('file', file);
-  return parseJsonResponse<UploadSummary>(await fetch('/api/files/upload', { method: 'POST', body: form }));
+  return parseJsonResponse<UploadSummary>(await fetchWithTimeout('/api/files/upload', { method: 'POST', body: form }, 180000));
 }
 
 export async function uploadEstimateWorkbook(file: File): Promise<EstimateUploadSummary> {
@@ -68,7 +83,7 @@ export async function fetchInvoiceStatuses(savedName: string, invoiceStatusCol: 
   return result.invoice_statuses || [];
 }
 
-export async function previewGenericProductCodes(payload: { profile: string; products: string[]; word_rules?: Record<string, string>; first_word_rules?: Record<string, string>; repeated_phrase_removals?: string[] }) {
+export async function previewGenericProductCodes(payload: { profile: string; products: string[]; word_rules?: Record<string, string>; first_word_rules?: Record<string, string>; repeated_phrase_removals?: string[]; product_code_replacements?: Record<string, string> }) {
   return parseJsonResponse<{ codes: Record<string, string> }>(
     await fetch('/api/product-preview', {
       method: 'POST',
@@ -91,6 +106,24 @@ export async function processGenericWorkbook(payload: Record<string, unknown>): 
   return response.blob();
 }
 
+export async function importProductCodeReplacements(file: File) {
+  const form = new FormData();
+  form.append('file', file);
+  return parseJsonResponse<{ product_code_replacements: Record<string, string>; count: number }>(
+    await fetchWithTimeout('/api/product-code-replacements/import', { method: 'POST', body: form }, 180000),
+  );
+}
+
+export async function processGenericWorkbookCache(payload: Record<string, unknown>, operationId = ''): Promise<ProcessResult> {
+  return parseJsonResponse<ProcessResult>(
+    await fetch('/api/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, cache_only: true, operation_id: operationId }),
+    }),
+  );
+}
+
 export async function exportPriceReportWorkbook(payload: Record<string, unknown>): Promise<Blob> {
   const response = await fetch('/api/export_price_report', {
     method: 'POST',
@@ -106,21 +139,25 @@ export async function exportPriceReportWorkbook(payload: Record<string, unknown>
 
 export async function inspectProcessedVietmaxFile(savedName: string, phase: 'purchase' | 'sales'): Promise<ProcessedFileStats> {
   return parseJsonResponse<ProcessedFileStats>(
-    await fetch('/api/vietmax/processed-file-stats', {
+    await fetchWithTimeout('/api/vietmax/processed-file-stats', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ saved_name: savedName, phase }),
-    }),
+    }, 120000),
   );
+}
+
+export async function getVietmaxFormatMappingDefaults(): Promise<FormatMappingDefaults> {
+  return parseJsonResponse<FormatMappingDefaults>(await fetch('/api/vietmax/format-mapping-defaults'));
 }
 
 export async function validateFastImportProcessedFile(savedName: string, phase: 'purchase' | 'sales'): Promise<{ valid_rows: number; tk_vat_tu_col: string; ma_kho_col: string }> {
   return parseJsonResponse<{ valid_rows: number; tk_vat_tu_col: string; ma_kho_col: string }>(
-    await fetch('/api/vietmax/validate-fast-import-processed', {
+    await fetchWithTimeout('/api/vietmax/validate-fast-import-processed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ saved_name: savedName, phase }),
-    }),
+    }, 120000),
   );
 }
 
@@ -156,12 +193,12 @@ export async function createPurchaseReview(savedName: string, comparisonScope: s
   );
 }
 
-export async function createGenericReview(savedName: string, profile: string, comparisonScope: string, wordRules: Record<string, string>, firstWordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[], operationId = '') {
+export async function createGenericReview(savedName: string, profile: string, comparisonScope: string, wordRules: Record<string, string>, firstWordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[], operationId = '', phase: 'purchase' | 'sales' = 'purchase') {
   return parseJsonResponse<{ products: unknown[]; review_rows: unknown[] }>(
     await fetch('/api/review', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ saved_name: savedName, profile, comparison_scope: comparisonScope, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId }),
+      body: JSON.stringify({ saved_name: savedName, profile, vietmax_phase: phase, comparison_scope: comparisonScope, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId }),
     }),
   );
 }
@@ -175,7 +212,7 @@ export async function analyzeVietmaxCompanies(savedName: string, phase: 'purchas
   const mst_col = columns.mst_col || (phase === 'sales' ? 'J' : 'G');
   const address_col = columns.address_col || (phase === 'sales' ? 'K' : 'H');
   const invoiceStatusSkipValues = columns.invoice_status_skip_values || vietmaxInvoiceStatusSkipValues;
-  return parseJsonResponse<{ rows_to_process: number; company_count: number; companies: CompanyRow[]; missing_mst_companies?: MissingMstCompanyWarning[]; missing_mst_row_count?: number; manual_code_overrides?: Record<string, string>; word_rules?: Record<string, string>; repeated_phrase_removals?: string[]; inventory_pairs?: InventoryPair[]; use_default_inventory_pair?: boolean; default_inventory_pair_id?: string; inventory_pair_rules?: InventoryRule[]; sales_match_rules?: MatchRow[]; vietmax_mua_vao_internal_merges?: ReviewRow[]; vietmax_ban_ra_sales_internal_merges?: ReviewRow[]; include_company_prefix?: boolean; prefix_strategy?: string; prefix_mst_digits?: number; prefix_name_words?: number; prefix_name_chars?: number; prefix_missing_mst_strategy?: string; prefix_strategy_values?: Record<string, Record<string, string>>; columns?: Record<string, unknown> }>(
+  return parseJsonResponse<{ rows_to_process: number; company_count: number; companies: CompanyRow[]; missing_mst_companies?: MissingMstCompanyWarning[]; missing_mst_row_count?: number; manual_code_overrides?: Record<string, string>; product_code_replacements?: Record<string, string>; word_rules?: Record<string, string>; repeated_phrase_removals?: string[]; inventory_pairs?: InventoryPair[]; use_default_inventory_pair?: boolean; default_inventory_pair_id?: string; inventory_pair_rules?: InventoryRule[]; sales_match_rules?: MatchRow[]; vietmax_mua_vao_internal_merges?: ReviewRow[]; vietmax_ban_ra_sales_internal_merges?: ReviewRow[]; include_company_prefix?: boolean; prefix_strategy?: string; prefix_mst_digits?: number; prefix_name_words?: number; prefix_name_chars?: number; prefix_missing_mst_strategy?: string; prefix_strategy_values?: Record<string, Record<string, string>>; processing_groups?: import('./types').ProcessingGroup[]; company_group_assignments?: Record<string, string>; form_mapping_presets?: import('./types').FormMappingPreset[]; columns?: Record<string, unknown> }>(
     await fetch('/api/vietmax/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -184,12 +221,12 @@ export async function analyzeVietmaxCompanies(savedName: string, phase: 'purchas
   );
 }
 
-export async function previewVietmaxProductCodes(products: string[], wordRules: Record<string, string>, repeatedPhraseRemovals: string[], phase: 'purchase' | 'sales' = 'purchase') {
+export async function previewVietmaxProductCodes(products: string[], wordRules: Record<string, string>, repeatedPhraseRemovals: string[], phase: 'purchase' | 'sales' = 'purchase', productCodeReplacements: Record<string, string> = {}) {
   return parseJsonResponse<{ codes: Record<string, string> }>(
     await fetch('/api/vietmax/product-preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phase, products, word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals }),
+      body: JSON.stringify({ phase, products, word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals, product_code_replacements: productCodeReplacements }),
     }),
   );
 }
@@ -256,11 +293,32 @@ export async function downloadCachedFile(savedName: string): Promise<Blob> {
   return response.blob();
 }
 
-export async function createVietmaxFastImportPackage(purchaseSavedName: string, salesSavedName: string, operationId = ''): Promise<Blob> {
+export type VietmaxFastImportMappingPayload = {
+  profile?: string;
+  purchaseOriginalSavedName?: string;
+  salesOriginalSavedName?: string;
+  purchaseFormMappingPresets?: FormMappingPreset[];
+  salesFormMappingPresets?: FormMappingPreset[];
+  purchaseCompanyGroupAssignments?: Record<string, string>;
+  salesCompanyGroupAssignments?: Record<string, string>;
+};
+
+export async function createVietmaxFastImportPackage(purchaseSavedName: string, salesSavedName: string, operationId = '', mappingPayload: VietmaxFastImportMappingPayload = {}): Promise<Blob> {
   const response = await fetch('/api/vietmax/fast-import-package', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ purchase_saved_name: purchaseSavedName, sales_saved_name: salesSavedName, operation_id: operationId }),
+    body: JSON.stringify({
+      profile: mappingPayload.profile || 'vietmax',
+      purchase_saved_name: purchaseSavedName,
+      sales_saved_name: salesSavedName,
+      purchase_original_saved_name: mappingPayload.purchaseOriginalSavedName || '',
+      sales_original_saved_name: mappingPayload.salesOriginalSavedName || '',
+      purchase_form_mapping_presets: mappingPayload.purchaseFormMappingPresets,
+      sales_form_mapping_presets: mappingPayload.salesFormMappingPresets,
+      purchase_company_group_assignments: mappingPayload.purchaseCompanyGroupAssignments,
+      sales_company_group_assignments: mappingPayload.salesCompanyGroupAssignments,
+      operation_id: operationId,
+    }),
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));

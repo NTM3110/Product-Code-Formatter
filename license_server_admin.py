@@ -31,6 +31,7 @@ DEFAULT_ADMIN_OPTIONS = {
         {"key": "cao_thanh", "label": "Cao Thành"},
         {"key": "quang_thinh", "label": "Quang Thịnh"},
         {"key": "vietmax", "label": "Vietmax"},
+        {"key": "ho_guom", "label": "Hồ Gươm"},
     ],
     "products": [
         {"code": "product-code-formatter", "name": "Product Code Formatter", "label": "Product Code Formatter", "uses_profiles": True, "application": "ProductCodeFormatter"},

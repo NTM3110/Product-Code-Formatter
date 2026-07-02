@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useState } from 'react';
-import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel, validateFastImportProcessedFile } from '../api';
-import type { CompanyRow, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from '../types';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, getVietmaxFormatMappingDefaults, importProductCodeReplacements, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, processGenericWorkbookCache, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel, validateFastImportProcessedFile } from '../api';
+import type { CompanyRow, FormatMappingDefaults, FormColumn, FormMappingPreset, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ProcessingForm, ProcessingGroup, ReviewProduct, ReviewRow, UploadSummary } from '../types';
 import { EstimateExtractorWorkflow } from '../estimate/EstimateExtractorWorkflow';
 import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
 import { StageNavigation } from './StageNavigation';
@@ -9,6 +9,525 @@ import { isGenericProfileKey, isStageId, profiles, stagesForProfile, type Prefix
 
 type PrefixStrategyValues = Record<PrefixPresetStrategy, Record<string, string>>;
 type InventoryConfigScope = 'purchase' | 'sales' | 'generic';
+type FormatScope = 'purchase' | 'sales' | 'both';
+const MATERIALS_GROUP_ID = 'materials';
+const SERVICE_GROUP_ID = 'services';
+const IGNORED_GROUP_ID = 'ignored';
+const FORMAT_SCOPE_LABELS: Record<FormatScope, string> = {
+  purchase: 'Mua vào',
+  sales: 'Bán ra',
+  both: 'Mua vào + Bán ra',
+};
+const MAPPING_RULE_OPTIONS = [
+  { value: 'source_column', label: 'Cột nguồn' },
+  { value: 'if_rules', label: 'IF' },
+  { value: 'text', label: 'Giá trị cố định' },
+  { value: 'empty', label: 'Để trống' },
+];
+type MappingTransformRule = NonNullable<NonNullable<FormMappingPreset['mappings']>[number]['transform_rules']>[number];
+const DEFAULT_REVENUE_ACCOUNT_RULES: MappingTransformRule[] = [
+  { match_type: 'starts_with', value: '152', result: '5111' },
+  { match_type: 'starts_with', value: '155', result: '5112' },
+  { match_type: 'default', value: '', result: '5112' },
+];
+const DEFAULT_MATERIAL_TYPE_RULES: MappingTransformRule[] = [
+  { match_type: 'starts_with', value: '152', result: '21' },
+  { match_type: 'default', value: '', result: '51' },
+];
+const TRANSFORM_RULE_MATCH_OPTIONS = [
+  { value: 'starts_with', label: 'Bắt đầu bằng', needsValue: true },
+  { value: 'equals', label: 'Bằng', needsValue: true },
+  { value: 'not_equals', label: 'Khác', needsValue: true },
+  { value: 'contains', label: 'Có chứa', needsValue: true },
+  { value: 'not_contains', label: 'Không chứa', needsValue: true },
+  { value: 'ends_with', label: 'Kết thúc bằng', needsValue: true },
+  { value: 'regex', label: 'Regex', needsValue: true },
+  { value: 'blank', label: 'Rỗng', needsValue: false },
+  { value: 'not_blank', label: 'Không rỗng', needsValue: false },
+  { value: 'gt', label: 'Số >', needsValue: true },
+  { value: 'gte', label: 'Số >=', needsValue: true },
+  { value: 'lt', label: 'Số <', needsValue: true },
+  { value: 'lte', label: 'Số <=', needsValue: true },
+  { value: 'default', label: 'Mặc định', needsValue: false },
+];
+
+const fallbackFdiSourceColumns: FormColumn[] = [
+  ['A', 'Mẫu HĐ'],
+  ['B', 'Số seri'],
+  ['C', 'Số chứng từ'],
+  ['D', 'Ngày chứng từ'],
+  ['F', 'Người bán'],
+  ['G', 'MST người bán'],
+  ['H', 'Địa chỉ người bán'],
+  ['I', 'Người mua'],
+  ['J', 'MST người mua'],
+  ['K', 'Địa chỉ người mua'],
+  ['L', 'Mã VT'],
+  ['M', 'Tên hàng'],
+  ['N', 'ĐVT'],
+  ['O', 'Số lượng'],
+  ['P', 'Đơn giá'],
+  ['R', 'Thuế'],
+  ['V', 'Tiền hàng'],
+  ['W', 'Tiền thuế'],
+  ['AQ', 'Mã ngoại tệ'],
+  ['AR', 'Tỷ giá'],
+  ['AS', 'TK vật tư'],
+  ['AT', 'Mã kho'],
+  ['AU', 'Mã khách hàng'],
+].map(([letter, header]) => ({ letter, header, label: `${letter}. ${header}` }));
+
+function outputColumns(labels: string[]): FormColumn[] {
+  return labels.map((header, index) => ({ letter: indexToColumnLetter(index), header, label: `${indexToColumnLetter(index)}. ${header}` }));
+}
+
+function indexToColumnLetter(index: number) {
+  let value = index + 1;
+  let result = '';
+  while (value > 0) {
+    const mod = (value - 1) % 26;
+    result = String.fromCharCode(65 + mod) + result;
+    value = Math.floor((value - mod) / 26);
+  }
+  return result;
+}
+
+function columnLetterToIndex(letter: string | undefined) {
+  const normalized = String(letter || '').trim().toUpperCase();
+  if (!/^[A-Z]+$/.test(normalized)) return Number.MAX_SAFE_INTEGER;
+  return normalized.split('').reduce((total, char) => total * 26 + char.charCodeAt(0) - 64, 0);
+}
+
+function mappingRule(target_col: string, source_col = '', source_phase: 'purchase' | 'sales' | 'both' = 'purchase', source_type = 'source_column', extra: Partial<NonNullable<FormMappingPreset['mappings']>[number]> = {}) {
+  return { target_col, source_col, source_phase, source_type, ...extra };
+}
+
+function isTextMappingRule(rule: Partial<NonNullable<FormMappingPreset['mappings']>[number]>) {
+  return rule.source_type === 'constant' || rule.source_type === 'text_template' || rule.source_type === 'text';
+}
+
+function textSourceTypeForValue(value: string | undefined) {
+  return /\{[A-Za-z]{1,3}\}/.test(String(value || '')) ? 'text_template' : 'constant';
+}
+
+function mappingRuleControlValue(rule: Partial<NonNullable<FormMappingPreset['mappings']>[number]>) {
+  if (isTextMappingRule(rule)) return 'text';
+  if (rule.source_type === 'if_rules' || rule.source_type === 'if_empty_prefix_before_dot' || rule.source_type === 'conditional_rules' || supportsCustomTransformRules(rule.transform)) return 'if_rules';
+  return rule.source_type || 'source_column';
+}
+
+function defaultConditionRules(rule: Partial<NonNullable<FormMappingPreset['mappings']>[number]>, defaultSourceCol = ''): MappingTransformRule[] {
+  if (rule.transform_rules?.length) return rule.transform_rules.map((item) => ({ ...item, source_col: item.source_col || defaultSourceCol }));
+  const defaults = defaultTransformRules(rule.transform);
+  return defaults.length ? defaults.map((item) => ({ source_col: defaultSourceCol, ...item })) : [{ source_col: defaultSourceCol, match_type: 'blank', value: '', result: '' }];
+}
+
+function defaultTransformRules(transform: string | undefined): MappingTransformRule[] {
+  if (transform === 'revenue_account_from_inventory_account') return DEFAULT_REVENUE_ACCOUNT_RULES.map((rule) => ({ ...rule }));
+  if (transform === 'material_type_from_inventory_account') return DEFAULT_MATERIAL_TYPE_RULES.map((rule) => ({ ...rule }));
+  return [];
+}
+
+function supportsCustomTransformRules(transform: string | undefined) {
+  return transform === 'revenue_account_from_inventory_account' || transform === 'material_type_from_inventory_account';
+}
+
+function normalizeTransformRules(raw: unknown, transform: string | undefined, defaultSourceCol = ''): MappingTransformRule[] | undefined {
+  if (!supportsCustomTransformRules(transform) && (!Array.isArray(raw) || !raw.length)) return undefined;
+  const rows = Array.isArray(raw) && raw.length ? raw : defaultTransformRules(transform);
+  const normalizedRules: MappingTransformRule[] = [];
+  rows.forEach((item) => {
+    const rule = (item || {}) as MappingTransformRule;
+    const source_col = String(rule.source_col || defaultSourceCol || '').trim().toUpperCase();
+    const match_type = TRANSFORM_RULE_MATCH_OPTIONS.some((option) => option.value === rule.match_type) ? String(rule.match_type) : 'starts_with';
+    const result = String(rule.result ?? '').trim();
+    const needsValue = TRANSFORM_RULE_MATCH_OPTIONS.find((option) => option.value === match_type)?.needsValue !== false;
+    const value = needsValue ? String(rule.value ?? '').trim() : '';
+    if (match_type !== 'default' && !source_col) return;
+    if (!result || (needsValue && !value)) return;
+    normalizedRules.push({ source_col, match_type, value, result });
+  });
+  return normalizedRules;
+}
+
+function mappingTargetOrder(rule: NonNullable<FormMappingPreset['mappings']>[number], outputColumns: FormColumn[] = []) {
+  const outputIndex = outputColumns.findIndex((column) => column.letter === rule.target_col);
+  return outputIndex >= 0 ? outputIndex + 1 : columnLetterToIndex(rule.target_col);
+}
+
+function sortedMappingsForDisplay(mappings: NonNullable<FormMappingPreset['mappings']> = [], outputColumns: FormColumn[] = []) {
+  return mappings
+    .map((rule, originalIndex) => ({ rule, originalIndex }))
+    .sort((left, right) => {
+      const byTarget = mappingTargetOrder(left.rule, outputColumns) - mappingTargetOrder(right.rule, outputColumns);
+      return byTarget || left.originalIndex - right.originalIndex;
+    });
+}
+
+function normalizeMappingRuleForSave(rule: NonNullable<FormMappingPreset['mappings']>[number]) {
+  const target_col = String(rule.target_col || '').trim().toUpperCase();
+  if (!target_col) return null;
+  const controlValue = mappingRuleControlValue(rule);
+  const source_type = String(controlValue || rule.source_type || 'source_column');
+  const normalized = {
+    ...rule,
+    target_col,
+    source_phase: rule.source_phase || 'purchase',
+    source_col: String(rule.source_col || '').trim().toUpperCase(),
+    condition_source_col: String(rule.condition_source_col || rule.fallback_source_col || '').trim().toUpperCase(),
+    fallback_source_col: String(rule.fallback_source_col || '').trim().toUpperCase(),
+    fallback_delimiter: rule.fallback_delimiter || '.',
+  };
+  const transform_rules = normalizeTransformRules(rule.transform_rules, supportsCustomTransformRules(normalized.transform) ? normalized.transform : undefined, normalized.condition_source_col || normalized.source_col);
+  if (source_type === 'empty') {
+    return { ...normalized, transform: undefined, transform_rules: undefined, source_type: 'empty', source_col: '', condition_source_col: '', fallback_source_col: '' };
+  }
+  if (isTextMappingRule(normalized)) {
+    const value = String(normalized.value ?? '');
+    if (!value) return null;
+    return { ...normalized, transform: undefined, transform_rules: undefined, source_type: textSourceTypeForValue(value), source_col: '', condition_source_col: '', fallback_source_col: '', value };
+  }
+  if (source_type === 'if_empty_prefix_before_dot') {
+    if (!normalized.source_col && !normalized.fallback_source_col) return null;
+    return { ...normalized, transform: undefined, transform_rules: undefined, source_type: 'if_empty_prefix_before_dot' };
+  }
+  if (source_type === 'if_rules') {
+    if (!(transform_rules || []).some((item) => item.source_col || item.match_type === 'default')) return null;
+    return { ...normalized, transform: undefined, transform_rules: transform_rules || [], source_type: 'if_rules', source_col: '', condition_source_col: '', fallback_source_col: '' };
+  }
+  if (source_type === 'conditional_rules') {
+    if (!normalized.source_col) return null;
+    return { ...normalized, transform: undefined, transform_rules: transform_rules || [], source_type: 'conditional_rules', condition_source_col: '', fallback_source_col: '' };
+  }
+  if (!normalized.source_col) return null;
+  return { ...normalized, transform_rules: undefined, source_type: 'source_column', condition_source_col: '', fallback_source_col: '' };
+}
+
+function normalizeFormForSave(form: FormMappingPreset): FormMappingPreset {
+  const mappings = (form.mappings || [])
+    .map(normalizeMappingRuleForSave)
+    .filter((rule): rule is NonNullable<ReturnType<typeof normalizeMappingRuleForSave>> => Boolean(rule))
+    .sort((left, right) => mappingTargetOrder(left, form.output_columns || []) - mappingTargetOrder(right, form.output_columns || []));
+  return { ...form, mappings };
+}
+
+function normalizeFormsForSave(forms: FormMappingPreset[] = []) {
+  return forms.map(normalizeFormForSave);
+}
+
+function fallbackDefaultFormMappingPresets(phase: 'purchase' | 'sales' | 'all' = 'all'): FormMappingPreset[] {
+  const purchase: FormMappingPreset = {
+    id: 'fast_hoadonmuahang',
+    label: 'Hoadonmuahang',
+    scope: 'purchase',
+    type: 'builtin',
+    enabled: true,
+    builtin_exporter: 'fast_hoadonmuahang',
+    group_id: MATERIALS_GROUP_ID,
+    input_phase: 'purchase',
+    sheet: 'Hoadonmuahang',
+    output_columns: outputColumns(['Mã khách hàng (ma_kh)', 'Người mua hàng (ong_ba)', 'Diễn giải (dien_giai)', 'Quyển sổ (ma_qs)', 'Mã nx (Tk có) (ma_nx)', 'Số chứng từ (so_ct)', 'Ngày chứng từ (ngay_ct)', 'Mã ngoại tệ (ma_nt)', 'Tỷ giá (ty_gia)', 'Mã kho  (ma_kho)', 'Mã vật tư (ma_vt)', 'Số lượng:Q (so_luong)', 'Giá mua chưa thuế:P0 (gia0)', 'Tiền mua:N0 (tien0)', 'Tk vật tư (tk_vt)', 'Mã dự án (ma_vv_i)', 'Mã ĐVCS (ma_dvcs)', 'Số HĐ thuế (so_ct0)', 'Ngày HĐ (ngay_ct0)', 'Mẫu HĐ (kh_mau_hd)', 'Số seri (so_seri0)', 'Mã thuế (ma_thue)']),
+    mappings: [
+      mappingRule('A', 'G', 'purchase', 'source_column', { transform: 'mst_or_prefix' }),
+      mappingRule('C', '', 'purchase', 'text_template', { value: 'Mua hàng nhập kho HD{C}' }),
+      mappingRule('E', '', 'purchase', 'constant', { value: '331' }),
+      mappingRule('F', 'C', 'purchase'),
+      mappingRule('G', 'D', 'purchase'),
+      mappingRule('H', 'AQ', 'purchase'),
+      mappingRule('I', 'AR', 'purchase'),
+      mappingRule('J', 'AT', 'purchase'),
+      mappingRule('K', 'L', 'purchase'),
+      mappingRule('L', 'O', 'purchase'),
+      mappingRule('M', 'P', 'purchase'),
+      mappingRule('N', 'V', 'purchase'),
+      mappingRule('O', 'AS', 'purchase'),
+      mappingRule('Q', '', 'purchase', 'constant', { value: 'CTY' }),
+      mappingRule('R', 'C', 'purchase'),
+      mappingRule('S', 'D', 'purchase'),
+      mappingRule('V', 'R', 'purchase', 'source_column', { transform: 'tax_code' }),
+    ],
+  };
+  const sales: FormMappingPreset = {
+    id: 'fast_hoadonbanhang',
+    label: 'Hoadonbanhang',
+    scope: 'sales',
+    type: 'builtin',
+    enabled: true,
+    builtin_exporter: 'fast_hoadonbanhang',
+    group_id: MATERIALS_GROUP_ID,
+    input_phase: 'sales',
+    sheet: 'Hoadonbanhang',
+    output_columns: outputColumns(['Mã khách hàng (ma_kh)', 'Người mua hàng (ong_ba)', 'Quyển sổ (ma_qs)', 'Số seri (so_seri)', 'Số chứng từ (so_ct)', 'Ngày chứng từ (ngay_ct)', 'NVBH (ma_bp)', 'Số lượng:Q (so_luong)', 'Giá bán n.tệ:P1 (gia_nt2)', 'Tiền bán n.tệ:N1 (tien_nt2)', 'Giá vốn n.tệ:P1 (gia_nt)', 'Tiền vốn n.tệ:N1 (tien_nt)', 'Mã n.tệ (ma_nt)', 'Tỷ giá:R (ty_gia)', 'Giá bán:P0 (gia2)', 'Tiền bán:N0 (tien2)', 'Giá vốn:P0 (gia)', 'Tiền vốn:N0 (tien)', 'Tỷ lệ chiết khấu (tl_ck)', 'Tiền chiết khấu n.tệ:N1 (tien_ck_nt)', 'Tiền chiết khấu:N0 (tien_ck)', 'Mã thuế (ma_thue)', 'Thuế suất (thue_suat)', 'Tiền thuế n.tệ:N1 (tien_thue_nt)', 'Tiền thuế:N0 (tien_thue)', 'Mã nx (Tk nợ) (ma_nx)', 'Tk doanh thu (tk_dt)', 'Tk vật tư (tk_vt)', 'Tk giá vốn (tk_gv)', 'Tk chiết khấu (tk_ck)', 'Tài khoản thuế (tk_thue_co)', 'Mã kho  (ma_kho)', 'Mã vật tư (ma_vt)', 'Diễn giải (dien_giai)', 'Hạn thanh toán:N (han_tt)', 'Hình thức tt (ht_tt)', 'Loại hoá đơn (ma_gd)', 'Mã dự án (ma_vv_i)', 'Mã phí (ma_phi_i)', 'Mã bpht (ma_bpht_i)', 'Khuyến mại (km_ck)', 'Tk cp km (tk_km_i)', 'Mã ĐVCS (ma_dvcs)', 'Sử dụng HĐĐT (sd_hddt_yn)', 'Tỷ giá hđ:R (ty_gia_hd)', 'Thêm thông tin (xu_ly_hddt)', 'Thông tin thêm (gc_dc_hddt)', 'Mã loại (ma_loai)']),
+    mappings: [
+      mappingRule('A', 'AU', 'sales', 'source_column', { transform: 'mst_or_prefix' }),
+      mappingRule('E', 'C', 'sales'),
+      mappingRule('F', 'D', 'sales'),
+      mappingRule('H', 'O', 'sales'),
+      mappingRule('O', 'P', 'sales'),
+      mappingRule('P', 'V', 'sales'),
+      mappingRule('V', 'R', 'sales', 'source_column', { transform: 'tax_code' }),
+      mappingRule('Y', 'W', 'sales'),
+      mappingRule('Z', '', 'sales', 'constant', { value: '131' }),
+      mappingRule('AA', '', 'sales', 'if_rules', { condition_source_col: 'AS', transform_rules: DEFAULT_REVENUE_ACCOUNT_RULES.map((rule) => ({ source_col: 'AS', ...rule })) }),
+      mappingRule('AB', 'AS', 'sales'),
+      mappingRule('AC', '', 'sales', 'constant', { value: '632' }),
+      mappingRule('AE', '', 'sales', 'constant', { value: '33311' }),
+      mappingRule('AF', 'AT', 'sales'),
+      mappingRule('AG', 'L', 'sales'),
+      mappingRule('AH', '', 'sales', 'constant', { value: 'Xuất bán hàng' }),
+      mappingRule('AK', '', 'sales', 'constant', { value: '1' }),
+      mappingRule('AQ', '', 'sales', 'constant', { value: 'CTY' }),
+      mappingRule('AS', 'AR', 'sales'),
+    ],
+  };
+  const material: FormMappingPreset = {
+    id: 'fast_dm_vat_tu',
+    label: 'Danh sách vật tư',
+    scope: 'both',
+    type: 'builtin',
+    enabled: true,
+    builtin_exporter: 'fast_dm_vat_tu',
+    group_id: MATERIALS_GROUP_ID,
+    input_phase: 'both',
+    sheet: 'DMvat_tu',
+    output_columns: outputColumns(['Mã vật tư', 'Tên vật tư', 'ĐVT', 'Theo dõi tồn kho', 'TK vật tư', 'TK giá vốn', 'TK doanh thu', 'TK hàng bán bị trả lại', 'TK sp dở dang', 'Loại vật tư', 'Cho sửa tk kho', 'TK NVL', 'TK chiết khấu', 'TK khuyến mại', 'Mã phụ', 'Tên 2', 'Cách tính giá tồn kho', 'Nhóm vt 1', 'Nhóm vt 2', 'Nhóm vt 3', 'Số lượng tồn tối thiểu', 'Số lượng tồn tối đa', 'TK chênh lệch vật tư']),
+    mappings: [mappingRule('A', 'L', 'both'), mappingRule('B', 'M', 'both'), mappingRule('C', 'N', 'both'), mappingRule('D', '', 'both', 'constant', { value: '1' }), mappingRule('E', 'AS', 'both'), mappingRule('F', '', 'both', 'constant', { value: '632' }), mappingRule('G', '', 'both', 'if_rules', { condition_source_col: 'AS', transform_rules: DEFAULT_REVENUE_ACCOUNT_RULES.map((rule) => ({ source_col: 'AS', ...rule })) }), mappingRule('J', '', 'both', 'if_rules', { condition_source_col: 'AS', transform_rules: DEFAULT_MATERIAL_TYPE_RULES.map((rule) => ({ source_col: 'AS', ...rule })) }), mappingRule('K', '', 'both', 'constant', { value: '1' }), mappingRule('Q', '', 'both', 'constant', { value: '4' }), mappingRule('W', '', 'both', 'constant', { value: '632' })],
+  };
+  const customer: FormMappingPreset = {
+    id: 'fast_dm_khach_hang',
+    label: 'Danh sách khách hàng',
+    scope: 'both',
+    type: 'builtin',
+    enabled: true,
+    builtin_exporter: 'fast_dm_khach_hang',
+    group_id: MATERIALS_GROUP_ID,
+    input_phase: 'both',
+    sheet: 'DMkhachhang',
+    output_columns: outputColumns(['Mã khách hàng', 'Tên khách hàng', 'Tên 2', 'Mã số thuế', 'Địa chỉ']),
+    mappings: [
+      mappingRule('A', 'G', 'purchase', 'source_column', { transform: 'mst_or_prefix' }),
+      mappingRule('B', 'F', 'purchase'),
+      mappingRule('D', 'G', 'purchase'),
+      mappingRule('E', 'H', 'purchase'),
+      mappingRule('A', 'AU', 'sales', 'source_column', { transform: 'mst_or_prefix' }),
+      mappingRule('B', 'I', 'sales'),
+      mappingRule('D', 'J', 'sales'),
+      mappingRule('E', 'K', 'sales'),
+    ],
+  };
+  const forms = [purchase, sales, material, customer];
+  if (phase === 'purchase') return forms.filter((form) => form.scope === 'purchase' || form.scope === 'both');
+  if (phase === 'sales') return forms.filter((form) => form.scope === 'sales' || form.scope === 'both');
+  return forms;
+}
+
+function mergeFormPreset(defaultPreset: FormMappingPreset | undefined, rawPreset: FormMappingPreset): FormMappingPreset {
+  const preset = { ...(defaultPreset || {}), ...rawPreset };
+  return {
+    ...preset,
+    id: String(preset.id || rawPreset.id || '').trim(),
+    label: String(preset.label || preset.id || ''),
+    mappings: Array.isArray(preset.mappings) ? preset.mappings : (defaultPreset?.mappings || []),
+    output_columns: Array.isArray(preset.output_columns) ? preset.output_columns : (defaultPreset?.output_columns || []),
+  };
+}
+
+function defaultProcessingGroups(phase: 'purchase' | 'sales' | 'generic' = 'purchase'): ProcessingGroup[] {
+  const materialForms: ProcessingForm[] = [
+    { id: 'processed_fdi', label: 'FDI đã xử lý', type: 'builtin', builtin_exporter: 'processed_fdi', enabled: true },
+    ...fallbackDefaultFormMappingPresets(phase === 'sales' ? 'sales' : 'purchase'),
+  ];
+  if (phase !== 'sales') {
+    materialForms.push({ id: 'nhap_kho', label: 'Nhập kho companion', type: 'builtin', builtin_exporter: 'nhap_kho', enabled: true });
+  }
+  return [
+    { id: MATERIALS_GROUP_ID, label: 'Nhóm vật tư', builtin: true, uses_product_code: true, forms: materialForms },
+    { id: SERVICE_GROUP_ID, label: 'Nhóm dịch vụ', builtin: true, uses_product_code: false, forms: [] },
+    { id: IGNORED_GROUP_ID, label: 'Không xử lý', builtin: true, uses_product_code: false, forms: [] },
+  ];
+}
+
+function normalizeProcessingGroups(raw: unknown, phase: 'purchase' | 'sales' | 'generic' = 'purchase'): ProcessingGroup[] {
+  const defaults = defaultProcessingGroups(phase);
+  const rows = Array.isArray(raw) ? raw : [];
+  const byId = new Map(defaults.map((group) => [group.id, group]));
+  rows.forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const group = item as ProcessingGroup;
+    const id = String(group.id || '').trim();
+    if (!id) return;
+    const defaultGroup = byId.get(id);
+    const label = defaultGroup?.builtin ? defaultGroup.label : String(group.label || id);
+    byId.set(id, { ...group, id, label, forms: Array.isArray(group.forms) ? group.forms : [] });
+  });
+  return Array.from(byId.values());
+}
+
+function singlePhaseFormPreset(form: FormMappingPreset, phase: 'purchase' | 'sales'): FormMappingPreset | null {
+  const scope = formatScopeOfForm(form, phase);
+  if (scope !== phase && scope !== 'both') return null;
+  return {
+    ...form,
+    scope: phase,
+    input_phase: phase,
+    mappings: (form.mappings || [])
+      .filter((rule) => !rule.source_phase || rule.source_phase === phase || rule.source_phase === 'both')
+      .map((rule) => ({ ...rule, source_phase: phase })),
+  };
+}
+
+function normalizeFormMappingPresets(raw: unknown, phase: 'purchase' | 'sales' | 'all' = 'purchase', backendDefaults?: FormatMappingDefaults | null, singleInputPhase = false): FormMappingPreset[] {
+  const defaults = backendDefaults?.form_mapping_presets?.length
+    ? backendDefaults.form_mapping_presets.filter((form) => phase === 'all' || form.scope === phase || form.scope === 'both')
+    : fallbackDefaultFormMappingPresets(phase);
+  const preparedDefaults = singleInputPhase && phase !== 'all'
+    ? defaults.map((form) => singlePhaseFormPreset(form, phase)).filter((form): form is FormMappingPreset => Boolean(form))
+    : defaults;
+  const rows = Array.isArray(raw) ? raw : [];
+  const byId = new Map(preparedDefaults.map((preset) => [preset.id, preset]));
+  rows.forEach((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const preset = item as FormMappingPreset;
+    const id = String(preset.id || '').trim();
+    if (!id) return;
+    const merged = mergeFormPreset(byId.get(id), { ...preset, id });
+    const prepared = singleInputPhase && phase !== 'all' ? singlePhaseFormPreset(merged, phase) : merged;
+    if (prepared) byId.set(id, prepared);
+  });
+  return Array.from(byId.values()).filter((preset) => preset.enabled !== false);
+}
+
+function groupAssignmentsFromRows(rows: CompanyRow[]): Record<string, string> {
+  const assignments: Record<string, string> = {};
+  rows.forEach((company) => {
+    const groupId = committedCompanyGroup(company);
+    [companyConfigKey(company), company.company_id, company.mst, company.safe_id, company.company]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .forEach((key) => { assignments[key] = groupId; });
+  });
+  return assignments;
+}
+
+function genericProfileFormPhase(profile: ProfileKey): 'purchase' | 'sales' | 'all' {
+  if (profile === 'son_phuong') return 'all';
+  return profile === 'cao_thanh' ? 'sales' : 'purchase';
+}
+
+function scopedProfileConfig(profilesCfg: Record<string, any>, profile: ProfileKey, phase: 'purchase' | 'sales') {
+  const root = profilesCfg[profile] && typeof profilesCfg[profile] === 'object' ? profilesCfg[profile] : {};
+  const scopes = root.scopes && typeof root.scopes === 'object' ? root.scopes : {};
+  const scoped = scopes[phase] && typeof scopes[phase] === 'object' ? scopes[phase] : null;
+  if (scoped) return scoped;
+  if (profile === 'vietmax') {
+    const legacyKey = phase === 'sales' ? 'vietmax_ban_ra' : 'vietmax_mua_vao';
+    const legacy = profilesCfg[legacyKey] && typeof profilesCfg[legacyKey] === 'object' ? profilesCfg[legacyKey] : null;
+    if (legacy) return legacy;
+  }
+  return root;
+}
+
+function isTwoPhaseGenericProfile(profile: ProfileKey) {
+  return profile === 'son_phuong';
+}
+
+function applyGroupAssignments(rows: CompanyRow[], assignments: Record<string, string> = {}): CompanyRow[] {
+  return rows.map((company) => {
+    const key = companyConfigKey(company);
+    const oldProcess = company.process ?? true;
+    const groupId = String(company.group_id || assignments[key] || (oldProcess ? MATERIALS_GROUP_ID : IGNORED_GROUP_ID));
+    const process = groupId === MATERIALS_GROUP_ID;
+    return { ...company, group_id: groupId, pending_group_id: company.pending_group_id || groupId, process, pending_process: process };
+  });
+}
+
+function formatScopeOfForm(form: ProcessingForm, fallback: FormatScope = 'purchase'): FormatScope {
+  const scope = String(form.scope || '').trim();
+  return scope === 'sales' || scope === 'both' || scope === 'purchase' ? scope : fallback;
+}
+
+function formatScopeMatches(form: ProcessingForm, scope: FormatScope) {
+  return formatScopeOfForm(form) === scope;
+}
+
+function visibleFormatFormsForScope(scope: FormatScope, purchaseForms: FormMappingPreset[], salesForms: FormMappingPreset[]): FormMappingPreset[] {
+  const source = scope === 'sales' ? salesForms : scope === 'purchase' ? purchaseForms : [...purchaseForms, ...salesForms];
+  const byId = new Map<string, FormMappingPreset>();
+  source.forEach((form) => {
+    if (form.enabled === false || !formatScopeMatches(form, scope)) return;
+    byId.set(form.id, form);
+  });
+  return Array.from(byId.values()).sort((left, right) => left.label.localeCompare(right.label, 'vi', { numeric: true, sensitivity: 'base' }));
+}
+
+function replaceFormatFormInList(list: FormMappingPreset[], scope: FormatScope, formId: string, updater: (form: FormMappingPreset) => FormMappingPreset): FormMappingPreset[] {
+  return list.map((form) => (form.id === formId && formatScopeMatches(form, scope) ? updater(form) : form));
+}
+
+function removeFormatFormFromList(list: FormMappingPreset[], formId: string): FormMappingPreset[] {
+  return list.filter((form) => form.id !== formId);
+}
+
+function upsertFormatForm(list: FormMappingPreset[], form: FormMappingPreset): FormMappingPreset[] {
+  if (list.some((item) => item.id === form.id)) {
+    return list.map((item) => (item.id === form.id ? form : item));
+  }
+  return [...list, form];
+}
+
+function formWithScope(form: FormMappingPreset, scope: FormatScope): FormMappingPreset {
+  const sourcePhase = scope === 'sales' ? 'sales' : 'purchase';
+  return {
+    ...form,
+    scope,
+    input_phase: scope === 'both' ? 'both' : scope,
+    mappings: (form.mappings || []).map((rule) => {
+      if (scope === 'both') {
+        const phase = rule.source_phase === 'sales' ? 'sales' : 'purchase';
+        return { ...rule, source_phase: phase };
+      }
+      return { ...rule, source_phase: sourcePhase };
+    }),
+  };
+}
+
+function activeFormsRequirePhase(forms: FormMappingPreset[], phase: 'purchase' | 'sales') {
+  return forms.some((form) => {
+    if (form.enabled === false || !(form.mappings || []).length) return false;
+    const scope = formatScopeOfForm(form, phase);
+    if (scope !== phase && scope !== 'both') return false;
+    return (form.mappings || []).some((rule) => !rule.source_phase || rule.source_phase === phase || rule.source_phase === 'both');
+  });
+}
+
+function autoCacheSignature(file: UploadSummary | null, payload: Record<string, unknown>) {
+  return JSON.stringify({ file: file?.saved_name || '', payload });
+}
+
+function columnsFromUploadSummary(summary: UploadSummary): FormColumn[] {
+  return summary.columns.map((column) => ({
+    letter: column.letter,
+    label: column.label.includes('.') ? column.label : `${column.letter}. ${column.label.replace(`${column.letter} - `, '')}`,
+    header: column.label.replace(`${column.letter} - `, '').replace(`${column.letter}. `, ''),
+  }));
+}
+
+function groupIdFromLabel(label: string, existing: ProcessingGroup[] = []) {
+  const base = label
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'nhom';
+  const used = new Set(existing.map((group) => group.id));
+  let id = base;
+  let suffix = 2;
+  while (used.has(id)) {
+    id = `${base}_${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
 
 type WorkflowState = {
   stage: StageId;
@@ -38,6 +557,8 @@ type WorkflowState = {
   salesProductPreviewCodes: Record<string, string>;
   productCodeOverrides: Record<string, string>;
   salesProductCodeOverrides: Record<string, string>;
+  productCodeReplacements: Record<string, string>;
+  salesProductCodeReplacements: Record<string, string>;
   purchaseWordRules: Record<string, string>;
   salesWordRules: Record<string, string>;
   firstWordRules: Record<string, string>;
@@ -79,6 +600,10 @@ type WorkflowState = {
   prefixMissingMstStrategy: PrefixPresetStrategy;
   purchasePrefixStrategyValues: PrefixStrategyValues;
   salesPrefixStrategyValues: PrefixStrategyValues;
+  purchaseProcessingGroups: ProcessingGroup[];
+  salesProcessingGroups: ProcessingGroup[];
+  purchaseFormMappingPresets: FormMappingPreset[];
+  salesFormMappingPresets: FormMappingPreset[];
   purchaseReviewScope: 'all' | 'company';
   salesReviewScope: 'all' | 'company';
 };
@@ -167,6 +692,8 @@ function initialWorkflowState(): WorkflowState {
     salesProductPreviewCodes: {},
     productCodeOverrides: {},
     salesProductCodeOverrides: {},
+    productCodeReplacements: {},
+    salesProductCodeReplacements: {},
     purchaseWordRules: {},
     salesWordRules: {},
     firstWordRules: {},
@@ -208,6 +735,10 @@ function initialWorkflowState(): WorkflowState {
     prefixMissingMstStrategy: 'all_name_words',
     purchasePrefixStrategyValues: emptyPrefixStrategyValues(),
     salesPrefixStrategyValues: emptyPrefixStrategyValues(),
+    purchaseProcessingGroups: defaultProcessingGroups('purchase'),
+    salesProcessingGroups: defaultProcessingGroups('sales'),
+    purchaseFormMappingPresets: fallbackDefaultFormMappingPresets('purchase'),
+    salesFormMappingPresets: fallbackDefaultFormMappingPresets('sales'),
     purchaseReviewScope: 'all',
     salesReviewScope: 'company',
   };
@@ -215,16 +746,49 @@ function initialWorkflowState(): WorkflowState {
 
 function initialWorkflowStates(): Record<ProfileKey, WorkflowState> {
   return {
-    son_phuong: initialWorkflowState(),
-    cao_thanh: initialWorkflowState(),
-    quang_thinh: initialWorkflowState(),
-    vietmax: initialWorkflowState(),
+    son_phuong: { ...initialWorkflowState(), stage: 0.5 },
+    cao_thanh: { ...initialWorkflowState(), stage: 0.5 },
+    quang_thinh: { ...initialWorkflowState(), stage: 0.5 },
+    vietmax: { ...initialWorkflowState(), stage: 0.5 },
     ho_guom: initialWorkflowState(),
   };
 }
 
 function initialLicenseForm() {
   return { server_url: '', account_id: '', license_key: '' };
+}
+
+function normalizeLicenseProfileText(value: unknown) {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function licenseProfileAliases(profile: ProfileKey, label: string) {
+  const aliases = [profile, label];
+  if (profile === 'vietmax') aliases.push('vietmax_mua_vao', 'vietmax_ban_ra', 'Vietmax mua vào', 'Vietmax bán ra');
+  return aliases.map(normalizeLicenseProfileText).filter(Boolean);
+}
+
+function licenseAllowsSelectedProfile(profile: ProfileKey, label: string, license: LicenseStatus | null) {
+  if (!license?.activated) return false;
+  const allowedProfiles = license.allowed_profiles || [];
+  if (!allowedProfiles.length) return true;
+  const allowed = new Set(allowedProfiles.map(normalizeLicenseProfileText).filter(Boolean));
+  return licenseProfileAliases(profile, label).some((item) => allowed.has(item));
+}
+
+function selectedProfileLicenseText(profile: ProfileKey, label: string, license: LicenseStatus | null, ready: boolean) {
+  if (ready) return 'Được phép dùng.';
+  if (!license) return 'Đang kiểm tra license...';
+  if (!license.activated) return 'Chưa kích hoạt license.';
+  const allowed = (license.allowed_profiles || []).filter(Boolean);
+  const suffix = allowed.length ? ` License hiện tại: ${allowed.join(', ')}.` : '';
+  return `License đã kích hoạt nhưng chưa bao gồm ${label}.${suffix}`;
 }
 
 function defaultInventoryAllocationConfig(): InventoryAllocationConfig {
@@ -277,21 +841,26 @@ export function VietmaxApp() {
   const [status, setStatus] = useState('Chọn profile và bắt đầu theo từng stage. Dữ liệu được giữ khi chuyển stage, chỉ xóa khi bấm Làm lại.');
   const [busy, setBusy] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState<OperationProgress | null>(null);
+  const autoPurchaseCacheSignatureRef = useRef('');
+  const autoSalesCacheSignatureRef = useRef('');
 
   const workflow = workflows[profile];
-  const { stage, purchaseFile, genericColumns, purchaseColumns, salesColumns, processedPurchaseSavedName, processedPurchaseStats, salesFile, processedSalesSavedName, processedSalesStats, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, purchaseMissingMstCompanies, purchaseInvoiceStatuses, salesCompanyRows, selectedSalesCompanyIndex, salesMissingMstCompanies, salesInvoiceStatuses, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, purchaseWordRules, salesWordRules, firstWordRules, purchaseRepeatedPhraseRemovals, salesRepeatedPhraseRemovals, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewRules, salesReviewRules, purchaseReviewGenerated, salesReviewGenerated, priceRangeRules, priceGroups, priceFilterAllPercent, priceAdjustAllPercent, matches, salesMatchGenerated, salesMatchRules, purchaseInventoryPairs, purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId, purchaseInventoryPairRules, salesInventoryPairs, salesUseDefaultInventoryPair, salesDefaultInventoryPairId, salesInventoryPairRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix, purchasePrefixStrategy, salesPrefixStrategy, prefixMstDigits, prefixNameWords, prefixNameChars, prefixMissingMstStrategy, purchasePrefixStrategyValues, salesPrefixStrategyValues, purchaseReviewScope, salesReviewScope } = workflow;
+  const { stage, purchaseFile, genericColumns, purchaseColumns, salesColumns, processedPurchaseSavedName, processedPurchaseStats, salesFile, processedSalesSavedName, processedSalesStats, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, purchaseMissingMstCompanies, purchaseInvoiceStatuses, salesCompanyRows, selectedSalesCompanyIndex, salesMissingMstCompanies, salesInvoiceStatuses, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, productCodeReplacements, salesProductCodeReplacements, purchaseWordRules, salesWordRules, firstWordRules, purchaseRepeatedPhraseRemovals, salesRepeatedPhraseRemovals, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewRules, salesReviewRules, purchaseReviewGenerated, salesReviewGenerated, priceRangeRules, priceGroups, priceFilterAllPercent, priceAdjustAllPercent, matches, salesMatchGenerated, salesMatchRules, purchaseInventoryPairs, purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId, purchaseInventoryPairRules, salesInventoryPairs, salesUseDefaultInventoryPair, salesDefaultInventoryPairId, salesInventoryPairRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix, purchasePrefixStrategy, salesPrefixStrategy, prefixMstDigits, prefixNameWords, prefixNameChars, prefixMissingMstStrategy, purchasePrefixStrategyValues, salesPrefixStrategyValues, purchaseProcessingGroups, salesProcessingGroups, purchaseFormMappingPresets, salesFormMappingPresets, purchaseReviewScope, salesReviewScope } = workflow;
   const selectedProfile = profiles.find((item) => item.key === profile) ?? profiles[0];
-  const licenseReady = Boolean(license?.activated && (profile !== 'vietmax' || license.vietmax_allowed));
+  const licenseReady = licenseAllowsSelectedProfile(profile, selectedProfile.label, license);
+  const licenseProfileText = selectedProfileLicenseText(profile, selectedProfile.label, license, licenseReady);
   const isGenericProfile = isGenericProfileKey(profile);
   const usesNativeStageShell = profile === 'vietmax' || isGenericProfile || profile === 'ho_guom';
   const visibleStages = useMemo(() => stagesForProfile(profile), [profile]);
   const currentStage = visibleStages.find((item) => item.id === stage) ?? visibleStages[0];
   const selectedMatches = useMemo(() => matches.filter((match) => match.confirmed !== false), [matches]);
-  const showLicenseBar = stage === 1;
+  const showLicenseBar = stage === 0.5 || stage === 1;
   const activeVietmaxSalesConfig = profile === 'vietmax' && stage >= 6;
-  const activeInventoryConfigScope: InventoryConfigScope = profile === 'vietmax' ? (activeVietmaxSalesConfig ? 'sales' : 'purchase') : 'generic';
-  const activeWordRules = profile === 'vietmax' ? (activeVietmaxSalesConfig ? salesWordRules : purchaseWordRules) : wordRules;
-  const activeRepeatedPhraseRemovals = profile === 'vietmax' ? (activeVietmaxSalesConfig ? salesRepeatedPhraseRemovals : purchaseRepeatedPhraseRemovals) : repeatedPhraseRemovals;
+  const activeTwoPhaseSalesConfig = isTwoPhaseGenericProfile(profile) && stage >= 6;
+  const activeUsesScopedPhase = profile === 'vietmax' || isTwoPhaseGenericProfile(profile);
+  const activeInventoryConfigScope: InventoryConfigScope = activeUsesScopedPhase ? (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig ? 'sales' : 'purchase') : 'generic';
+  const activeWordRules = activeUsesScopedPhase ? (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig ? salesWordRules : purchaseWordRules) : wordRules;
+  const activeRepeatedPhraseRemovals = activeUsesScopedPhase ? (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig ? salesRepeatedPhraseRemovals : purchaseRepeatedPhraseRemovals) : repeatedPhraseRemovals;
 
   function updateWorkflow(targetProfile: ProfileKey, update: Partial<WorkflowState>) {
     setWorkflows((current) => ({ ...current, [targetProfile]: { ...current[targetProfile], ...update } }));
@@ -330,6 +899,12 @@ export function VietmaxApp() {
   }, [profile, stage, salesFile, salesCompanyRows.length, busy]);
 
   useEffect(() => {
+    if (isTwoPhaseGenericProfile(profile) && stage === 9 && salesFile && !salesCompanyRows.length && !busy) {
+      void loadGenericSalesCompanies();
+    }
+  }, [profile, stage, salesFile, salesCompanyRows.length, busy]);
+
+  useEffect(() => {
     if (profile === 'vietmax' && stage === 4 && purchaseFile && companyRows.length && !purchaseReviewGenerated && !busy) {
       if (companyRows.some(hasCompanyDraftChanges)) {
         applyCompanyAndProductChoices(4);
@@ -360,6 +935,16 @@ export function VietmaxApp() {
   }, [isGenericProfile, stage, purchaseFile, companyRows.length, purchaseReviewGenerated, busy]);
 
   useEffect(() => {
+    if (isTwoPhaseGenericProfile(profile) && stage === 10 && salesFile && salesCompanyRows.length && !salesReviewGenerated && !busy) {
+      if (salesCompanyRows.some(hasCompanyDraftChanges)) {
+        applySalesCompanyAndProductChoices(9);
+        return;
+      }
+      void runGenericSalesReview();
+    }
+  }, [profile, stage, salesFile, salesCompanyRows.length, salesReviewGenerated, busy]);
+
+  useEffect(() => {
     if (profile === 'cao_thanh' && stage === 5 && companyRows.length && !priceGroups.length && !busy) {
       updateCaoThanhPriceGroups();
     }
@@ -367,15 +952,44 @@ export function VietmaxApp() {
 
   useEffect(() => {
     if (profile === 'vietmax' && stage === 5 && purchaseFile && !processedPurchaseSavedName && !busy) {
+      if (companyRows.some(hasCompanyDraftChanges)) return;
+      const signature = autoCacheSignature(purchaseFile, buildPurchaseProcessPayload(workflow));
+      if (autoPurchaseCacheSignatureRef.current === signature) return;
+      autoPurchaseCacheSignatureRef.current = signature;
       void prepareProcessedPurchaseCache();
     }
-  }, [profile, stage, purchaseFile, processedPurchaseSavedName, busy]);
+  }, [profile, stage, purchaseFile, processedPurchaseSavedName, busy, companyRows]);
+
+  useEffect(() => {
+    const genericExportStage = isGenericProfile && !isTwoPhaseGenericProfile(profile) && ((Number(stage) === 5 && profile !== 'cao_thanh') || Number(stage) === 6);
+    if (genericExportStage && purchaseFile && companyRows.length && !processedPurchaseSavedName && !busy) {
+      void prepareGenericProcessedCache();
+    }
+  }, [isGenericProfile, profile, stage, purchaseFile, companyRows.length, processedPurchaseSavedName, busy]);
+
+  useEffect(() => {
+    if (isTwoPhaseGenericProfile(profile) && stage === 5 && purchaseFile && companyRows.length && !processedPurchaseSavedName && !busy) {
+      if (companyRows.some(hasCompanyDraftChanges)) return;
+      void prepareGenericProcessedCache();
+    }
+  }, [profile, stage, purchaseFile, companyRows.length, processedPurchaseSavedName, busy]);
+
+  useEffect(() => {
+    if (isTwoPhaseGenericProfile(profile) && stage === 11 && salesFile && salesCompanyRows.length && !processedSalesSavedName && !busy) {
+      if (salesCompanyRows.some(hasCompanyDraftChanges)) return;
+      void prepareGenericSalesProcessedCache();
+    }
+  }, [profile, stage, salesFile, salesCompanyRows.length, processedSalesSavedName, busy]);
 
   useEffect(() => {
     if (profile === 'vietmax' && stage === 11 && salesFile && !processedSalesSavedName && !busy) {
+      if (salesCompanyRows.some(hasCompanyDraftChanges)) return;
+      const signature = autoCacheSignature(salesFile, buildSalesProcessPayload(workflow));
+      if (autoSalesCacheSignatureRef.current === signature) return;
+      autoSalesCacheSignatureRef.current = signature;
       void prepareProcessedSalesCache();
     }
-  }, [profile, stage, salesFile, processedSalesSavedName, busy]);
+  }, [profile, stage, salesFile, processedSalesSavedName, busy, salesCompanyRows]);
 
   useEffect(() => {
     if (profile === 'vietmax' && processedPurchaseSavedName && !processedPurchaseStats && !busy) {
@@ -390,15 +1004,25 @@ export function VietmaxApp() {
   }, [profile, processedSalesSavedName, processedSalesStats, busy]);
 
   function resetWorkflow() {
-    updateWorkflow(profile, initialWorkflowState());
+    updateWorkflow(profile, profile === 'vietmax' || isGenericProfile ? { ...initialWorkflowState(), stage: 0.5 } : initialWorkflowState());
     setStatus(profile === 'vietmax' ? 'Đã làm lại. Hãy tải file mua vào Vietmax từ stage 1.' : `Đã làm lại profile ${selectedProfile.label}.`);
   }
 
   function canEnterStage(target: StageId) {
-    if (!visibleStages.some((item) => item.id === target)) return false;
+    const targetDefinition = visibleStages.find((item) => item.id === target);
+    if (!targetDefinition || targetDefinition.disabled) return false;
     if (profile === 'ho_guom') return target === 1 || licenseReady;
     if (isGenericProfile) {
-      if (!licenseReady) return target === 1;
+      if (!licenseReady) return target === 0.5 || target === 1;
+      if (isTwoPhaseGenericProfile(profile)) {
+        if (target === 0.5 || target === 1 || target === 6 || target === 15) return true;
+        if (target === 2 || target === 3) return Boolean(purchaseFile);
+        if (target === 4 || target === 5) return Boolean(purchaseFile && companyRows.length);
+        if (target === 7 || target === 9) return Boolean(salesFile);
+        if (target === 10 || target === 11) return Boolean(salesFile && salesCompanyRows.length);
+        return false;
+      }
+      if (target === 0.5) return true;
       if (target === 1) return true;
       if (target === 2 || target === 3) return Boolean(purchaseFile);
       if (target === 4) return Boolean(purchaseFile && companyRows.length);
@@ -407,8 +1031,8 @@ export function VietmaxApp() {
       return false;
     }
     if (profile !== 'vietmax') return licenseReady || target === 1;
-    if (!licenseReady) return target === 1;
-    if (target <= 2) return true;
+    if (!licenseReady) return target === 0.5 || target === 1;
+    if (target === 0.5 || target <= 2) return true;
     if (target === 6 || target === 12) return true;
     if (target <= 5) return Boolean(purchaseFile);
     if (target <= 11) return Boolean(salesFile && (purchaseFile || processedPurchaseSavedName));
@@ -421,17 +1045,61 @@ export function VietmaxApp() {
     updateWorkflow(profile, { stage: target });
   }
 
-  function goBack() {
+  function adjacentEnterableStage(direction: 1 | -1) {
     const currentIndex = visibleStages.findIndex((item) => item.id === stage);
-    const previous = visibleStages[Math.max(0, currentIndex - 1)];
+    if (currentIndex < 0) return undefined;
+    for (let index = currentIndex + direction; index >= 0 && index < visibleStages.length; index += direction) {
+      const candidate = visibleStages[index];
+      if (canEnterStage(candidate.id)) return candidate;
+    }
+    return undefined;
+  }
+
+  function goBack() {
+    const previous = adjacentEnterableStage(-1);
     if (previous) goToStage(previous.id);
   }
 
   function goNext() {
-    const currentIndex = visibleStages.findIndex((item) => item.id === stage);
-    const next = visibleStages[currentIndex + 1];
+    const next = adjacentEnterableStage(1);
     if (!next) return;
     if (isGenericProfile) {
+      if (isTwoPhaseGenericProfile(profile)) {
+        if (stage === 2 && purchaseFile && !companyRows.length) {
+          void loadGenericCompanies(next.id);
+          return;
+        }
+        if (stage === 3 && companyRows.some(hasCompanyDraftChanges)) {
+          applyCompanyAndProductChoices(next.id);
+          return;
+        }
+        if (stage === 4 && purchaseFile && !purchaseReviewGenerated) {
+          void runGenericReview();
+          return;
+        }
+        if (stage === 5 && purchaseFile && !processedPurchaseSavedName) {
+          void prepareGenericProcessedCache(next.id);
+          return;
+        }
+        if (stage === 7 && salesFile && !salesCompanyRows.length) {
+          void loadGenericSalesCompanies(next.id);
+          return;
+        }
+        if (stage === 9 && salesCompanyRows.some(hasCompanyDraftChanges)) {
+          applySalesCompanyAndProductChoices(next.id);
+          return;
+        }
+        if (stage === 10 && salesFile && !salesReviewGenerated) {
+          void runGenericSalesReview();
+          return;
+        }
+        if (stage === 11 && salesFile && !processedSalesSavedName) {
+          void prepareGenericSalesProcessedCache(next.id);
+          return;
+        }
+        goToStage(next.id);
+        return;
+      }
       if (stage === 2 && purchaseFile && !companyRows.length) {
         void loadGenericCompanies(next.id);
         return;
@@ -495,7 +1163,8 @@ export function VietmaxApp() {
         account_id: licenseForm.account_id || undefined,
       });
       setLicense(nextLicense);
-      setStatus(nextLicense.vietmax_allowed ? 'Kích hoạt thành công. Vietmax được phép dùng.' : 'License chưa cho phép Vietmax.');
+      const nextReady = licenseAllowsSelectedProfile(profile, selectedProfile.label, nextLicense);
+      setStatus(nextReady ? `Kích hoạt thành công. ${selectedProfile.label} được phép dùng.` : selectedProfileLicenseText(profile, selectedProfile.label, nextLicense, nextReady));
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -509,7 +1178,8 @@ export function VietmaxApp() {
     try {
       const nextLicense = await reloadLicense();
       setLicense(nextLicense);
-      setStatus(nextLicense.vietmax_allowed ? 'Đã tải lại license. Vietmax được phép dùng.' : 'Đã tải lại license, nhưng Vietmax chưa được phép.');
+      const nextReady = licenseAllowsSelectedProfile(profile, selectedProfile.label, nextLicense);
+      setStatus(nextReady ? `Đã tải lại license. ${selectedProfile.label} được phép dùng.` : selectedProfileLicenseText(profile, selectedProfile.label, nextLicense, nextReady));
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -632,8 +1302,8 @@ export function VietmaxApp() {
     setStatus(`Đang tải FDI ${label} đã xử lý cho Xuất FAST...`);
     try {
       const summary = await uploadExcel(file);
+      setStatus(`Đã tải file lên. Đang đọc thống kê FDI ${label}...`);
       const stats = await inspectProcessedVietmaxFile(summary.saved_name, kind);
-      const validation = await validateFastImportProcessedFile(summary.saved_name, kind);
       if (kind === 'purchase') {
         updateWorkflow(targetProfile, {
           processedPurchaseSavedName: summary.saved_name,
@@ -647,7 +1317,7 @@ export function VietmaxApp() {
           salesFile: salesFile ?? summary,
         });
       }
-      setStatus(`Đã tải FDI ${label} cho Xuất FAST. ${processedStatsSentence(stats)} Đã kiểm tra ${validation.valid_rows} dòng có đủ TK vật tư (${validation.tk_vat_tu_col}) và Mã kho (${validation.ma_kho_col}).`);
+      setStatus(`Đã tải FDI ${label} cho Xuất FAST. ${processedStatsSentence(stats)} Khi xuất workbook, app sẽ chỉ dùng các cột mà form mapping đang cần.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -698,15 +1368,68 @@ export function VietmaxApp() {
   async function loadGenericProfileConfig(targetProfile: ProfileKey) {
     if (!isGenericProfileKey(targetProfile)) return;
     try {
-      const cfg = await getAppConfig();
+      const [cfg, formatDefaults] = await Promise.all([
+        getAppConfig(),
+        getVietmaxFormatMappingDefaults().catch(() => null),
+      ]);
+      const formPhase = genericProfileFormPhase(targetProfile);
       const profilesCfg = (cfg.profiles && typeof cfg.profiles === 'object' ? cfg.profiles : {}) as Record<string, any>;
       const profileCfg = profilesCfg[targetProfile] || {};
+      if (isTwoPhaseGenericProfile(targetProfile)) {
+        const purchaseCfg = scopedProfileConfig(profilesCfg, targetProfile, 'purchase');
+        const salesCfg = scopedProfileConfig(profilesCfg, targetProfile, 'sales');
+        const purchaseSavedColumns = purchaseCfg.columns && typeof purchaseCfg.columns === 'object' ? purchaseCfg.columns as Record<string, unknown> : {};
+        const salesSavedColumns = salesCfg.columns && typeof salesCfg.columns === 'object' ? salesCfg.columns as Record<string, unknown> : {};
+        updateWorkflow(targetProfile, {
+          genericColumns: normalizeGenericColumns(purchaseSavedColumns),
+          purchaseColumns: normalizeVietmaxColumns(purchaseSavedColumns, 'purchase'),
+          salesColumns: normalizeVietmaxColumns(salesSavedColumns, 'sales'),
+          wordRules: purchaseCfg.word_rules && typeof purchaseCfg.word_rules === 'object' ? purchaseCfg.word_rules : {},
+          firstWordRules: purchaseCfg.first_word_rules && typeof purchaseCfg.first_word_rules === 'object' ? purchaseCfg.first_word_rules : {},
+          productCodeReplacements: cleanStringMap(purchaseCfg.product_code_replacements),
+          salesProductCodeReplacements: cleanStringMap(salesCfg.product_code_replacements),
+          repeatedPhraseRemovals: Array.isArray(purchaseCfg.repeated_phrase_removals) ? purchaseCfg.repeated_phrase_removals : [],
+          inventoryPairs: Array.isArray(purchaseCfg.inventory_pairs) ? purchaseCfg.inventory_pairs : [],
+          useDefaultInventoryPair: Boolean(purchaseCfg.use_default_inventory_pair),
+          defaultInventoryPairId: String(purchaseCfg.default_inventory_pair_id || ''),
+          inventoryPairRules: Array.isArray(purchaseCfg.inventory_pair_rules) ? purchaseCfg.inventory_pair_rules : [],
+          purchaseWordRules: purchaseCfg.word_rules && typeof purchaseCfg.word_rules === 'object' ? purchaseCfg.word_rules : {},
+          salesWordRules: salesCfg.word_rules && typeof salesCfg.word_rules === 'object' ? salesCfg.word_rules : {},
+          purchaseRepeatedPhraseRemovals: Array.isArray(purchaseCfg.repeated_phrase_removals) ? purchaseCfg.repeated_phrase_removals : [],
+          salesRepeatedPhraseRemovals: Array.isArray(salesCfg.repeated_phrase_removals) ? salesCfg.repeated_phrase_removals : [],
+          purchaseInventoryPairs: Array.isArray(purchaseCfg.inventory_pairs) ? purchaseCfg.inventory_pairs : [],
+          purchaseUseDefaultInventoryPair: Boolean(purchaseCfg.use_default_inventory_pair),
+          purchaseDefaultInventoryPairId: String(purchaseCfg.default_inventory_pair_id || ''),
+          purchaseInventoryPairRules: Array.isArray(purchaseCfg.inventory_pair_rules) ? purchaseCfg.inventory_pair_rules : [],
+          salesInventoryPairs: Array.isArray(salesCfg.inventory_pairs) ? salesCfg.inventory_pairs : [],
+          salesUseDefaultInventoryPair: Boolean(salesCfg.use_default_inventory_pair),
+          salesDefaultInventoryPairId: String(salesCfg.default_inventory_pair_id || ''),
+          salesInventoryPairRules: Array.isArray(salesCfg.inventory_pair_rules) ? salesCfg.inventory_pair_rules : [],
+          includeCompanyPrefix: purchaseCfg.include_company_prefix !== false,
+          purchasePrefixStrategy: normalizedPrefixStrategy(purchaseCfg.prefix_strategy || 'last_2_words'),
+          salesPrefixStrategy: normalizedPrefixStrategy(salesCfg.prefix_strategy || 'last_2_words'),
+          prefixMstDigits: clampPrefixMstDigits(purchaseCfg.prefix_mst_digits ?? 3),
+          prefixNameWords: clampPrefixNameWords(purchaseCfg.prefix_name_words ?? 2),
+          prefixNameChars: clampPrefixNameChars(purchaseCfg.prefix_name_chars ?? 1),
+          prefixMissingMstStrategy: normalizeMissingMstPrefixStrategy(purchaseCfg.prefix_missing_mst_strategy),
+          purchasePrefixStrategyValues: normalizePrefixStrategyValues(purchaseCfg.prefix_strategy_values, emptyPrefixStrategyValues()),
+          salesPrefixStrategyValues: normalizePrefixStrategyValues(salesCfg.prefix_strategy_values, emptyPrefixStrategyValues()),
+          purchaseProcessingGroups: normalizeProcessingGroups(purchaseCfg.processing_groups, 'purchase'),
+          salesProcessingGroups: normalizeProcessingGroups(salesCfg.processing_groups, 'sales'),
+          purchaseFormMappingPresets: normalizeFormMappingPresets(purchaseCfg.form_mapping_presets, 'purchase', formatDefaults),
+          salesFormMappingPresets: normalizeFormMappingPresets(salesCfg.form_mapping_presets, 'sales', formatDefaults),
+          purchaseReviewRules: Array.isArray(purchaseCfg.product_review_merges) ? purchaseCfg.product_review_merges : [],
+          salesReviewRules: Array.isArray(salesCfg.product_review_merges) ? salesCfg.product_review_merges : [],
+        });
+        return;
+      }
       const globalColumns = cfg.columns && typeof cfg.columns === 'object' ? cfg.columns as Record<string, unknown> : {};
       const savedColumns = profileCfg.columns && typeof profileCfg.columns === 'object' ? profileCfg.columns as Record<string, unknown> : {};
       updateWorkflow(targetProfile, {
         genericColumns: normalizeGenericColumns({ ...globalColumns, ...savedColumns }),
         wordRules: profileCfg.word_rules && typeof profileCfg.word_rules === 'object' ? profileCfg.word_rules : {},
         firstWordRules: profileCfg.first_word_rules && typeof profileCfg.first_word_rules === 'object' ? profileCfg.first_word_rules : {},
+        productCodeReplacements: cleanStringMap(profileCfg.product_code_replacements),
         repeatedPhraseRemovals: Array.isArray(profileCfg.repeated_phrase_removals) ? profileCfg.repeated_phrase_removals : [],
         inventoryPairs: Array.isArray(profileCfg.inventory_pairs) ? profileCfg.inventory_pairs : [],
         useDefaultInventoryPair: Boolean(profileCfg.use_default_inventory_pair),
@@ -719,6 +1442,8 @@ export function VietmaxApp() {
         prefixNameChars: clampPrefixNameChars(profileCfg.prefix_name_chars ?? 1),
         prefixMissingMstStrategy: normalizeMissingMstPrefixStrategy(profileCfg.prefix_missing_mst_strategy),
         purchasePrefixStrategyValues: normalizePrefixStrategyValues(profileCfg.prefix_strategy_values, emptyPrefixStrategyValues()),
+        purchaseProcessingGroups: normalizeProcessingGroups(profileCfg.processing_groups, 'generic'),
+        purchaseFormMappingPresets: normalizeFormMappingPresets(profileCfg.form_mapping_presets, formPhase, formatDefaults, true),
         purchaseReviewRules: Array.isArray(profileCfg.product_review_merges) ? profileCfg.product_review_merges : [],
         priceRangeRules: profileCfg.price_range_rules && typeof profileCfg.price_range_rules === 'object' ? profileCfg.price_range_rules : {},
         priceAdjustAllPercent: Number(profileCfg.price_adjust_all_percent || 0),
@@ -730,15 +1455,24 @@ export function VietmaxApp() {
 
   async function loadVietmaxProfileConfig() {
     try {
-      const cfg = await getAppConfig();
+      const [cfg, formatDefaults] = await Promise.all([
+        getAppConfig(),
+        getVietmaxFormatMappingDefaults().catch(() => null),
+      ]);
       const profilesCfg = (cfg.profiles && typeof cfg.profiles === 'object' ? cfg.profiles : {}) as Record<string, any>;
-      const purchaseCfg = profilesCfg.vietmax_mua_vao || profilesCfg.vietmax || {};
-      const salesCfg = profilesCfg.vietmax_ban_ra || {};
+      const purchaseCfg = scopedProfileConfig(profilesCfg, 'vietmax', 'purchase');
+      const salesCfg = scopedProfileConfig(profilesCfg, 'vietmax', 'sales');
       const purchaseSavedColumns = purchaseCfg.columns && typeof purchaseCfg.columns === 'object' ? purchaseCfg.columns as Record<string, unknown> : {};
       const salesSavedColumns = salesCfg.columns && typeof salesCfg.columns === 'object' ? salesCfg.columns as Record<string, unknown> : {};
       updateWorkflow('vietmax', {
         purchaseColumns: normalizeVietmaxColumns(purchaseSavedColumns, 'purchase'),
         salesColumns: normalizeVietmaxColumns(salesSavedColumns, 'sales'),
+        productCodeReplacements: cleanStringMap(purchaseCfg.product_code_replacements),
+        salesProductCodeReplacements: cleanStringMap(salesCfg.product_code_replacements),
+        purchaseProcessingGroups: normalizeProcessingGroups(purchaseCfg.processing_groups, 'purchase'),
+        salesProcessingGroups: normalizeProcessingGroups(salesCfg.processing_groups, 'sales'),
+        purchaseFormMappingPresets: normalizeFormMappingPresets(purchaseCfg.form_mapping_presets, 'purchase', formatDefaults),
+        salesFormMappingPresets: normalizeFormMappingPresets(salesCfg.form_mapping_presets, 'sales', formatDefaults),
       });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -752,23 +1486,32 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus(`Đang tải danh sách công ty và hàng hóa ${selectedProfile.label}...`);
     try {
-      const result = await analyzeGenericWorkbook({
-        saved_name: targetFile.saved_name,
-        original_name: targetFile.original_name,
-        profile: targetProfile,
-        ...genericColumns,
-      });
-      const savedWordRules = result.word_rules ?? wordRules;
+      const twoPhase = isTwoPhaseGenericProfile(targetProfile);
+      const sourceColumns = twoPhase ? normalizeVietmaxColumns(purchaseColumns, 'purchase') : normalizeGenericColumns(genericColumns);
+      const [result, formatDefaults] = await Promise.all([
+        analyzeGenericWorkbook({
+          saved_name: targetFile.saved_name,
+          original_name: targetFile.original_name,
+          profile: targetProfile,
+          vietmax_phase: 'purchase',
+          ...sourceColumns,
+        }),
+        getVietmaxFormatMappingDefaults().catch(() => null),
+      ]);
+      const savedWordRules = result.word_rules ?? (twoPhase ? purchaseWordRules : wordRules);
       const savedFirstWordRules = result.first_word_rules ?? firstWordRules;
-      const savedRepeatedPhrases = result.repeated_phrase_removals ?? repeatedPhraseRemovals;
-      const savedInventoryPairs = result.inventory_pairs ?? inventoryPairs;
-      const nextCompanies = result.companies.map((company) => ({
+      const savedProductCodeReplacements = result.product_code_replacements ?? productCodeReplacements;
+      const savedRepeatedPhrases = result.repeated_phrase_removals ?? (twoPhase ? purchaseRepeatedPhraseRemovals : repeatedPhraseRemovals);
+      const savedInventoryPairs = result.inventory_pairs ?? (twoPhase ? purchaseInventoryPairs : inventoryPairs);
+      const loadedGroups = normalizeProcessingGroups(result.processing_groups, twoPhase ? 'purchase' : 'generic');
+      const loadedFormPresets = normalizeFormMappingPresets(result.form_mapping_presets, twoPhase ? 'purchase' : genericProfileFormPhase(targetProfile), formatDefaults, !twoPhase);
+      const nextCompanies = applyGroupAssignments(result.companies.map((company) => ({
         ...company,
         process: company.process ?? true,
         pending_process: company.pending_process ?? company.process ?? true,
         committed_prefix: company.committed_prefix ?? company.value ?? '',
         selected_product_names: company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name),
-      }));
+      })), result.company_group_assignments ?? {});
       const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || purchasePrefixStrategy);
       const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
       const loadedPrefixNameWords = clampPrefixNameWords(result.prefix_name_words ?? prefixNameWords);
@@ -777,15 +1520,17 @@ export function VietmaxApp() {
       const loadedPrefixNameChars = clampPrefixNameChars(result.prefix_name_chars ?? prefixNameChars);
       const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, loadedMissingMstPrefixStrategy);
       const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, nextPrefixValues, true, loadedMissingMstPrefixStrategy);
-      const previewCodes = await loadGenericProductPreviewCodes(targetProfile, displayCompanies, savedWordRules, savedFirstWordRules, savedRepeatedPhrases);
+      const previewCodes = await loadGenericProductPreviewCodes(targetProfile, displayCompanies, savedWordRules, savedFirstWordRules, savedRepeatedPhrases, savedProductCodeReplacements);
       updateWorkflow(targetProfile, {
         ...purchaseOutputInvalidation(),
-        genericColumns: normalizeGenericColumns(genericColumns),
+        genericColumns: normalizeGenericColumns(sourceColumns),
+        ...(twoPhase ? { purchaseColumns: normalizeVietmaxColumns(sourceColumns, 'purchase') } : {}),
         companyRows: displayCompanies,
-        selectedCompanyIndex: firstDisplayedCompanyIndex(displayCompanies),
+        selectedCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups),
         purchaseMissingMstCompanies: result.missing_mst_companies ?? [],
         productPreviewCodes: previewCodes,
         productCodeOverrides: result.manual_code_overrides ?? {},
+        productCodeReplacements: savedProductCodeReplacements,
         wordRules: savedWordRules,
         firstWordRules: savedFirstWordRules,
         repeatedPhraseRemovals: savedRepeatedPhrases,
@@ -793,6 +1538,15 @@ export function VietmaxApp() {
         useDefaultInventoryPair: result.use_default_inventory_pair ?? useDefaultInventoryPair,
         defaultInventoryPairId: result.default_inventory_pair_id ?? defaultInventoryPairId,
         inventoryPairRules: result.inventory_pair_rules ?? inventoryPairRules,
+        ...(twoPhase ? {
+          purchaseWordRules: savedWordRules,
+          productCodeReplacements: savedProductCodeReplacements,
+          purchaseRepeatedPhraseRemovals: savedRepeatedPhrases,
+          purchaseInventoryPairs: savedInventoryPairs,
+          purchaseUseDefaultInventoryPair: result.use_default_inventory_pair ?? purchaseUseDefaultInventoryPair,
+          purchaseDefaultInventoryPairId: result.default_inventory_pair_id ?? purchaseDefaultInventoryPairId,
+          purchaseInventoryPairRules: result.inventory_pair_rules ?? purchaseInventoryPairRules,
+        } : {}),
         includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix,
         purchasePrefixStrategy: loadedPrefixStrategy,
         prefixMstDigits: loadedPrefixMstDigits,
@@ -800,6 +1554,8 @@ export function VietmaxApp() {
         prefixNameChars: loadedPrefixNameChars,
         prefixMissingMstStrategy: loadedMissingMstPrefixStrategy,
         purchasePrefixStrategyValues: nextPrefixValues,
+        purchaseProcessingGroups: loadedGroups,
+        purchaseFormMappingPresets: loadedFormPresets,
         purchaseReviewRules: Array.isArray(result.product_review_merges) ? result.product_review_merges as ReviewRow[] : purchaseReviewRules,
         priceRangeRules: result.price_range_rules ?? priceRangeRules,
         priceAdjustAllPercent: Number(result.price_adjust_all_percent ?? priceAdjustAllPercent),
@@ -902,18 +1658,121 @@ export function VietmaxApp() {
       return;
     }
     setBusy(true);
-    setStatus(`Đang tạo file ${selectedProfile.label}...`);
+    const exportFormMappings = !isTwoPhaseGenericProfile(profile);
+    const progress = processedPurchaseSavedName ? null : beginProgress(`Đang tạo cache file ${selectedProfile.label}`);
+    setStatus(processedPurchaseSavedName ? `Đang tải file ${selectedProfile.label} từ cache...` : `Đang tạo cache file ${selectedProfile.label}...`);
     try {
-      const blob = await processGenericWorkbook({
-        saved_name: purchaseFile.saved_name,
-        original_name: purchaseFile.original_name,
-        ...buildGenericProcessPayload(workflow, profile),
-      });
-      const saved = await saveBlob(blob, `${fileStem(purchaseFile.original_name)}_fdi.xls`);
-      setStatus(saved ? `Đã xuất file kết quả ${selectedProfile.label}.` : 'Đã hủy lưu file kết quả.');
+      let savedName = processedPurchaseSavedName;
+      if (!savedName) {
+        const result = await processGenericWorkbookCache({
+          saved_name: purchaseFile.saved_name,
+          original_name: purchaseFile.original_name,
+          export_form_mappings: exportFormMappings,
+          ...buildGenericProcessPayload(workflow, profile),
+        }, progress?.operationId);
+        savedName = result.processedSavedName;
+        if (!savedName) throw new Error('Không tạo được cache file kết quả.');
+        updateWorkflow(profile, { processedPurchaseSavedName: savedName });
+      }
+      const blob = await downloadCachedFile(savedName);
+      const filename = `${fileStem(purchaseFile.original_name)}_${profile}_${isTwoPhaseGenericProfile(profile) ? 'mua_vao_fdi' : 'fast'}.xls`;
+      const saved = await saveBlob(blob, filename);
+      setStatus(saved ? `Đã xuất workbook FDI và form mapping ${selectedProfile.label}.` : 'Đã hủy lưu file kết quả.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
+      progress?.stop();
+      if (progress) setLoadingProgress(null);
+      setBusy(false);
+    }
+  }
+
+  async function prepareGenericProcessedCache(nextStage?: StageId) {
+    if (!purchaseFile || !isGenericProfile || processedPurchaseSavedName) return;
+    const dirtyCompanies = companyRows.filter(hasCompanyDraftChanges);
+    if (dirtyCompanies.length) return;
+    const exportFormMappings = !isTwoPhaseGenericProfile(profile);
+    const targetProfile = profile;
+    const progress = beginProgress(`Đang tạo cache file ${selectedProfile.label}`);
+    setBusy(true);
+    setStatus(`Đang tạo cache file ${selectedProfile.label} để lần xuất sau không xử lý lại...`);
+    try {
+      const result = await processGenericWorkbookCache({
+        saved_name: purchaseFile.saved_name,
+        original_name: purchaseFile.original_name,
+        export_form_mappings: exportFormMappings,
+        ...buildGenericProcessPayload(workflow, profile),
+      }, progress.operationId);
+      if (!result.processedSavedName) throw new Error('Không tạo được cache file kết quả.');
+      updateWorkflow(targetProfile, { processedPurchaseSavedName: result.processedSavedName, ...(nextStage ? { stage: nextStage } : {}) });
+      setStatus(`Đã tạo cache file ${selectedProfile.label}. Bấm Xuất file kết quả để lưu file.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      progress.stop();
+      setLoadingProgress(null);
+      setBusy(false);
+    }
+  }
+
+  async function prepareGenericSalesProcessedCache(nextStage?: StageId) {
+    if (!salesFile || !isTwoPhaseGenericProfile(profile) || processedSalesSavedName) return;
+    const dirtyCompanies = salesCompanyRows.filter(hasCompanyDraftChanges);
+    if (dirtyCompanies.length) return;
+    const targetProfile = profile;
+    const progress = beginProgress(`Đang tạo cache file bán ra ${selectedProfile.label}`);
+    setBusy(true);
+    setStatus(`Đang tạo cache file bán ra ${selectedProfile.label} để xuất FAST...`);
+    try {
+      const result = await processGenericWorkbookCache({
+        saved_name: salesFile.saved_name,
+        original_name: salesFile.original_name,
+        export_form_mappings: false,
+        ...buildGenericSalesProcessPayload(workflow, profile),
+      }, progress.operationId);
+      if (!result.processedSavedName) throw new Error('Không tạo được cache file bán ra.');
+      const stats = await inspectProcessedVietmaxFile(result.processedSavedName, 'sales');
+      updateWorkflow(targetProfile, { processedSalesSavedName: result.processedSavedName, processedSalesStats: stats, ...(nextStage ? { stage: nextStage } : {}) });
+      setStatus(`Đã tạo cache file bán ra ${selectedProfile.label}. ${processedStatsSentence(stats)}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      progress.stop();
+      setLoadingProgress(null);
+      setBusy(false);
+    }
+  }
+
+  async function downloadGenericSalesProcessedFile() {
+    if (!salesFile || !isTwoPhaseGenericProfile(profile)) return;
+    if (salesCompanyRows.some(hasCompanyDraftChanges)) {
+      setStatus('Đang có thay đổi lọc công ty/prefix bán ra chưa áp dụng. Bấm Áp dụng lựa chọn trước khi xuất file.');
+      return;
+    }
+    setBusy(true);
+    const progress = processedSalesSavedName ? null : beginProgress(`Đang tạo cache file bán ra ${selectedProfile.label}`);
+    try {
+      let savedName = processedSalesSavedName;
+      if (!savedName) {
+        const result = await processGenericWorkbookCache({
+          saved_name: salesFile.saved_name,
+          original_name: salesFile.original_name,
+          export_form_mappings: false,
+          ...buildGenericSalesProcessPayload(workflow, profile),
+        }, progress?.operationId);
+        savedName = result.processedSavedName;
+        if (!savedName) throw new Error('Không tạo được cache file bán ra.');
+        updateWorkflow(profile, { processedSalesSavedName: savedName });
+      }
+      const blob = await downloadCachedFile(savedName);
+      const filename = `${fileStem(salesFile.original_name)}_${profile}_ban_ra_fdi.xls`;
+      const saved = await saveBlob(blob, filename);
+      setStatus(saved ? `Đã lưu file bán ra ${selectedProfile.label}.` : 'Đã hủy lưu file bán ra.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      progress?.stop();
+      if (progress) setLoadingProgress(null);
       setBusy(false);
     }
   }
@@ -960,7 +1819,17 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus(`Dang tao review Ma VT ${selectedProfile.label}...`);
     try {
-      const result = await createGenericReview(targetPurchaseFile.saved_name, targetProfile, scope, wordRules, firstWordRules, repeatedPhraseRemovals, reviewProducts, progress.operationId);
+      const result = await createGenericReview(
+        targetPurchaseFile.saved_name,
+        targetProfile,
+        scope,
+        isTwoPhaseGenericProfile(targetProfile) ? purchaseWordRules : wordRules,
+        firstWordRules,
+        isTwoPhaseGenericProfile(targetProfile) ? purchaseRepeatedPhraseRemovals : repeatedPhraseRemovals,
+        reviewProducts,
+        progress.operationId,
+        'purchase',
+      );
       updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), purchaseReviewRows: normalizeReviewRows(result.review_rows as ReviewRow[]), purchaseReviewGenerated: true, priceGroups: [], stage: 4 });
       setStatus(`Da tao ${result.review_rows.length} dong Review Ma VT ${selectedProfile.label}. Ap dung review truoc khi sang buoc tiep theo.`);
     } catch (error) {
@@ -1282,15 +2151,18 @@ export function VietmaxApp() {
     try {
       const result = await analyzeVietmaxCompanies(purchaseFile.saved_name, 'purchase', purchaseColumns);
       const savedWordRules = result.word_rules ?? purchaseWordRules;
+      const savedProductCodeReplacements = result.product_code_replacements ?? productCodeReplacements;
       const savedRepeatedPhrases = result.repeated_phrase_removals ?? purchaseRepeatedPhraseRemovals;
       const savedInventoryPairs = result.inventory_pairs ?? purchaseInventoryPairs;
-      const nextCompanies = result.companies.map((company) => ({
+      const loadedGroups = normalizeProcessingGroups(result.processing_groups, 'purchase');
+      const loadedFormPresets = normalizeFormMappingPresets(result.form_mapping_presets, 'purchase');
+      const nextCompanies = applyGroupAssignments(result.companies.map((company) => ({
         ...company,
         process: company.process ?? true,
         pending_process: company.pending_process ?? company.process ?? true,
         committed_prefix: company.committed_prefix ?? company.value ?? '',
         selected_product_names: company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name),
-      }));
+      })), result.company_group_assignments ?? {});
       const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || purchasePrefixStrategy);
       const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
       const loadedPrefixNameWords = clampPrefixNameWords(result.prefix_name_words ?? prefixNameWords);
@@ -1299,8 +2171,8 @@ export function VietmaxApp() {
       const loadedPrefixValues = normalizePrefixStrategyValues(result.prefix_strategy_values, purchasePrefixStrategyValues);
       const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, loadedMissingMstPrefixStrategy);
       const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, nextPrefixValues, true, loadedMissingMstPrefixStrategy);
-      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases);
-      updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), companyRows: displayCompanies, selectedCompanyIndex: firstDisplayedCompanyIndex(displayCompanies), purchaseMissingMstCompanies: result.missing_mst_companies ?? [], productPreviewCodes: previewCodes, productCodeOverrides: result.manual_code_overrides ?? {}, purchaseWordRules: savedWordRules, purchaseRepeatedPhraseRemovals: savedRepeatedPhrases, purchaseInventoryPairs: savedInventoryPairs, purchaseUseDefaultInventoryPair: result.use_default_inventory_pair ?? purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId: result.default_inventory_pair_id ?? purchaseDefaultInventoryPairId, purchaseInventoryPairRules: result.inventory_pair_rules ?? purchaseInventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, purchasePrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, purchasePrefixStrategyValues: nextPrefixValues, purchaseReviewRules: result.vietmax_mua_vao_internal_merges ?? purchaseReviewRules, purchaseReviewRows: [], purchaseReviewGenerated: false });
+      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases, 'purchase', savedProductCodeReplacements);
+      updateWorkflow(targetProfile, { ...purchaseOutputInvalidation(), companyRows: displayCompanies, selectedCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups), purchaseMissingMstCompanies: result.missing_mst_companies ?? [], productPreviewCodes: previewCodes, productCodeOverrides: result.manual_code_overrides ?? {}, productCodeReplacements: savedProductCodeReplacements, purchaseWordRules: savedWordRules, purchaseRepeatedPhraseRemovals: savedRepeatedPhrases, purchaseInventoryPairs: savedInventoryPairs, purchaseUseDefaultInventoryPair: result.use_default_inventory_pair ?? purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId: result.default_inventory_pair_id ?? purchaseDefaultInventoryPairId, purchaseInventoryPairRules: result.inventory_pair_rules ?? purchaseInventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, purchasePrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, purchasePrefixStrategyValues: nextPrefixValues, purchaseProcessingGroups: loadedGroups, purchaseFormMappingPresets: loadedFormPresets, purchaseReviewRules: result.vietmax_mua_vao_internal_merges ?? purchaseReviewRules, purchaseReviewRows: [], purchaseReviewGenerated: false });
       setStatus(`Đã tải ${result.company_count} công ty, ${result.rows_to_process} dòng mua vào. Chọn một dòng công ty để xem hàng hóa và Mã VT preview.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1317,10 +2189,13 @@ export function VietmaxApp() {
     try {
       const result = await analyzeVietmaxCompanies(salesFile.saved_name, 'sales', salesColumns);
       const savedWordRules = result.word_rules ?? salesWordRules;
+      const savedProductCodeReplacements = result.product_code_replacements ?? salesProductCodeReplacements;
       const savedRepeatedPhrases = result.repeated_phrase_removals ?? salesRepeatedPhraseRemovals;
       const savedInventoryPairs = result.inventory_pairs?.length ? result.inventory_pairs : salesInventoryPairs;
       const khhMatchedKeys = confirmedSalesMatchKeys(matches, comparisonScope);
-      const nextCompanies = result.companies.map((company) => ({
+      const loadedGroups = normalizeProcessingGroups(result.processing_groups, 'sales');
+      const loadedFormPresets = normalizeFormMappingPresets(result.form_mapping_presets, 'sales');
+      const nextCompanies = applyGroupAssignments(result.companies.map((company) => ({
         ...company,
         all_products: company.all_products.filter((product) => !khhMatchedKeys.has(salesProductMatchKey(product.name, company.company, company.mst, comparisonScope))),
         process: company.process ?? true,
@@ -1329,7 +2204,7 @@ export function VietmaxApp() {
       })).map((company) => ({
         ...company,
         selected_product_names: (company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name)).filter((name) => company.all_products.some((product) => product.name === name)),
-      })).filter((company) => company.all_products.length);
+      })).filter((company) => company.all_products.length), result.company_group_assignments ?? {});
       const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || salesPrefixStrategy);
       const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
       const loadedPrefixNameWords = clampPrefixNameWords(result.prefix_name_words ?? prefixNameWords);
@@ -1338,8 +2213,8 @@ export function VietmaxApp() {
       const loadedPrefixValues = normalizePrefixStrategyValues(result.prefix_strategy_values, salesPrefixStrategyValues);
       const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, loadedMissingMstPrefixStrategy);
       const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, nextPrefixValues, true, loadedMissingMstPrefixStrategy);
-      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases, 'sales');
-      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: displayCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies), salesMissingMstCompanies: result.missing_mst_companies ?? [], salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: result.manual_code_overrides ?? {}, salesWordRules: savedWordRules, salesRepeatedPhraseRemovals: savedRepeatedPhrases, salesMatchRules: result.sales_match_rules ?? salesMatchRules, salesInventoryPairs: savedInventoryPairs, salesUseDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : salesUseDefaultInventoryPair, salesDefaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : salesDefaultInventoryPairId, salesInventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : salesInventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, salesPrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, salesPrefixStrategyValues: nextPrefixValues, salesReviewRules: result.vietmax_ban_ra_sales_internal_merges ?? salesReviewRules, salesReviewRows: [], salesReviewGenerated: false });
+      const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases, 'sales', savedProductCodeReplacements);
+      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: displayCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups), salesMissingMstCompanies: result.missing_mst_companies ?? [], salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: result.manual_code_overrides ?? {}, salesProductCodeReplacements: savedProductCodeReplacements, salesWordRules: savedWordRules, salesRepeatedPhraseRemovals: savedRepeatedPhrases, salesMatchRules: result.sales_match_rules ?? salesMatchRules, salesInventoryPairs: savedInventoryPairs, salesUseDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : salesUseDefaultInventoryPair, salesDefaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : salesDefaultInventoryPairId, salesInventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : salesInventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, salesPrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, salesPrefixStrategyValues: nextPrefixValues, salesProcessingGroups: loadedGroups, salesFormMappingPresets: loadedFormPresets, salesReviewRules: result.vietmax_ban_ra_sales_internal_merges ?? salesReviewRules, salesReviewRows: [], salesReviewGenerated: false });
       setStatus(`Đã tải ${nextCompanies.length} công ty bán ra còn lại sau KVT/152. Chọn công ty/hàng hóa rồi áp dụng trước khi review bán ra.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1353,15 +2228,27 @@ export function VietmaxApp() {
   }
 
   function updatePendingCompany(index: number, pending: boolean) {
-    const nextRows = companyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, pending_process: pending } : company));
-    updateWorkflow(profile, { ...purchaseOutputInvalidation(), companyRows: nextRows, selectedCompanyIndex: index });
+    const groupId = pending ? MATERIALS_GROUP_ID : IGNORED_GROUP_ID;
+    const nextRows = companyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, pending_group_id: groupId, pending_process: pending } : company));
+    updateWorkflow(profile, { ...purchaseOutputInvalidation(), companyRows: nextRows, selectedCompanyIndex: selectedCompanyIndexAfterGrouping(nextRows, index, purchaseProcessingGroups) });
+  }
+
+  function updateCompanyGroup(index: number, groupId: string) {
+    const nextRows = companyRows.map((company, rowIndex) => {
+      if (rowIndex !== index) return company;
+      const process = groupId === MATERIALS_GROUP_ID;
+      return { ...company, pending_group_id: groupId, pending_process: process };
+    });
+    updateWorkflow(profile, { ...purchaseOutputInvalidation(), companyRows: nextRows, selectedCompanyIndex: selectedCompanyIndexAfterGrouping(nextRows, index, purchaseProcessingGroups) });
   }
 
   function bulkUpdatePendingCompanies(pending: boolean) {
+    const groupId = pending ? MATERIALS_GROUP_ID : IGNORED_GROUP_ID;
+    const nextRows = companyRows.map((company) => ({ ...company, pending_group_id: groupId, pending_process: pending }));
     updateWorkflow(profile, {
       ...purchaseOutputInvalidation(),
-      companyRows: companyRows.map((company) => ({ ...company, pending_process: pending })),
-      selectedCompanyIndex: companyRows.length ? Math.max(0, selectedCompanyIndex) : -1,
+      companyRows: nextRows,
+      selectedCompanyIndex: pending ? firstDisplayedCompanyIndex(nextRows, purchaseProcessingGroups) : -1,
     });
   }
 
@@ -1370,15 +2257,16 @@ export function VietmaxApp() {
     const activeStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
     const nextPrefixValues = rememberManualPrefixValues(purchasePrefixStrategyValues, activeStrategy, companyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
     const nextCompanyRows = sortAppliedCompanyRows(companyRows.map((company) => {
-      const process = company.pending_process ?? company.process ?? true;
-      return { ...company, value: normalizePrefixValue(company.value), process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
-    }));
+      const groupId = pendingCompanyGroup(company);
+      const process = groupId === MATERIALS_GROUP_ID;
+      return { ...company, value: normalizePrefixValue(company.value), group_id: groupId, pending_group_id: groupId, process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
+    }), purchaseProcessingGroups);
     const nextWorkflow = {
       ...workflow,
       ...purchaseOutputInvalidation(),
       companyRows: nextCompanyRows,
       purchasePrefixStrategyValues: nextPrefixValues,
-      selectedCompanyIndex: firstDisplayedCompanyIndex(nextCompanyRows),
+      selectedCompanyIndex: firstDisplayedCompanyIndex(nextCompanyRows, purchaseProcessingGroups),
       purchaseReviewRows: [],
       purchaseReviewGenerated: false,
       ...(targetStage ? { stage: targetStage } : {}),
@@ -1393,15 +2281,16 @@ export function VietmaxApp() {
     const activeStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
     const nextPrefixValues = rememberManualPrefixValues(salesPrefixStrategyValues, activeStrategy, salesCompanyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
     const nextSalesCompanyRows = sortAppliedCompanyRows(salesCompanyRows.map((company) => {
-      const process = company.pending_process ?? company.process ?? true;
-      return { ...company, value: normalizePrefixValue(company.value), process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
-    }));
+      const groupId = pendingCompanyGroup(company);
+      const process = groupId === MATERIALS_GROUP_ID;
+      return { ...company, value: normalizePrefixValue(company.value), group_id: groupId, pending_group_id: groupId, process, pending_process: process, committed_prefix: normalizePrefixValue(company.value) };
+    }), salesProcessingGroups);
     const nextWorkflow = {
       ...workflow,
       ...salesOutputInvalidation(),
       salesCompanyRows: nextSalesCompanyRows,
       salesPrefixStrategyValues: nextPrefixValues,
-      selectedSalesCompanyIndex: firstDisplayedCompanyIndex(nextSalesCompanyRows),
+      selectedSalesCompanyIndex: firstDisplayedCompanyIndex(nextSalesCompanyRows, salesProcessingGroups),
       salesReviewRows: [],
       salesReviewGenerated: false,
       ...(targetStage ? { stage: targetStage } : {}),
@@ -1439,15 +2328,27 @@ export function VietmaxApp() {
   }
 
   function updateSalesPendingCompany(index: number, pending: boolean) {
-    const nextRows = salesCompanyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, pending_process: pending } : company));
-    updateWorkflow(profile, { ...salesOutputInvalidation(), salesCompanyRows: nextRows, selectedSalesCompanyIndex: index });
+    const groupId = pending ? MATERIALS_GROUP_ID : IGNORED_GROUP_ID;
+    const nextRows = salesCompanyRows.map((company, rowIndex) => (rowIndex === index ? { ...company, pending_group_id: groupId, pending_process: pending } : company));
+    updateWorkflow(profile, { ...salesOutputInvalidation(), salesCompanyRows: nextRows, selectedSalesCompanyIndex: selectedCompanyIndexAfterGrouping(nextRows, index, salesProcessingGroups) });
+  }
+
+  function updateSalesCompanyGroup(index: number, groupId: string) {
+    const nextRows = salesCompanyRows.map((company, rowIndex) => {
+      if (rowIndex !== index) return company;
+      const process = groupId === MATERIALS_GROUP_ID;
+      return { ...company, pending_group_id: groupId, pending_process: process };
+    });
+    updateWorkflow(profile, { ...salesOutputInvalidation(), salesCompanyRows: nextRows, selectedSalesCompanyIndex: selectedCompanyIndexAfterGrouping(nextRows, index, salesProcessingGroups) });
   }
 
   function bulkUpdateSalesPendingCompanies(pending: boolean) {
+    const groupId = pending ? MATERIALS_GROUP_ID : IGNORED_GROUP_ID;
+    const nextRows = salesCompanyRows.map((company) => ({ ...company, pending_group_id: groupId, pending_process: pending }));
     updateWorkflow(profile, {
       ...salesOutputInvalidation(),
-      salesCompanyRows: salesCompanyRows.map((company) => ({ ...company, pending_process: pending })),
-      selectedSalesCompanyIndex: salesCompanyRows.length ? Math.max(0, selectedSalesCompanyIndex) : -1,
+      salesCompanyRows: nextRows,
+      selectedSalesCompanyIndex: pending ? firstDisplayedCompanyIndex(nextRows, salesProcessingGroups) : -1,
     });
   }
 
@@ -1615,7 +2516,9 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus('Đang cập nhật Mã VT preview bán ra...');
     try {
-      const previewCodes = await loadProductPreviewCodes(salesCompanyRows, salesWordRules, salesRepeatedPhraseRemovals, 'sales');
+      const previewCodes = isTwoPhaseGenericProfile(profile)
+        ? await loadGenericProductPreviewCodes(profile, salesCompanyRows, salesWordRules, firstWordRules, salesRepeatedPhraseRemovals, salesProductCodeReplacements)
+        : await loadProductPreviewCodes(salesCompanyRows, salesWordRules, salesRepeatedPhraseRemovals, 'sales', salesProductCodeReplacements);
       const nextWorkflow = { ...workflow, ...salesOutputInvalidation(), salesProductPreviewCodes: previewCodes, salesReviewRows: [], salesReviewGenerated: false };
       updateWorkflow(profile, nextWorkflow);
       for (const payload of buildConfigPayloads(nextWorkflow, 'sales')) {
@@ -1670,7 +2573,249 @@ export function VietmaxApp() {
   }
 
   function saveCurrentConfig() {
-    void saveWorkflowConfig(workflow, 'Đã lưu cấu hình hiện tại.', stage >= 6 ? 'sales' : 'purchase');
+    void saveWorkflowConfig(workflow, 'Đã lưu cấu hình hiện tại.', profile === 'vietmax' && stage === 0.5 ? 'all' : (stage >= 6 ? 'sales' : 'purchase'));
+  }
+
+  async function runGenericSalesReview() {
+    if (!salesFile || !isTwoPhaseGenericProfile(profile)) return;
+    const dirtyCompanies = salesCompanyRows.filter(hasCompanyDraftChanges);
+    if (dirtyCompanies.length) {
+      setStatus('Đang có thay đổi lọc công ty/prefix bán ra chưa áp dụng. Bấm Áp dụng lựa chọn công ty và hàng hóa trước khi review.');
+      return;
+    }
+    const reviewProducts = buildSalesReviewProducts(workflow);
+    const scope = workflow.salesReviewScope === 'company' ? 'same_company' : 'all_companies';
+    const progress = beginProgress('Đang chuẩn bị review Mã VT bán ra');
+    setBusy(true);
+    setStatus(`Đang tạo review Mã VT bán ra ${selectedProfile.label}...`);
+    try {
+      const result = await createGenericReview(salesFile.saved_name, profile, scope, salesWordRules, firstWordRules, salesRepeatedPhraseRemovals, reviewProducts as ReviewProduct[], progress.operationId, 'sales');
+      updateWorkflow(profile, { ...salesOutputInvalidation(), salesReviewRows: normalizeReviewRows(result.review_rows as ReviewRow[]), salesReviewGenerated: true, stage: 10 });
+      setStatus(`Đã tạo ${result.review_rows.length} dòng Review Mã VT bán ra ${selectedProfile.label}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      progress.stop();
+      setLoadingProgress(null);
+      setBusy(false);
+    }
+  }
+
+  async function loadGenericSalesCompanies(nextStage?: StageId) {
+    if (!salesFile || !isTwoPhaseGenericProfile(profile)) return;
+    const targetProfile = profile;
+    setBusy(true);
+    setStatus('Đang tải danh sách công ty và hàng hóa bán ra...');
+    try {
+      const sourceColumns = normalizeVietmaxColumns(salesColumns, 'sales');
+      const [result, formatDefaults] = await Promise.all([
+        analyzeGenericWorkbook({
+          saved_name: salesFile.saved_name,
+          original_name: salesFile.original_name,
+          profile: targetProfile,
+          vietmax_phase: 'sales',
+          ...sourceColumns,
+        }),
+        getVietmaxFormatMappingDefaults().catch(() => null),
+      ]);
+      const savedWordRules = result.word_rules ?? salesWordRules;
+      const savedProductCodeReplacements = result.product_code_replacements ?? salesProductCodeReplacements;
+      const savedRepeatedPhrases = result.repeated_phrase_removals ?? salesRepeatedPhraseRemovals;
+      const savedInventoryPairs = result.inventory_pairs ?? salesInventoryPairs;
+      const loadedGroups = normalizeProcessingGroups(result.processing_groups, 'sales');
+      const loadedFormPresets = normalizeFormMappingPresets(result.form_mapping_presets, 'sales', formatDefaults);
+      const nextCompanies = applyGroupAssignments(result.companies.map((company) => ({
+        ...company,
+        process: company.process ?? true,
+        pending_process: company.pending_process ?? company.process ?? true,
+        committed_prefix: company.committed_prefix ?? company.value ?? '',
+        selected_product_names: company.selected_product_names.length ? company.selected_product_names : company.all_products.map((product) => product.name),
+      })), result.company_group_assignments ?? {});
+      const loadedPrefixStrategy = normalizedPrefixStrategy(result.prefix_strategy || salesPrefixStrategy);
+      const loadedPrefixMstDigits = clampPrefixMstDigits(result.prefix_mst_digits ?? prefixMstDigits);
+      const loadedPrefixNameWords = clampPrefixNameWords(result.prefix_name_words ?? prefixNameWords);
+      const loadedMissingMstPrefixStrategy = normalizeMissingMstPrefixStrategy(result.prefix_missing_mst_strategy ?? prefixMissingMstStrategy);
+      const loadedPrefixValues = normalizePrefixStrategyValues(result.prefix_strategy_values, salesPrefixStrategyValues);
+      const loadedPrefixNameChars = clampPrefixNameChars(result.prefix_name_chars ?? prefixNameChars);
+      const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, loadedMissingMstPrefixStrategy);
+      const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, nextPrefixValues, true, loadedMissingMstPrefixStrategy);
+      const previewCodes = await loadGenericProductPreviewCodes(targetProfile, displayCompanies, savedWordRules, firstWordRules, savedRepeatedPhrases, savedProductCodeReplacements);
+      updateWorkflow(targetProfile, {
+        ...salesOutputInvalidation(),
+        salesColumns: sourceColumns,
+        salesCompanyRows: displayCompanies,
+        selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups),
+        salesMissingMstCompanies: result.missing_mst_companies ?? [],
+        salesProductPreviewCodes: previewCodes,
+        salesProductCodeOverrides: result.manual_code_overrides ?? {},
+        salesProductCodeReplacements: savedProductCodeReplacements,
+        salesWordRules: savedWordRules,
+        salesRepeatedPhraseRemovals: savedRepeatedPhrases,
+        salesInventoryPairs: savedInventoryPairs,
+        salesUseDefaultInventoryPair: result.use_default_inventory_pair ?? salesUseDefaultInventoryPair,
+        salesDefaultInventoryPairId: result.default_inventory_pair_id ?? salesDefaultInventoryPairId,
+        salesInventoryPairRules: result.inventory_pair_rules ?? salesInventoryPairRules,
+        includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix,
+        salesPrefixStrategy: loadedPrefixStrategy,
+        prefixMstDigits: loadedPrefixMstDigits,
+        prefixNameWords: loadedPrefixNameWords,
+        prefixNameChars: loadedPrefixNameChars,
+        prefixMissingMstStrategy: loadedMissingMstPrefixStrategy,
+        salesPrefixStrategyValues: nextPrefixValues,
+        salesProcessingGroups: loadedGroups,
+        salesFormMappingPresets: loadedFormPresets,
+        salesReviewRules: Array.isArray(result.product_review_merges) ? result.product_review_merges as ReviewRow[] : salesReviewRules,
+        salesReviewRows: [],
+        salesReviewGenerated: false,
+        ...(nextStage ? { stage: nextStage } : {}),
+      });
+      setStatus(`Đã tải ${result.company_count} công ty, ${result.rows_to_process} dòng bán ra ${selectedProfile.label}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveFormatMappingConfig() {
+    const nextPurchase = normalizeFormsForSave(purchaseFormMappingPresets);
+    const nextSales = normalizeFormsForSave(salesFormMappingPresets);
+    const nextWorkflow = {
+      ...workflow,
+      purchaseFormMappingPresets: nextPurchase,
+      salesFormMappingPresets: nextSales,
+    };
+    updateWorkflow(profile, nextWorkflow);
+    void saveWorkflowConfig(nextWorkflow, 'Đã lưu cấu hình form mapping.', 'all');
+  }
+
+  function updateFormatLists(scope: FormatScope, update: (forms: FormMappingPreset[], phase: 'purchase' | 'sales') => FormMappingPreset[]) {
+    const nextPurchase = scope === 'sales' ? purchaseFormMappingPresets : update(purchaseFormMappingPresets, 'purchase');
+    const nextSales = scope === 'purchase' ? salesFormMappingPresets : update(salesFormMappingPresets, 'sales');
+    updateWorkflow(profile, {
+      ...(isGenericProfile ? purchaseOutputInvalidation() : {}),
+      purchaseFormMappingPresets: nextPurchase,
+      salesFormMappingPresets: nextSales,
+    });
+  }
+
+  function updateFormatGroups(scope: FormatScope, update: (groups: ProcessingGroup[], phase: 'purchase' | 'sales') => ProcessingGroup[]) {
+    const nextPurchase = scope === 'sales' ? purchaseProcessingGroups : update(purchaseProcessingGroups, 'purchase');
+    const nextSales = scope === 'purchase' ? salesProcessingGroups : update(salesProcessingGroups, 'sales');
+    updateWorkflow(profile, {
+      ...(isGenericProfile ? purchaseOutputInvalidation() : {}),
+      purchaseProcessingGroups: nextPurchase,
+      salesProcessingGroups: nextSales,
+    });
+  }
+
+  function addFormatGroup(scope: FormatScope, labelOverride?: string) {
+    updateFormatGroups(scope, (groups) => {
+      const label = String(labelOverride || '').trim() || 'Nhóm mới';
+      return [...groups, { id: groupIdFromLabel(label, groups), label, uses_product_code: false, forms: [] }];
+    });
+  }
+
+  function updateFormatGroup(scope: FormatScope, groupId: string, update: Partial<ProcessingGroup>) {
+    updateFormatGroups(scope, (groups) => groups.map((group) => (group.id === groupId ? { ...group, ...update, id: group.id } : group)));
+  }
+
+  function deleteFormatGroup(scope: FormatScope, groupId: string) {
+    const group = (scope === 'sales' ? salesProcessingGroups : purchaseProcessingGroups).find((item) => item.id === groupId);
+    if (!group || group.builtin) return;
+    const resetForms = (forms: FormMappingPreset[]) => forms.map((form) => form.group_id === groupId ? { ...form, group_id: MATERIALS_GROUP_ID } : form);
+    updateFormatGroups(scope, (groups) => groups.filter((item) => item.id !== groupId));
+    updateWorkflow(profile, {
+      ...(isGenericProfile ? purchaseOutputInvalidation() : {}),
+      purchaseFormMappingPresets: scope === 'sales' ? purchaseFormMappingPresets : resetForms(purchaseFormMappingPresets),
+      salesFormMappingPresets: scope === 'purchase' ? salesFormMappingPresets : resetForms(salesFormMappingPresets),
+    });
+  }
+
+  function addFormatForm(scope: FormatScope, groupId = MATERIALS_GROUP_ID) {
+    const sourcePhase = scope === 'sales' ? 'sales' : 'purchase';
+    const id = `custom_${scope}_${Date.now().toString(36)}`;
+    const form: FormMappingPreset = {
+      id,
+      label: scope === 'purchase' ? 'Form mua vào mới' : scope === 'sales' ? 'Form bán ra mới' : 'Form dùng chung mới',
+      scope,
+      type: 'template_mapping',
+      enabled: true,
+      group_id: groupId,
+      input_phase: scope === 'both' ? 'both' : scope,
+      sheet: '',
+      output_columns: outputColumns(['Cột A', 'Cột B', 'Cột C', 'Cột D']),
+      mappings: [mappingRule('A', '', sourcePhase)],
+    };
+    updateFormatLists(scope, (forms) => [...forms, form]);
+  }
+
+  function updateFormatForm(scope: FormatScope, formId: string, update: Partial<FormMappingPreset>) {
+    updateFormatLists(scope, (forms) => replaceFormatFormInList(forms, scope, formId, (form) => ({ ...form, ...update, scope: formatScopeOfForm(form, scope) })));
+  }
+
+  function updateFormatFormScope(scope: FormatScope, formId: string, nextScope: FormatScope) {
+    const form = visibleFormatFormsForScope(scope, purchaseFormMappingPresets, salesFormMappingPresets).find((item) => item.id === formId);
+    if (!form) return;
+    const nextForm = formWithScope(form, nextScope);
+    let nextPurchase = removeFormatFormFromList(purchaseFormMappingPresets, formId);
+    let nextSales = removeFormatFormFromList(salesFormMappingPresets, formId);
+    if (nextScope === 'purchase' || nextScope === 'both') nextPurchase = upsertFormatForm(nextPurchase, nextForm);
+    if (nextScope === 'sales' || nextScope === 'both') nextSales = upsertFormatForm(nextSales, nextForm);
+    updateWorkflow(profile, {
+      ...(isGenericProfile ? purchaseOutputInvalidation() : {}),
+      purchaseFormMappingPresets: nextPurchase,
+      salesFormMappingPresets: nextSales,
+    });
+  }
+
+  function deleteFormatForm(scope: FormatScope, formId: string) {
+    updateFormatForm(scope, formId, { enabled: false });
+  }
+
+  function addFormatMappingRule(scope: FormatScope, formId: string) {
+    const sourcePhase = scope === 'sales' ? 'sales' : 'purchase';
+    updateFormatForm(scope, formId, {
+      mappings: [
+        ...(visibleFormatFormsForScope(scope, purchaseFormMappingPresets, salesFormMappingPresets).find((form) => form.id === formId)?.mappings || []),
+        mappingRule('A', '', sourcePhase),
+      ],
+    });
+  }
+
+  function updateFormatMappingRule(scope: FormatScope, formId: string, index: number, update: Partial<NonNullable<FormMappingPreset['mappings']>[number]>) {
+    const form = visibleFormatFormsForScope(scope, purchaseFormMappingPresets, salesFormMappingPresets).find((item) => item.id === formId);
+    if (!form) return;
+    const mappings = [...(form.mappings || [])];
+    mappings[index] = { ...mappings[index], ...update };
+    updateFormatForm(scope, formId, { mappings });
+  }
+
+  function removeFormatMappingRule(scope: FormatScope, formId: string, index: number) {
+    const form = visibleFormatFormsForScope(scope, purchaseFormMappingPresets, salesFormMappingPresets).find((item) => item.id === formId);
+    if (!form) return;
+    updateFormatForm(scope, formId, { mappings: (form.mappings || []).filter((_, itemIndex) => itemIndex !== index) });
+  }
+
+  async function uploadFormatTemplate(scope: FormatScope, formId: string, file: File | undefined) {
+    if (!file) return;
+    setBusy(true);
+    setStatus('Đang tải file mẫu output...');
+    try {
+      const summary = await uploadExcel(file);
+      updateFormatForm(scope, formId, {
+        type: 'template_mapping',
+        template_original_name: summary.original_name,
+        template_saved_name: summary.saved_name,
+        output_columns: columnsFromUploadSummary(summary),
+        output_preview: summary.preview,
+      });
+      setStatus(`Đã tải file mẫu ${summary.original_name}. Hãy chọn cột output trong mapping.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function exportCurrentVietmaxConfig(phase: 'purchase' | 'sales') {
@@ -1699,8 +2844,8 @@ export function VietmaxApp() {
       setStatus('Chỉ nhập cấu hình Vietmax ở profile Vietmax.');
       return;
     }
-    const requiredStage = phase === 'purchase' ? 1 : 6;
-    if (stage !== requiredStage) {
+    const allowedStage = phase === 'purchase' ? stage === 0.5 || stage === 1 : stage === 6;
+    if (!allowedStage) {
       setStatus(phase === 'purchase'
         ? 'Chỉ nhập cấu hình mua vào ở stage 1 để tránh conflict dữ liệu đang xử lý.'
         : 'Chỉ nhập cấu hình bán ra ở stage 6 để tránh conflict dữ liệu đang xử lý.');
@@ -1739,9 +2884,11 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus('Đang cập nhật Mã VT preview theo từ thay riêng và từ lặp...');
     try {
-      const previewCodes = isGenericProfile
-        ? await loadGenericProductPreviewCodes(profile, companyRows, wordRules, firstWordRules, repeatedPhraseRemovals)
-        : await loadProductPreviewCodes(companyRows, purchaseWordRules, purchaseRepeatedPhraseRemovals);
+      const previewCodes = isTwoPhaseGenericProfile(profile)
+        ? await loadGenericProductPreviewCodes(profile, companyRows, purchaseWordRules, firstWordRules, purchaseRepeatedPhraseRemovals, productCodeReplacements)
+        : isGenericProfile
+        ? await loadGenericProductPreviewCodes(profile, companyRows, wordRules, firstWordRules, repeatedPhraseRemovals, productCodeReplacements)
+        : await loadProductPreviewCodes(companyRows, purchaseWordRules, purchaseRepeatedPhraseRemovals, 'purchase', productCodeReplacements);
       const nextWorkflow = { ...workflow, ...purchaseOutputInvalidation(), productPreviewCodes: previewCodes, purchaseReviewRows: [], purchaseReviewGenerated: false, priceGroups: [] };
       updateWorkflow(profile, nextWorkflow);
       for (const payload of buildConfigPayloads(nextWorkflow, 'purchase', profile)) {
@@ -1760,11 +2907,11 @@ export function VietmaxApp() {
     entries[index] = field === 'from' ? [value, entries[index]?.[1] || ''] : [entries[index]?.[0] || '', value];
     const nextRules = Object.fromEntries(entries.filter(([from]) => from.trim()));
     const invalidation = inventoryOutputInvalidation();
-    if (profile === 'vietmax' && activeVietmaxSalesConfig) {
+    if (activeUsesScopedPhase && (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig)) {
       updateWorkflow(profile, { ...invalidation, salesWordRules: nextRules, salesReviewRows: [], salesReviewGenerated: false });
       return;
     }
-    if (profile === 'vietmax') {
+    if (activeUsesScopedPhase) {
       updateWorkflow(profile, { ...invalidation, purchaseWordRules: nextRules, purchaseReviewRows: [], purchaseReviewGenerated: false });
       return;
     }
@@ -1774,11 +2921,11 @@ export function VietmaxApp() {
   function addWordRule() {
     const nextRules = { ...activeWordRules, '': '' };
     const invalidation = inventoryOutputInvalidation();
-    if (profile === 'vietmax' && activeVietmaxSalesConfig) {
+    if (activeUsesScopedPhase && (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig)) {
       updateWorkflow(profile, { ...invalidation, salesWordRules: nextRules, salesReviewGenerated: false });
       return;
     }
-    if (profile === 'vietmax') {
+    if (activeUsesScopedPhase) {
       updateWorkflow(profile, { ...invalidation, purchaseWordRules: nextRules, purchaseReviewGenerated: false });
       return;
     }
@@ -1790,11 +2937,11 @@ export function VietmaxApp() {
     next[index] = value;
     const nextPhrases = next.filter((item, rowIndex) => item.trim() || rowIndex === index);
     const invalidation = inventoryOutputInvalidation();
-    if (profile === 'vietmax' && activeVietmaxSalesConfig) {
+    if (activeUsesScopedPhase && (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig)) {
       updateWorkflow(profile, { ...invalidation, salesRepeatedPhraseRemovals: nextPhrases, salesReviewRows: [], salesReviewGenerated: false });
       return;
     }
-    if (profile === 'vietmax') {
+    if (activeUsesScopedPhase) {
       updateWorkflow(profile, { ...invalidation, purchaseRepeatedPhraseRemovals: nextPhrases, purchaseReviewRows: [], purchaseReviewGenerated: false });
       return;
     }
@@ -1804,11 +2951,11 @@ export function VietmaxApp() {
   function addRepeatedPhrase() {
     const nextPhrases = [...activeRepeatedPhraseRemovals, ''];
     const invalidation = inventoryOutputInvalidation();
-    if (profile === 'vietmax' && activeVietmaxSalesConfig) {
+    if (activeUsesScopedPhase && (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig)) {
       updateWorkflow(profile, { ...invalidation, salesRepeatedPhraseRemovals: nextPhrases, salesReviewGenerated: false });
       return;
     }
-    if (profile === 'vietmax') {
+    if (activeUsesScopedPhase) {
       updateWorkflow(profile, { ...invalidation, purchaseRepeatedPhraseRemovals: nextPhrases, purchaseReviewGenerated: false });
       return;
     }
@@ -1819,11 +2966,11 @@ export function VietmaxApp() {
     const next = activeRepeatedPhraseRemovals.slice();
     next.splice(index, 1);
     const invalidation = inventoryOutputInvalidation();
-    if (profile === 'vietmax' && activeVietmaxSalesConfig) {
+    if (activeUsesScopedPhase && (activeVietmaxSalesConfig || activeTwoPhaseSalesConfig)) {
       updateWorkflow(profile, { ...invalidation, salesRepeatedPhraseRemovals: next, salesReviewRows: [], salesReviewGenerated: false });
       return;
     }
-    if (profile === 'vietmax') {
+    if (activeUsesScopedPhase) {
       updateWorkflow(profile, { ...invalidation, purchaseRepeatedPhraseRemovals: next, purchaseReviewRows: [], purchaseReviewGenerated: false });
       return;
     }
@@ -1961,7 +3108,7 @@ export function VietmaxApp() {
     }
   }
 
-  async function downloadFastImportPackage() {
+  async function downloadFastImportPackageLegacy() {
     if (!processedPurchaseSavedName || !processedSalesSavedName) {
       setStatus('Cần có cả FDI mua vào và FDI bán ra đã xử lý trước khi tạo workbook FAST.');
       return;
@@ -1970,7 +3117,15 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus('Đang tạo workbook FAST gồm Hoadonmuahang, Hoadonbanhang, DM vật tư và DM khách hàng từ FDI đã xử lý...');
     try {
-      const blob = await createVietmaxFastImportPackage(processedPurchaseSavedName, processedSalesSavedName, progress.operationId);
+      const blob = await createVietmaxFastImportPackage(processedPurchaseSavedName, processedSalesSavedName, progress.operationId, {
+        profile,
+        purchaseOriginalSavedName: purchaseFile?.saved_name || '',
+        salesOriginalSavedName: salesFile?.saved_name || '',
+        purchaseFormMappingPresets: normalizeFormsForSave(purchaseFormMappingPresets),
+        salesFormMappingPresets: normalizeFormsForSave(salesFormMappingPresets),
+        purchaseCompanyGroupAssignments: groupAssignmentsFromRows(companyRows),
+        salesCompanyGroupAssignments: groupAssignmentsFromRows(salesCompanyRows),
+      });
       const saved = await saveBlob(blob, 'vietmax_fast_import.xls');
       setStatus(saved ? 'Đã lưu workbook FAST 4 sheet.' : 'Đã hủy lưu workbook FAST; dữ liệu đã xử lý vẫn được giữ.');
     } catch (error) {
@@ -1982,8 +3137,47 @@ export function VietmaxApp() {
     }
   }
 
+  async function downloadFastImportPackage() {
+    const purchaseForms = normalizeFormsForSave(purchaseFormMappingPresets);
+    const salesForms = normalizeFormsForSave(salesFormMappingPresets);
+    const needsPurchase = activeFormsRequirePhase(purchaseForms, 'purchase') || activeFormsRequirePhase(salesForms, 'purchase');
+    const needsSales = activeFormsRequirePhase(purchaseForms, 'sales') || activeFormsRequirePhase(salesForms, 'sales');
+    if (!needsPurchase && !needsSales) {
+      setStatus('Chua co form mapping nao dang bat de xuat FAST.');
+      return;
+    }
+    if ((needsPurchase && !processedPurchaseSavedName) || (needsSales && !processedSalesSavedName)) {
+      const missing = [needsPurchase && !processedPurchaseSavedName ? 'FDI mua vao' : '', needsSales && !processedSalesSavedName ? 'FDI ban ra' : ''].filter(Boolean).join(' va ');
+      setStatus(`Can co ${missing} da xu ly truoc khi tao workbook FAST theo form mapping.`);
+      return;
+    }
+    const progress = beginProgress('Dang tao workbook FAST theo form mapping');
+    setBusy(true);
+    setStatus('Dang tao workbook FAST theo cac form mapping dang bat...');
+    try {
+      const blob = await createVietmaxFastImportPackage(needsPurchase ? processedPurchaseSavedName : '', needsSales ? processedSalesSavedName : '', progress.operationId, {
+        profile,
+        purchaseOriginalSavedName: needsPurchase ? (purchaseFile?.saved_name || '') : '',
+        salesOriginalSavedName: needsSales ? (salesFile?.saved_name || '') : '',
+        purchaseFormMappingPresets: purchaseForms,
+        salesFormMappingPresets: salesForms,
+        purchaseCompanyGroupAssignments: groupAssignmentsFromRows(companyRows),
+        salesCompanyGroupAssignments: groupAssignmentsFromRows(salesCompanyRows),
+      });
+      const saved = await saveBlob(blob, 'vietmax_fast_import.xls');
+      setStatus(saved ? 'Da luu workbook FAST theo form mapping.' : 'Da huy luu workbook FAST; du lieu da xu ly van duoc giu.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      progress.stop();
+      setLoadingProgress(null);
+      setBusy(false);
+    }
+  }
+
   function inventoryStateForScope(scope: InventoryConfigScope) {
-    if (profile === 'vietmax' && scope === 'sales') {
+    const scopedProfile = profile === 'vietmax' || isTwoPhaseGenericProfile(profile);
+    if (scopedProfile && scope === 'sales') {
       return {
         pairs: salesInventoryPairs,
         useDefault: salesUseDefaultInventoryPair,
@@ -1991,7 +3185,7 @@ export function VietmaxApp() {
         rules: salesInventoryPairRules,
       };
     }
-    if (profile === 'vietmax' && scope === 'purchase') {
+    if (scopedProfile && scope === 'purchase') {
       return {
         pairs: purchaseInventoryPairs,
         useDefault: purchaseUseDefaultInventoryPair,
@@ -2061,7 +3255,8 @@ export function VietmaxApp() {
 
   function updateScopedInventoryConfig(update: { pairs?: InventoryPair[]; useDefault?: boolean; defaultPairId?: string; rules?: InventoryRule[] }, scope: InventoryConfigScope = activeInventoryConfigScope) {
     const invalidation = inventoryOutputInvalidation(scope);
-    if (profile === 'vietmax' && scope === 'sales') {
+    const scopedProfile = profile === 'vietmax' || isTwoPhaseGenericProfile(profile);
+    if (scopedProfile && scope === 'sales') {
       updateWorkflow(profile, {
         ...invalidation,
         ...(update.pairs ? { salesInventoryPairs: update.pairs } : {}),
@@ -2071,7 +3266,7 @@ export function VietmaxApp() {
       });
       return;
     }
-    if (profile === 'vietmax' && scope === 'purchase') {
+    if (scopedProfile && scope === 'purchase') {
       updateWorkflow(profile, {
         ...invalidation,
         ...(update.pairs ? { purchaseInventoryPairs: update.pairs } : {}),
@@ -2090,6 +3285,63 @@ export function VietmaxApp() {
     });
   }
 
+  function productCodeReplacementsForScope(scope: InventoryConfigScope = activeInventoryConfigScope) {
+    const scopedProfile = profile === 'vietmax' || isTwoPhaseGenericProfile(profile);
+    if (scopedProfile && scope === 'sales') return salesProductCodeReplacements;
+    return productCodeReplacements;
+  }
+
+  function updateScopedProductCodeReplacements(nextReplacements: Record<string, string>, scope: InventoryConfigScope = activeInventoryConfigScope) {
+    const normalized = normalizeProductCodeReplacements(nextReplacements);
+    const invalidation = inventoryOutputInvalidation(scope);
+    const scopedProfile = profile === 'vietmax' || isTwoPhaseGenericProfile(profile);
+    if (scopedProfile && scope === 'sales') {
+      updateWorkflow(profile, { ...invalidation, salesProductCodeReplacements: normalized, salesReviewRows: [], salesReviewGenerated: false });
+      return;
+    }
+    updateWorkflow(profile, { ...invalidation, productCodeReplacements: normalized, purchaseReviewRows: [], purchaseReviewGenerated: false, priceGroups: [] });
+  }
+
+  function addProductCodeReplacement(scope: InventoryConfigScope = activeInventoryConfigScope) {
+    const entries = Object.entries(productCodeReplacementsForScope(scope));
+    let key = '';
+    let index = entries.length + 1;
+    while (!key || entries.some(([existing]) => existing === key)) {
+      key = `MA_CU_${index}`;
+      index += 1;
+    }
+    updateScopedProductCodeReplacements({ ...productCodeReplacementsForScope(scope), [key]: `MA_MOI_${entries.length + 1}` }, scope);
+  }
+
+  function updateProductCodeReplacement(index: number, field: 'from' | 'to', value: string, scope: InventoryConfigScope = activeInventoryConfigScope) {
+    const entries = Object.entries(productCodeReplacementsForScope(scope));
+    const current = entries[index] || ['', ''];
+    entries[index] = field === 'from'
+      ? [sanitizeDisplayProductCode(value), current[1] || '']
+      : [current[0] || '', sanitizeDisplayProductCode(value)];
+    updateScopedProductCodeReplacements(Object.fromEntries(entries), scope);
+  }
+
+  function removeProductCodeReplacement(index: number, scope: InventoryConfigScope = activeInventoryConfigScope) {
+    const entries = Object.entries(productCodeReplacementsForScope(scope)).filter((_, rowIndex) => rowIndex !== index);
+    updateScopedProductCodeReplacements(Object.fromEntries(entries), scope);
+  }
+
+  async function importProductCodeReplacementFile(file: File | undefined, scope: InventoryConfigScope = activeInventoryConfigScope) {
+    if (!file) return;
+    setBusy(true);
+    setStatus('Đang nhập danh sách đổi mã VT...');
+    try {
+      const result = await importProductCodeReplacements(file);
+      updateScopedProductCodeReplacements({ ...productCodeReplacementsForScope(scope), ...result.product_code_replacements }, scope);
+      setStatus(`Đã nhập ${result.count} dòng đổi mã VT. Bấm Áp dụng đổi mã để cập nhật preview và lưu cấu hình.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function inventoryOutputInvalidation(scope: InventoryConfigScope = activeInventoryConfigScope) {
     if (profile === 'vietmax') {
       return scope === 'sales' ? salesOutputInvalidation() : purchaseOutputInvalidation();
@@ -2097,7 +3349,7 @@ export function VietmaxApp() {
     return stage >= 6 ? salesOutputInvalidation() : purchaseOutputInvalidation();
   }
 
-  const nextStage = visibleStages[visibleStages.findIndex((item) => item.id === stage) + 1];
+  const nextStage = adjacentEnterableStage(1);
   const nextDisabled = busy || !nextStage || (stage === 12 ? !(processedPurchaseSavedName && processedSalesSavedName) : !canEnterStage(nextStage.id));
 
   return (
@@ -2111,7 +3363,7 @@ export function VietmaxApp() {
               <div className="config-export-actions" aria-label="Xuất/nhập cấu hình Vietmax">
                 <button type="button" className="btn-secondary" disabled={busy} onClick={() => void exportCurrentVietmaxConfig('purchase')}>Xuất cấu hình mua vào</button>
                 <button type="button" className="btn-secondary" disabled={busy} onClick={() => void exportCurrentVietmaxConfig('sales')}>Xuất cấu hình bán ra</button>
-                <button type="button" className="btn-secondary" disabled={busy || stage !== 1} title="Chỉ nhập ở stage 1 để tránh conflict dữ liệu đang xử lý" onClick={() => void importCurrentVietmaxConfig('purchase')}>Nhập cấu hình mua vào</button>
+                <button type="button" className="btn-secondary" disabled={busy || (stage !== 0.5 && stage !== 1)} title="Chỉ nhập ở stage form mapping hoặc stage 1 để tránh conflict dữ liệu đang xử lý" onClick={() => void importCurrentVietmaxConfig('purchase')}>Nhập cấu hình mua vào</button>
                 <button type="button" className="btn-secondary" disabled={busy || stage !== 6} title="Chỉ nhập ở stage 6 để tránh conflict dữ liệu đang xử lý" onClick={() => void importCurrentVietmaxConfig('sales')}>Nhập cấu hình bán ra</button>
               </div>
             )}
@@ -2126,7 +3378,7 @@ export function VietmaxApp() {
             <div>
               <strong>License</strong>
               <span>{license?.status || 'Đang kiểm tra license...'}</span>
-              <span className={licenseReady ? 'ok-text' : 'warning-text'}>{licenseReady ? 'Được phép dùng.' : 'Cần license cho profile đang chọn.'}</span>
+              <span className={licenseReady ? 'ok-text' : 'warning-text'}>{licenseProfileText}</span>
             </div>
             {!licenseReady && (
               <div className="license-form compact-form">
@@ -2141,13 +3393,13 @@ export function VietmaxApp() {
 
         <section className="stage-frame">
           <div className={`stage-body ${profile === 'cao_thanh' ? 'legacy-stage-body' : ''}`}>
-            {profile !== 'vietmax' ? renderProfileStage() : renderVietmaxStage()}
+            {profile === 'vietmax' || isTwoPhaseGenericProfile(profile) ? renderTwoPhaseStage() : renderProfileStage()}
           </div>
         </section>
 
         {usesNativeStageShell && (
           <footer className="action-bar">
-            <button type="button" className="btn-secondary" disabled={stage === 1 || busy} onClick={goBack}>Quay lại</button>
+            <button type="button" className="btn-secondary" disabled={visibleStages.findIndex((item) => item.id === stage) <= 0 || busy} onClick={goBack}>Quay lại</button>
             <button type="button" className="btn-danger" disabled={busy} onClick={resetWorkflow}>Làm lại</button>
             <div className="action-spacer" />
             <button type="button" disabled={nextDisabled} onClick={goNext}>Tiếp tục</button>
@@ -2157,37 +3409,42 @@ export function VietmaxApp() {
     </main>
   );
 
-  function renderVietmaxStage() {
+  function renderTwoPhaseStage() {
     switch (stage) {
+      case 0.5:
+        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
       case 1:
-        return <UploadStage title="HD mua vào" summary={purchaseFile} disabled={busy || !licenseReady} onUpload={(file) => upload('purchase', file)} />;
+        return <UploadStage title={profile === 'vietmax' ? 'HD mua vào' : `HD mua vào ${selectedProfile.label}`} summary={purchaseFile} disabled={busy || !licenseReady} onUpload={(file) => upload('purchase', file)} />;
       case 2:
         return <MappingStage summary={purchaseFile} phase="purchase" scope={comparisonScope} setScope={updateComparisonScope} columns={purchaseColumns} invoiceStatuses={purchaseInvoiceStatuses} onColumnsChange={(update) => updateVietmaxColumns('purchase', update)} onInvoiceStatusSkipValuesChange={(values) => updateVietmaxInvoiceStatusSkipValues('purchase', values)} />;
       case 3:
         if (busy && !companyRows.length) return <LoadingStage title="Đang tải danh sách công ty" detail="Đang đọc workbook và gom công ty/MST/hàng hóa..." />;
-        return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} wordRules={purchaseWordRules} repeatedPhrases={purchaseRepeatedPhraseRemovals} inventoryPairs={purchaseInventoryPairs} useDefaultInventoryPair={purchaseUseDefaultInventoryPair} defaultInventoryPairId={purchaseDefaultInventoryPairId} inventoryPairRules={purchaseInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={() => addInventoryPair('purchase')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'purchase')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'purchase')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'purchase')} onAddInventoryRule={() => addInventoryRule('purchase')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'purchase')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'purchase')} />;
+        return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} processingGroups={purchaseProcessingGroups} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} productCodeReplacements={productCodeReplacements} wordRules={purchaseWordRules} repeatedPhrases={purchaseRepeatedPhraseRemovals} inventoryPairs={purchaseInventoryPairs} useDefaultInventoryPair={purchaseUseDefaultInventoryPair} defaultInventoryPairId={purchaseDefaultInventoryPairId} inventoryPairRules={purchaseInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onCompanyGroupChange={updateCompanyGroup} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'purchase')} onAddProductCodeReplacement={() => addProductCodeReplacement('purchase')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'purchase')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'purchase')} onAddInventoryPair={() => addInventoryPair('purchase')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'purchase')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'purchase')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'purchase')} onAddInventoryRule={() => addInventoryRule('purchase')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'purchase')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'purchase')} />;
       case 4:
         if (busy || !purchaseReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." progress={loadingProgress} />;
         return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title="Review Mã VT mua vào" empty="Không có dòng Mã VT cần review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
       case 5:
         if (busy) return <LoadingStage title="Đang tạo file mua vào" detail="Đang xử lý workbook và tạo cache file mua vào để dùng cho các stage bán ra..." progress={loadingProgress} />;
-        return <ProcessStage title="Tạo file mua vào" detail="Xuất file FDI mua vào đã xử lý bằng logic Vietmax. File này sẽ được cache để dùng cho khớp mua/bán, phân bổ tồn kho và xuất FAST ở stage 15." buttonLabel="Xuất file mua vào" disabled={busy || !purchaseFile} onProcess={downloadProcessedPurchase} />;
+        return <ProcessStage title="Tạo file mua vào" detail="Xuất file FDI mua vào đã xử lý. File này sẽ được cache để dùng cho các stage bán ra và xuất FAST ở stage 15." buttonLabel="Xuất file mua vào" disabled={busy || !purchaseFile || (profile !== 'vietmax' && !companyRows.length)} onProcess={profile === 'vietmax' ? downloadProcessedPurchase : downloadGenericProcessedFile} />;
       case 6:
-        return <SalesEntryStage salesFile={salesFile} processedPurchaseReady={Boolean(processedPurchaseSavedName)} processedPurchaseStats={processedPurchaseStats} disabled={busy || !licenseReady} onSalesUpload={(file) => upload('sales', file)} onProcessedPurchaseUpload={(file) => uploadProcessed('purchase', file)} />;
+        return profile === 'vietmax'
+          ? <SalesEntryStage salesFile={salesFile} processedPurchaseReady={Boolean(processedPurchaseSavedName)} processedPurchaseStats={processedPurchaseStats} disabled={busy || !licenseReady} onSalesUpload={(file) => upload('sales', file)} onProcessedPurchaseUpload={(file) => uploadProcessed('purchase', file)} />
+          : <UploadStage title={`HD bán ra ${selectedProfile.label}`} summary={salesFile} disabled={busy || !licenseReady} onUpload={(file) => upload('sales', file)} />;
       case 7:
         return <MappingStage summary={salesFile} phase="sales" scope={comparisonScope} setScope={updateComparisonScope} columns={salesColumns} invoiceStatuses={salesInvoiceStatuses} onColumnsChange={(update) => updateVietmaxColumns('sales', update)} onInvoiceStatusSkipValuesChange={(values) => updateVietmaxInvoiceStatusSkipValues('sales', values)} />;
       case 8:
+        if (profile !== 'vietmax') return <PlaceholderStage title="Khớp mua vào chỉ dùng cho Vietmax" detail="Profile này sẽ đi thẳng từ chọn cột bán ra sang công ty bán ra." />;
         if (busy) return <LoadingStage title="Đang khớp mua vào / bán ra" detail={processedPurchaseSavedName ? 'Đang so sánh hàng bán ra với file mua vào đã xử lý và áp dụng cấu hình khớp đã lưu...' : 'Đang tạo cache mua vào rồi khớp với file bán ra...'} progress={loadingProgress} />;
         return <MatchStage rows={matches} disabled={!salesFile || busy || (!purchaseFile && !processedPurchaseSavedName)} onRun={runSalesMatch} onSave={saveMatchChoices} onToggle={toggleMatch} onBulkToggle={bulkToggleMatches} onConversionChange={updateMatchConversion} autoRun={Boolean(salesFile && (purchaseFile || processedPurchaseSavedName)) && matches.length === 0 && !busy} emptyMessage={processedPurchaseSavedName || purchaseFile ? undefined : 'Cần tải file mua vào đã xử lý trước khi khớp mua/bán.'} />;
       case 9:
         if (busy && !salesCompanyRows.length) return <LoadingStage title="Đang tải danh sách công ty bán ra" detail="Đang lọc các hàng hóa chưa khớp KVT/152 và gom theo công ty..." />;
-        return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} wordRules={salesWordRules} repeatedPhrases={salesRepeatedPhraseRemovals} inventoryPairs={salesInventoryPairs} useDefaultInventoryPair={salesUseDefaultInventoryPair} defaultInventoryPairId={salesDefaultInventoryPairId} inventoryPairRules={salesInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={salesPrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={salesMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applySalesPrefixPreset} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={() => addInventoryPair('sales')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'sales')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'sales')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'sales')} onAddInventoryRule={() => addInventoryRule('sales')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'sales')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'sales')} />;
+        return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} processingGroups={salesProcessingGroups} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} productCodeReplacements={salesProductCodeReplacements} wordRules={salesWordRules} repeatedPhrases={salesRepeatedPhraseRemovals} inventoryPairs={salesInventoryPairs} useDefaultInventoryPair={salesUseDefaultInventoryPair} defaultInventoryPairId={salesDefaultInventoryPairId} inventoryPairRules={salesInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={salesPrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={salesMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applySalesPrefixPreset} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onCompanyGroupChange={updateSalesCompanyGroup} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'sales')} onAddProductCodeReplacement={() => addProductCodeReplacement('sales')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'sales')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'sales')} onAddInventoryPair={() => addInventoryPair('sales')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'sales')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'sales')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'sales')} onAddInventoryRule={() => addInventoryRule('sales')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'sales')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'sales')} />;
       case 10:
         if (busy || !salesReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." progress={loadingProgress} />;
         return <ReviewStage rows={salesReviewRows} onApply={applySalesReviewChoices} disabled={!salesFile || busy} onRowChange={updateSalesReviewRow} onBulkChange={bulkUpdateSalesReviewRows} title="Review Mã VT bán ra" empty="Không có dòng Mã VT bán ra cần review." reviewScope={salesReviewScope} onReviewScopeChange={updateSalesReviewScope} />;
       case 11:
         if (busy) return <LoadingStage title="Đang tạo file bán ra" detail="Đang xử lý workbook bán ra, áp dụng khớp mua vào và lưu cache cho phân bổ tồn kho..." progress={loadingProgress} />;
-        return <ProcessStage title="Tạo file bán ra" detail="Xuất file FDI bán ra đã xử lý bằng logic Vietmax. File này sẽ được cache để dùng cho phân bổ tồn kho và xuất FAST ở stage 15." buttonLabel="Xuất file bán ra" disabled={busy || !salesFile} onProcess={downloadProcessedSales} />;
+        return <ProcessStage title="Tạo file bán ra" detail="Xuất file FDI bán ra đã xử lý. File này sẽ được cache để dùng cho xuất FAST ở stage 15." buttonLabel="Xuất file bán ra" disabled={busy || !salesFile || (profile !== 'vietmax' && !salesCompanyRows.length)} onProcess={profile === 'vietmax' ? downloadProcessedSales : downloadGenericSalesProcessedFile} />;
       case 12:
         if (isInventoryAllocationRunning(inventoryAllocationJob)) return <LoadingStage title="Đang phân bổ tồn kho" detail={inventoryAllocationJob?.label || 'Đang chạy phân bổ từ file mua vào và bán ra đã xử lý...'} progress={inventoryJobProgress(inventoryAllocationJob)} />;
         return <InventoryAllocationStage purchaseFile={purchaseFile} salesFile={salesFile} processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} processedPurchaseStats={processedPurchaseStats} processedSalesStats={processedSalesStats} openingStockFile={openingStockFile} config={inventoryAllocationConfig} busy={busy} onProcessedPurchaseFileChange={(file) => uploadProcessed('purchase', file)} onProcessedSalesFileChange={(file) => uploadProcessed('sales', file)} onOpeningStockFileChange={updateOpeningStockFile} onConfigChange={updateInventoryAllocationConfig} />;
@@ -2195,8 +3452,13 @@ export function VietmaxApp() {
         return <InventoryAllocationReportStage result={inventoryAllocationResult ?? inventoryAllocationJob?.result ?? null} busy={busy} />;
       case 14:
         return <InventoryAllocationExportStage result={inventoryAllocationResult ?? inventoryAllocationJob?.result ?? null} busy={busy} onDownload={downloadInventoryReport} />;
-      case 15:
-        return <FastImportExportStage processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} processedPurchaseStats={processedPurchaseStats} processedSalesStats={processedSalesStats} busy={busy} onProcessedPurchaseUpload={(file) => uploadFastImportProcessed('purchase', file)} onProcessedSalesUpload={(file) => uploadFastImportProcessed('sales', file)} onDownload={downloadFastImportPackage} />;
+      case 15: {
+        const purchaseForms = normalizeFormsForSave(purchaseFormMappingPresets);
+        const salesForms = normalizeFormsForSave(salesFormMappingPresets);
+        const needsPurchase = activeFormsRequirePhase(purchaseForms, 'purchase') || activeFormsRequirePhase(salesForms, 'purchase');
+        const needsSales = activeFormsRequirePhase(purchaseForms, 'sales') || activeFormsRequirePhase(salesForms, 'sales');
+        return <FastImportExportStage processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} processedPurchaseStats={processedPurchaseStats} processedSalesStats={processedSalesStats} needsPurchase={needsPurchase} needsSales={needsSales} busy={busy} onProcessedPurchaseUpload={(file) => uploadFastImportProcessed('purchase', file)} onProcessedSalesUpload={(file) => uploadFastImportProcessed('sales', file)} onDownload={downloadFastImportPackage} />;
+      }
       default:
         return null;
     }
@@ -2207,6 +3469,51 @@ export function VietmaxApp() {
       return <EstimateExtractorWorkflow licenseReady={licenseReady} onStatus={setStatus} stage={stage} onStageChange={goToStage} />;
     }
     if (isGenericProfile) {
+      if (isTwoPhaseGenericProfile(profile)) return renderTwoPhaseStage();
+      if (isTwoPhaseGenericProfile(profile)) {
+        switch (stage) {
+          case 0.5:
+            return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
+          case 1:
+            return <UploadStage title={`HD mua vào ${selectedProfile.label}`} summary={purchaseFile} disabled={busy || !licenseReady} onUpload={(file) => upload('purchase', file)} />;
+          case 2:
+            return <MappingStage summary={purchaseFile} phase="purchase" scope={comparisonScope} setScope={updateComparisonScope} columns={purchaseColumns} invoiceStatuses={purchaseInvoiceStatuses} onColumnsChange={(update) => updateVietmaxColumns('purchase', update)} onInvoiceStatusSkipValuesChange={(values) => updateVietmaxInvoiceStatusSkipValues('purchase', values)} />;
+          case 3:
+            if (busy && !companyRows.length) return <LoadingStage title="Đang tải danh sách công ty mua vào" detail="Đang đọc workbook và gom công ty/MST/hàng hóa..." />;
+            return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} processingGroups={purchaseProcessingGroups} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} productCodeReplacements={productCodeReplacements} wordRules={purchaseWordRules} repeatedPhrases={purchaseRepeatedPhraseRemovals} inventoryPairs={purchaseInventoryPairs} useDefaultInventoryPair={purchaseUseDefaultInventoryPair} defaultInventoryPairId={purchaseDefaultInventoryPairId} inventoryPairRules={purchaseInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onCompanyGroupChange={updateCompanyGroup} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'purchase')} onAddProductCodeReplacement={() => addProductCodeReplacement('purchase')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'purchase')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'purchase')} onAddInventoryPair={() => addInventoryPair('purchase')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'purchase')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'purchase')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'purchase')} onAddInventoryRule={() => addInventoryRule('purchase')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'purchase')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'purchase')} />;
+          case 4:
+            if (busy || !purchaseReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." progress={loadingProgress} />;
+            return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title="Review Mã VT mua vào" empty="Không có dòng Mã VT cần review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
+          case 5:
+            if (busy) return <LoadingStage title="Đang tạo file mua vào" detail="Đang xử lý workbook và tạo cache file mua vào..." progress={loadingProgress} />;
+            return <ProcessStage title="Tạo file mua vào" detail="Xuất file FDI mua vào đã xử lý. Workbook form mapping sẽ được tạo ở stage Xuất FAST." buttonLabel="Xuất file mua vào" disabled={busy || !purchaseFile || !companyRows.length} onProcess={downloadGenericProcessedFile} />;
+          case 6:
+            return <UploadStage title={`HD bán ra ${selectedProfile.label}`} summary={salesFile} disabled={busy || !licenseReady} onUpload={(file) => upload('sales', file)} />;
+          case 7:
+            return <MappingStage summary={salesFile} phase="sales" scope={comparisonScope} setScope={updateComparisonScope} columns={salesColumns} invoiceStatuses={salesInvoiceStatuses} onColumnsChange={(update) => updateVietmaxColumns('sales', update)} onInvoiceStatusSkipValuesChange={(values) => updateVietmaxInvoiceStatusSkipValues('sales', values)} />;
+          case 8:
+            if (busy && !salesCompanyRows.length) return <LoadingStage title="Đang tải danh sách công ty bán ra" detail="Đang đọc workbook bán ra và gom công ty/MST/hàng hóa..." />;
+            return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} processingGroups={salesProcessingGroups} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} productCodeReplacements={salesProductCodeReplacements} wordRules={salesWordRules} repeatedPhrases={salesRepeatedPhraseRemovals} inventoryPairs={salesInventoryPairs} useDefaultInventoryPair={salesUseDefaultInventoryPair} defaultInventoryPairId={salesDefaultInventoryPairId} inventoryPairRules={salesInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={salesPrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={salesMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applySalesPrefixPreset} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onCompanyGroupChange={updateSalesCompanyGroup} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'sales')} onAddProductCodeReplacement={() => addProductCodeReplacement('sales')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'sales')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'sales')} onAddInventoryPair={() => addInventoryPair('sales')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'sales')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'sales')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'sales')} onAddInventoryRule={() => addInventoryRule('sales')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'sales')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'sales')} />;
+          case 9:
+            if (busy || !salesReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." progress={loadingProgress} />;
+            return <ReviewStage rows={salesReviewRows} onApply={applySalesReviewChoices} disabled={!salesFile || busy} onRowChange={updateSalesReviewRow} onBulkChange={bulkUpdateSalesReviewRows} title="Review Mã VT bán ra" empty="Không có dòng Mã VT bán ra cần review." reviewScope={salesReviewScope} onReviewScopeChange={updateSalesReviewScope} />;
+          case 10:
+            if (busy) return <LoadingStage title="Đang tạo file bán ra" detail="Đang xử lý workbook bán ra và tạo cache file bán ra..." progress={loadingProgress} />;
+            return <ProcessStage title="Tạo file bán ra" detail="Xuất file FDI bán ra đã xử lý. Workbook form mapping sẽ được tạo ở stage Xuất FAST." buttonLabel="Xuất file bán ra" disabled={busy || !salesFile || !salesCompanyRows.length} onProcess={downloadGenericSalesProcessedFile} />;
+          case 15: {
+            const purchaseForms = normalizeFormsForSave(purchaseFormMappingPresets);
+            const salesForms = normalizeFormsForSave(salesFormMappingPresets);
+            const needsPurchase = activeFormsRequirePhase(purchaseForms, 'purchase') || activeFormsRequirePhase(salesForms, 'purchase');
+            const needsSales = activeFormsRequirePhase(purchaseForms, 'sales') || activeFormsRequirePhase(salesForms, 'sales');
+            return <FastImportExportStage processedPurchaseSavedName={processedPurchaseSavedName} processedSalesSavedName={processedSalesSavedName} processedPurchaseStats={processedPurchaseStats} processedSalesStats={processedSalesStats} needsPurchase={needsPurchase} needsSales={needsSales} busy={busy} onProcessedPurchaseUpload={(file) => uploadFastImportProcessed('purchase', file)} onProcessedSalesUpload={(file) => uploadFastImportProcessed('sales', file)} onDownload={downloadFastImportPackage} />;
+          }
+          default:
+            return null;
+        }
+      }
+      if (Number(stage) === 0.5) {
+        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
+      }
       if (Number(stage) === 4) {
         if (busy || (!purchaseReviewGenerated && purchaseFile && companyRows.length)) return <LoadingStage title={`Dang tao Review Ma VT ${selectedProfile.label}`} detail="Dang so sanh cac ten hang gan giong nhau theo danh sach cong ty/hang hoa da ap dung..." progress={loadingProgress} />;
         return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title={`Review Ma VT ${selectedProfile.label}`} empty="Khong co dong Ma VT can review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
@@ -2215,8 +3522,8 @@ export function VietmaxApp() {
         return <CaoThanhPriceStage groups={priceGroups} filterPercent={priceFilterAllPercent} marginPercent={priceAdjustAllPercent} busy={busy} onRefresh={updateCaoThanhPriceGroups} onGroupPercentChange={updateCaoThanhGroupPercent} onBucketMarginChange={updateCaoThanhBucketMargin} onFilterPercentChange={updateCaoThanhPriceFilterAllPercent} onMarginPercentChange={updateCaoThanhPriceAdjustAllPercent} onApplyFilter={applyCaoThanhBulkPriceFilter} onApplyMargin={applyCaoThanhBulkMargin} onExportReport={exportCaoThanhPriceReport} />;
       }
       if ((Number(stage) === 5 && profile !== 'cao_thanh') || Number(stage) === 6) {
-        if (busy) return <LoadingStage title={`Dang tao file ${selectedProfile.label}`} detail="Dang xu ly workbook va dong goi file ket qua..." />;
-        return <ProcessStage title={`Xuat file ${selectedProfile.label}`} detail="Xuat file da xu ly Ma VT va file nhap kho di kem theo cau hinh cong ty/hang hoa hien tai." buttonLabel="Xuat file ket qua" disabled={busy || !purchaseFile || !companyRows.length} onProcess={downloadGenericProcessedFile} />;
+        if (busy) return <LoadingStage title={`Đang tạo cache file ${selectedProfile.label}`} detail="Đang xử lý workbook một lần và lưu cache để các lần xuất sau tải nhanh hơn..." progress={loadingProgress} />;
+        return <ProcessStage title={`Xuất file ${selectedProfile.label}`} detail="Xuất một workbook .xls gồm FDI đã xử lý và các sheet form mapping theo cấu hình hiện tại." buttonLabel="Xuất file kết quả" disabled={busy || !purchaseFile || !companyRows.length || !processedPurchaseSavedName} onProcess={downloadGenericProcessedFile} />;
       }
       switch (stage) {
         case 1:
@@ -2225,9 +3532,9 @@ export function VietmaxApp() {
           return <GenericMappingStage summary={purchaseFile} columns={genericColumns} onColumnsChange={updateGenericColumns} />;
         case 3:
           if (busy && !companyRows.length) return <LoadingStage title={`Đang tải danh sách công ty ${selectedProfile.label}`} detail="Đang đọc workbook và gom công ty/MST/hàng hóa..." />;
-          return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onAddInventoryPair={() => addInventoryPair('generic')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'generic')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'generic')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'generic')} onAddInventoryRule={() => addInventoryRule('generic')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'generic')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'generic')} />;
+          return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} processingGroups={purchaseProcessingGroups} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} productCodeReplacements={productCodeReplacements} wordRules={wordRules} repeatedPhrases={repeatedPhraseRemovals} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onCompanyGroupChange={updateCompanyGroup} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'generic')} onAddProductCodeReplacement={() => addProductCodeReplacement('generic')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'generic')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'generic')} onAddInventoryPair={() => addInventoryPair('generic')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'generic')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'generic')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'generic')} onAddInventoryRule={() => addInventoryRule('generic')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'generic')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'generic')} />;
         case 4:
-          if (busy) return <LoadingStage title={`Đang tạo file ${selectedProfile.label}`} detail="Đang xử lý workbook và đóng gói file kết quả..." />;
+          if (busy) return <LoadingStage title={`Đang tạo cache file ${selectedProfile.label}`} detail="Đang xử lý workbook một lần và lưu cache để các lần xuất sau tải nhanh hơn..." progress={loadingProgress} />;
           return <ProcessStage title={`Xuất file ${selectedProfile.label}`} detail="Xuất file đã xử lý Mã VT và file UP đi kèm theo cấu hình công ty/hàng hóa hiện tại." buttonLabel="Xuất file kết quả" disabled={busy || !purchaseFile || !companyRows.length} onProcess={downloadGenericProcessedFile} />;
         default:
           return null;
@@ -2346,6 +3653,7 @@ function ConfigModal({
   onClose,
   wordRules,
   repeatedPhrases,
+  productCodeReplacements,
   inventoryPairs,
   useDefaultInventoryPair,
   defaultInventoryPairId,
@@ -2355,6 +3663,10 @@ function ConfigModal({
   onRepeatedChange,
   onAddRepeated,
   onRemoveRepeated,
+  onProductCodeReplacementChange,
+  onAddProductCodeReplacement,
+  onRemoveProductCodeReplacement,
+  onImportProductCodeReplacements,
   onAddInventoryPair,
   onInventoryPairChange,
   onRemoveInventoryPair,
@@ -2369,6 +3681,7 @@ function ConfigModal({
   onClose: () => void;
   wordRules: Record<string, string>;
   repeatedPhrases: string[];
+  productCodeReplacements: Record<string, string>;
   inventoryPairs: InventoryPair[];
   useDefaultInventoryPair: boolean;
   defaultInventoryPairId: string;
@@ -2378,6 +3691,10 @@ function ConfigModal({
   onRepeatedChange: (index: number, value: string) => void;
   onAddRepeated: () => void;
   onRemoveRepeated: (index: number) => void;
+  onProductCodeReplacementChange: (index: number, field: 'from' | 'to', value: string) => void;
+  onAddProductCodeReplacement: () => void;
+  onRemoveProductCodeReplacement: (index: number) => void;
+  onImportProductCodeReplacements: (file: File | undefined) => void;
   onAddInventoryPair: () => void;
   onInventoryPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void;
   onRemoveInventoryPair: (index: number) => void;
@@ -2388,8 +3705,9 @@ function ConfigModal({
   onRefreshPreviews?: () => void;
   busy?: boolean;
 }) {
-  const [activeTab, setActiveTab] = useState<'words' | 'repeat' | 'inventory'>('words');
+  const [activeTab, setActiveTab] = useState<'words' | 'repeat' | 'replace' | 'inventory'>('words');
   const wordEntries = Object.entries(wordRules);
+  const replacementEntries = Object.entries(productCodeReplacements);
   if (!isOpen) return null;
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -2400,6 +3718,7 @@ function ConfigModal({
         </div>
         <div className="modal-body">
           <div className="tab-list">
+            <button className={`tab-button ${activeTab === 'replace' ? 'active' : ''}`} onClick={() => setActiveTab('replace')}>{'\u0110\u1ed5i m\u00e3 VT'}</button>
             <button className={`tab-button ${activeTab === 'words' ? 'active' : ''}`} onClick={() => setActiveTab('words')}>Từ riêng</button>
             <button className={`tab-button ${activeTab === 'repeat' ? 'active' : ''}`} onClick={() => setActiveTab('repeat')}>Từ lặp</button>
             <button className={`tab-button ${activeTab === 'inventory' ? 'active' : ''}`} onClick={() => setActiveTab('inventory')}>Phân kho</button>
@@ -2420,6 +3739,29 @@ function ConfigModal({
               ))}
             </div>
             <div className="tab-apply-bar"><button type="button" disabled={busy} onClick={() => { onRefreshPreviews?.(); }}>Áp dụng từ lặp</button></div>
+          </div>
+          <div className={`tab-panel ${activeTab === 'replace' ? 'active' : ''}`}>
+            <div className="stage-toolbar compact-toolbar">
+              <p>{'\u0110\u1ed5i m\u00e3 VT sau khi t\u1ea1o m\u00e3'}</p>
+              <div className="compact-toolbar-actions">
+                <label className="btn-secondary file-import-button">
+                  {'Nh\u1eadp Excel'}
+                  <input type="file" accept=".xls,.xlsx,.xlsm" onChange={(event) => { onImportProductCodeReplacements(event.currentTarget.files?.[0]); event.currentTarget.value = ''; }} />
+                </label>
+                <button type="button" className="btn-secondary" onClick={onAddProductCodeReplacement}>Thêm dòng</button>
+              </div>
+            </div>
+            <div className="compact-rule-list">
+              {(replacementEntries.length ? replacementEntries : [['', '']]).map(([from, to], index) => (
+                <div className="rule-row product-code-replacement-row" key={`product-code-replacement-${index}`}>
+                  <input placeholder={'M\u00e3 VT g\u1ed1c, v\u00ed d\u1ee5 TU100'} value={from} onChange={(event) => onProductCodeReplacementChange(index, 'from', event.currentTarget.value)} />
+                  <input placeholder={'M\u00e3 VT m\u1edbi, v\u00ed d\u1ee5 TU100.001'} value={to} onChange={(event) => onProductCodeReplacementChange(index, 'to', event.currentTarget.value)} />
+                  <button type="button" className="btn-secondary compact-table-button" onClick={() => onRemoveProductCodeReplacement(index)}>Xóa</button>
+                </div>
+              ))}
+            </div>
+            <p className="muted">{'Quy t\u1eafc b\u1ecf qua prefix c\u00f4ng ty: TU100 c\u0169ng \u00e1p d\u1ee5ng cho TA.TU100, TP.TU100...'}</p>
+            <div className="tab-apply-bar"><button type="button" disabled={busy} onClick={() => { onRefreshPreviews?.(); }}>{'\u00c1p d\u1ee5ng \u0111\u1ed5i m\u00e3'}</button></div>
           </div>
           <div className={`tab-panel ${activeTab === 'inventory' ? 'active' : ''}`}>
             <InventoryPairEditor pairs={inventoryPairs} useDefault={useDefaultInventoryPair} defaultPairId={defaultInventoryPairId} rules={inventoryPairRules} busy={busy ?? false} onAddPair={onAddInventoryPair} onPairChange={onInventoryPairChange} onRemovePair={onRemoveInventoryPair} onDefaultsChange={onInventoryDefaultsChange} onAddRule={onAddInventoryRule} onRuleChange={onInventoryRuleChange} onRemoveRule={onRemoveInventoryRule} />
@@ -2451,7 +3793,399 @@ type ReviewDisplayGroup = {
   children?: ReviewDisplayGroup[];
 };
 
-function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCodes, productCodeOverrides, wordRules, repeatedPhrases, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, busy, showCompanyPrefixControls = false, includeCompanyPrefix = false, prefixStrategy = 'last_2_words', prefixMstDigits = 3, prefixNameWords = 2, prefixNameChars = 1, missingMstPrefixStrategy = 'all_name_words', missingMstCompanies = [], onIncludeCompanyPrefixChange, onCompanyPrefixChange, onPrefixMstDigitsChange, onPrefixNameWordsChange, onPrefixNameCharsChange, onMissingMstPrefixStrategyChange, onApplyPrefixPresetToAll, onCompanySelect, onCompanyChange, onBulkCompanyChange, onProductChange, onProductCodeChange, onApplyChoices, onRefreshPreviews, onWordRuleChange, onAddWordRule, onRepeatedChange, onAddRepeated, onRemoveRepeated, onAddInventoryPair, onInventoryPairChange, onRemoveInventoryPair, onInventoryDefaultsChange, onAddInventoryRule, onInventoryRuleChange, onRemoveInventoryRule }: { companies: CompanyRow[]; selectedCompanyIndex: number; productPreviewCodes: Record<string, string>; productCodeOverrides: Record<string, string>; wordRules: Record<string, string>; repeatedPhrases: string[]; inventoryPairs: InventoryPair[]; useDefaultInventoryPair: boolean; defaultInventoryPairId: string; inventoryPairRules: InventoryRule[]; busy: boolean; showCompanyPrefixControls?: boolean; includeCompanyPrefix?: boolean; prefixStrategy?: string; prefixMstDigits?: number; prefixNameWords?: number; prefixNameChars?: number; missingMstPrefixStrategy?: PrefixPresetStrategy; missingMstCompanies?: MissingMstCompanyWarning[]; onIncludeCompanyPrefixChange?: (include: boolean) => void; onCompanyPrefixChange?: (index: number, value: string) => void; onPrefixMstDigitsChange?: (digits: number) => void; onPrefixNameWordsChange?: (words: number) => void; onPrefixNameCharsChange?: (chars: number) => void; onMissingMstPrefixStrategyChange?: (strategy: PrefixPresetStrategy) => void; onApplyPrefixPresetToAll?: (strategy: PrefixPresetStrategy) => void; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onBulkCompanyChange?: (pending: boolean) => void; onProductChange: (companyIndex: number, productName: string, selected: boolean) => void; onProductCodeChange: (companyIndex: number, productName: string, code: string) => void; onApplyChoices: () => void; onRefreshPreviews: () => void; onWordRuleChange: (index: number, field: 'from' | 'to', value: string) => void; onAddWordRule: () => void; onRepeatedChange: (index: number, value: string) => void; onAddRepeated: () => void; onRemoveRepeated: (index: number) => void; onAddInventoryPair: () => void; onInventoryPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void; onRemoveInventoryPair: (index: number) => void; onInventoryDefaultsChange: (update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) => void; onAddInventoryRule: () => void; onInventoryRuleChange: (index: number, update: Partial<InventoryRule>) => void; onRemoveInventoryRule: (index: number) => void }) {
+function FormatMappingStage({
+  purchaseFile,
+  salesFile,
+  purchaseGroups,
+  salesGroups,
+  purchasePresets,
+  salesPresets,
+  allowedScopes = ['purchase', 'sales', 'both'],
+  busy,
+  onAddGroup,
+  onGroupChange,
+  onDeleteGroup,
+  onAddForm,
+  onFormChange,
+  onFormScopeChange,
+  onDeleteForm,
+  onAddMapping,
+  onMappingChange,
+  onRemoveMapping,
+  onUploadTemplate,
+  onSave,
+}: {
+  purchaseFile: UploadSummary | null;
+  salesFile: UploadSummary | null;
+  purchaseGroups: ProcessingGroup[];
+  salesGroups: ProcessingGroup[];
+  purchasePresets: FormMappingPreset[];
+  salesPresets: FormMappingPreset[];
+  allowedScopes?: FormatScope[];
+  busy: boolean;
+  onAddGroup: (scope: FormatScope, label?: string) => void;
+  onGroupChange: (scope: FormatScope, groupId: string, update: Partial<ProcessingGroup>) => void;
+  onDeleteGroup: (scope: FormatScope, groupId: string) => void;
+  onAddForm: (scope: FormatScope, groupId?: string) => void;
+  onFormChange: (scope: FormatScope, formId: string, update: Partial<FormMappingPreset>) => void;
+  onFormScopeChange: (scope: FormatScope, formId: string, nextScope: FormatScope) => void;
+  onDeleteForm: (scope: FormatScope, formId: string) => void;
+  onAddMapping: (scope: FormatScope, formId: string) => void;
+  onMappingChange: (scope: FormatScope, formId: string, index: number, update: Partial<NonNullable<FormMappingPreset['mappings']>[number]>) => void;
+  onRemoveMapping: (scope: FormatScope, formId: string, index: number) => void;
+  onUploadTemplate: (scope: FormatScope, formId: string, file: File | undefined) => void;
+  onSave: () => void;
+}) {
+  const scopes = allowedScopes.length ? allowedScopes : (Object.keys(FORMAT_SCOPE_LABELS) as FormatScope[]);
+  const [activeScope, setActiveScope] = useState<FormatScope>(scopes[0] || 'purchase');
+  useEffect(() => {
+    if (!scopes.includes(activeScope)) {
+      setActiveScope(scopes[0] || 'purchase');
+    }
+  }, [activeScope, scopes]);
+  const groups = activeScope === 'sales' ? salesGroups : purchaseGroups;
+  const [activeGroupId, setActiveGroupId] = useState(MATERIALS_GROUP_ID);
+  useEffect(() => {
+    if (!groups.some((group) => group.id === activeGroupId)) {
+      setActiveGroupId(groups[0]?.id || MATERIALS_GROUP_ID);
+    }
+  }, [activeGroupId, groups]);
+  const forms = visibleFormatFormsForScope(activeScope, purchasePresets, salesPresets).filter((form) => (form.group_id || MATERIALS_GROUP_ID) === activeGroupId);
+  const purchaseColumns = purchaseFile ? columnsFromUploadSummary(purchaseFile) : fallbackFdiSourceColumns;
+  const salesColumns = salesFile ? columnsFromUploadSummary(salesFile) : fallbackFdiSourceColumns;
+  const sourceColumns = (phase: string | undefined) => phase === 'sales' ? salesColumns : purchaseColumns;
+  const sourcePhaseOptions = Array.from(new Set(scopes.flatMap((scope) => (scope === 'sales' ? ['sales'] : scope === 'purchase' ? ['purchase'] : ['purchase', 'sales'])))) as Array<'purchase' | 'sales'>;
+  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [scopeEditForm, setScopeEditForm] = useState<FormMappingPreset | null>(null);
+
+  return (
+    <div className="format-mapping-stage">
+      <div className="stage-toolbar format-toolbar">
+        <div>
+          <p>Mapping form xuất</p>
+          <span className="muted">File FDI được nạp sẵn theo mặc định. Tải mẫu output trong từng form để thay cột đích và xem preview.</span>
+        </div>
+        <div className="format-toolbar-actions">
+          <button type="button" className="btn-secondary" disabled={busy} onClick={() => onAddForm(activeScope, activeGroupId)}>Thêm form</button>
+          <button type="button" className="btn-secondary" disabled={busy} onClick={onSave}>Lưu cấu hình</button>
+          <button type="button" disabled={busy} onClick={onSave}>Lưu form mapping</button>
+        </div>
+      </div>
+      <div className="format-sticky-controls">
+        <section className="format-control-panel format-scope-panel">
+          <div className="format-scope-group-row">
+            <div>
+              <strong>Phạm vi form</strong>
+              <div className="format-scope-tabs">
+                {scopes.map((scope) => (
+                  <button key={scope} type="button" className={activeScope === scope ? 'active' : ''} onClick={() => setActiveScope(scope)}>{FORMAT_SCOPE_LABELS[scope]}</button>
+                ))}
+              </div>
+            </div>
+            <label className="format-group-picker">
+              <span>Nhóm</span>
+              <select value={activeGroupId} onChange={(event) => setActiveGroupId(event.currentTarget.value)}>
+                {groups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
+              </select>
+            </label>
+          </div>
+        </section>
+        <FormatGroupSummary groups={groups} onOpen={() => setShowGroupModal(true)} />
+      </div>
+      {showGroupModal && <FormatGroupModal scope={activeScope} groups={groups} busy={busy} onAddGroup={onAddGroup} onGroupChange={onGroupChange} onDeleteGroup={onDeleteGroup} onClose={() => setShowGroupModal(false)} />}
+      {scopeEditForm && (
+        <FormatScopeModal
+          form={scopeEditForm}
+          activeScope={activeScope}
+          allowedScopes={allowedScopes}
+          busy={busy}
+          onSave={(nextScope) => {
+            onFormScopeChange(activeScope, scopeEditForm.id, nextScope);
+            if (scopes.includes(nextScope)) setActiveScope(nextScope);
+            setScopeEditForm(null);
+          }}
+          onClose={() => setScopeEditForm(null)}
+        />
+      )}
+      <div className="format-sample-grid">
+        <FormatSamplePanel title="FDI mua vào input" summary={purchaseFile} columns={purchaseColumns} />
+        {scopes.some((scope) => scope !== 'purchase') && <FormatSamplePanel title="FDI bán ra input" summary={salesFile} columns={salesColumns} />}
+      </div>
+      <div className="format-form-list">
+        {forms.map((form) => {
+          const outputCols = form.output_columns?.length ? form.output_columns : outputColumns(['Cột A', 'Cột B', 'Cột C']);
+          const mappings = form.mappings || [];
+          const orderedMappings = sortedMappingsForDisplay(mappings, outputCols);
+          return (
+            <section className="format-form-card" key={form.id}>
+              <header className="format-form-header">
+                <div className="format-form-title">
+                  <input value={form.label} onChange={(event) => onFormChange(activeScope, form.id, { label: event.currentTarget.value })} />
+                  <span>{form.template_original_name || form.sheet || form.builtin_exporter || 'Form tùy chỉnh'}</span>
+                </div>
+                <div className="format-form-actions">
+                  <button type="button" className="btn-secondary" disabled={busy} onClick={() => setScopeEditForm(form)}>Phạm vi: {FORMAT_SCOPE_LABELS[formatScopeOfForm(form, activeScope)]}</button>
+                  <select value={form.group_id || MATERIALS_GROUP_ID} onChange={(event) => onFormChange(activeScope, form.id, { group_id: event.currentTarget.value })}>
+                    {groups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
+                  </select>
+                  <label className="template-upload-button">
+                    <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy} onChange={(event) => onUploadTemplate(activeScope, form.id, event.currentTarget.files?.[0])} />
+                    Tải mẫu output
+                  </label>
+                  <button type="button" className="btn-secondary" disabled={busy} onClick={() => onAddMapping(activeScope, form.id)}>Thêm mapping</button>
+                  <button type="button" className="btn-secondary compact-table-button" disabled={busy} onClick={() => onDeleteForm(activeScope, form.id)}>Xóa form</button>
+                </div>
+              </header>
+              <div className="format-output-preview">
+                <FormatSamplePanel title="Cột output" columns={outputCols} preview={form.output_preview} />
+              </div>
+              <div className="format-mapping-table-wrap">
+                <table className="company-table format-mapping-table">
+                  <thead>
+                    <tr><th>Mapping</th><th>Input</th><th>Rule / Logic</th><th>Output</th><th /></tr>
+                  </thead>
+                  <tbody>
+                    {orderedMappings.map(({ rule, originalIndex }) => {
+                      const phase = rule.source_phase === 'sales' ? 'sales' : 'purchase';
+                      const sourceOptions = sourceColumns(phase);
+                      const ruleControlValue = mappingRuleControlValue(rule);
+                      return (
+                        <tr key={`${form.id}-${originalIndex}`}>
+                          <td className="mapping-expression">{mappingExpression(rule, sourceOptions, outputCols)}</td>
+                          <td className="mapping-source-cell">
+                            <div className="mapping-input-pair">
+                              <select value={phase} onChange={(event) => onMappingChange(activeScope, form.id, originalIndex, { source_phase: event.currentTarget.value })}>
+                                {sourcePhaseOptions.map((option) => <option key={option} value={option}>{option === 'sales' ? 'Bán ra' : 'Mua vào'}</option>)}
+                              </select>
+                              {ruleControlValue === 'if_rules' ? (
+                                <span className="mapping-input-note">Cột nằm trong IF</span>
+                              ) : (
+                                <select value={rule.source_col || ''} onChange={(event) => onMappingChange(activeScope, form.id, originalIndex, { source_col: event.currentTarget.value })}>
+                                  <option value="">Chọn cột</option>
+                                  {sourceOptions.map((column) => <option key={column.letter} value={column.letter}>{column.label}</option>)}
+                                </select>
+                              )}
+                            </div>
+                          </td>
+                          <td className="mapping-rule-cell">
+                            <div className="mapping-rule-stack">
+                              <select value={ruleControlValue} onChange={(event) => {
+                                const nextType = event.currentTarget.value;
+                                if (nextType === 'if_rules') {
+                                  onMappingChange(activeScope, form.id, originalIndex, {
+                                    source_type: nextType,
+                                    transform: undefined,
+                                    transform_rules: defaultConditionRules(rule, rule.condition_source_col || rule.fallback_source_col || rule.source_col || ''),
+                                    condition_source_col: '',
+                                    source_col: '',
+                                    fallback_source_col: '',
+                                  });
+                                } else {
+                                  onMappingChange(activeScope, form.id, originalIndex, {
+                                    source_type: nextType === 'text' ? textSourceTypeForValue(rule.value) : nextType,
+                                    transform: supportsCustomTransformRules(rule.transform) ? undefined : rule.transform,
+                                    transform_rules: undefined,
+                                    condition_source_col: '',
+                                  });
+                                }
+                              }}>
+                                {MAPPING_RULE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                              </select>
+                              {isTextMappingRule(rule) && <input value={rule.value || ''} placeholder="Nhập giá trị hoặc {C}" onChange={(event) => onMappingChange(activeScope, form.id, originalIndex, { value: event.currentTarget.value, source_type: textSourceTypeForValue(event.currentTarget.value) })} />}
+                              {ruleControlValue === 'if_rules' && (
+                                <TransformRuleEditor
+                                  rules={defaultConditionRules(rule, rule.condition_source_col || rule.fallback_source_col || rule.source_col || '')}
+                                  sourceColumns={sourceOptions}
+                                  onChange={(rules) => onMappingChange(activeScope, form.id, originalIndex, { transform_rules: rules })}
+                                />
+                              )}
+                            </div>
+                          </td>
+                          <td className="mapping-output-cell">
+                            <select value={rule.target_col || ''} onChange={(event) => onMappingChange(activeScope, form.id, originalIndex, { target_col: event.currentTarget.value })}>
+                              <option value="">Chọn output</option>
+                              {outputCols.map((column) => <option key={column.letter} value={column.letter}>{column.label}</option>)}
+                            </select>
+                          </td>
+                          <td><button type="button" className="btn-secondary compact-table-button" disabled={busy} onClick={() => onRemoveMapping(activeScope, form.id, originalIndex)}>Xóa</button></td>
+                        </tr>
+                      );
+                    })}
+                    {!mappings.length && <tr><td colSpan={5} className="muted">Chưa có mapping. Bấm Thêm mapping để tạo dòng mới.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          );
+        })}
+        {!forms.length && <p className="muted">Chưa có form trong nhóm này. Bấm Thêm form để tạo format mới.</p>}
+      </div>
+    </div>
+  );
+}
+
+function FormatGroupSummary({ groups, onOpen }: { groups: ProcessingGroup[]; onOpen: () => void }) {
+  return (
+    <section className="format-control-panel format-group-summary">
+      <div className="format-control-heading">
+        <strong>Nhóm công ty</strong>
+        <button type="button" className="btn-secondary compact-table-button" onClick={onOpen}>Quản lý nhóm</button>
+      </div>
+      <div className="format-group-chip-list">
+        {groups.map((group) => <span key={group.id}>{group.label}</span>)}
+      </div>
+    </section>
+  );
+}
+
+function FormatScopeModal({ form, activeScope, allowedScopes, busy, onSave, onClose }: { form: FormMappingPreset; activeScope: FormatScope; allowedScopes: FormatScope[]; busy: boolean; onSave: (scope: FormatScope) => void; onClose: () => void }) {
+  const [selectedScope, setSelectedScope] = useState<FormatScope>(formatScopeOfForm(form, activeScope));
+  useEffect(() => {
+    const current = formatScopeOfForm(form, activeScope);
+    setSelectedScope(allowedScopes.includes(current) ? current : allowedScopes[0] || 'purchase');
+  }, [form, activeScope, allowedScopes]);
+  const safeScopes: FormatScope[] = allowedScopes.length ? allowedScopes : ['purchase'];
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content format-scope-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Sửa phạm vi form</h2>
+          <button className="modal-close" type="button" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body format-scope-modal-body">
+          <div className="format-scope-form-name">
+            <strong>{form.label || form.sheet || form.id}</strong>
+            <span className="muted">{form.template_original_name || form.sheet || form.builtin_exporter || 'Form tùy chỉnh'}</span>
+          </div>
+          <div className="format-scope-choice-list">
+            {safeScopes.map((scope) => (
+              <label key={scope} className="format-scope-choice">
+                <input type="radio" name={`form-scope-${form.id}`} value={scope} checked={selectedScope === scope} disabled={busy} onChange={() => setSelectedScope(scope)} />
+                <span>{FORMAT_SCOPE_LABELS[scope]}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="btn-secondary" onClick={onClose}>Hủy</button>
+          <button type="button" disabled={busy || !safeScopes.includes(selectedScope)} onClick={() => onSave(selectedScope)}>Lưu phạm vi</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FormatGroupModal({ scope, groups, busy, onAddGroup, onGroupChange, onDeleteGroup, onClose }: { scope: FormatScope; groups: ProcessingGroup[]; busy: boolean; onAddGroup: (scope: FormatScope, label?: string) => void; onGroupChange: (scope: FormatScope, groupId: string, update: Partial<ProcessingGroup>) => void; onDeleteGroup: (scope: FormatScope, groupId: string) => void; onClose: () => void }) {
+  const [newGroupLabel, setNewGroupLabel] = useState('');
+  const addGroup = () => {
+    const label = newGroupLabel.trim();
+    onAddGroup(scope, label || undefined);
+    setNewGroupLabel('');
+  };
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content format-group-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Quản lý nhóm công ty</h2>
+          <button className="modal-close" type="button" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body format-group-modal-body">
+          <div className="format-group-add-row">
+            <input value={newGroupLabel} placeholder="Tên nhóm mới" disabled={busy} onChange={(event) => setNewGroupLabel(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') addGroup(); }} />
+            <button type="button" disabled={busy} onClick={addGroup}>Thêm nhóm</button>
+          </div>
+      <div className="format-group-list">
+        {groups.map((group) => (
+          <div className="format-group-row" key={group.id}>
+            <input value={group.label} disabled={busy} onChange={(event) => onGroupChange(scope, group.id, { label: event.currentTarget.value })} />
+            <span>{group.id}</span>
+            <button type="button" className="btn-secondary compact-table-button" disabled={busy || group.builtin} onClick={() => onDeleteGroup(scope, group.id)}>Xóa</button>
+          </div>
+        ))}
+      </div>
+        </div>
+        <div className="modal-footer">
+          <button type="button" onClick={onClose}>Đóng</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TransformRuleEditor({ rules, sourceColumns, onChange }: { rules: MappingTransformRule[]; sourceColumns: FormColumn[]; onChange: (rules: MappingTransformRule[]) => void }) {
+  const updateRule = (index: number, update: Partial<MappingTransformRule>) => {
+    onChange(rules.map((rule, ruleIndex) => (ruleIndex === index ? { ...rule, ...update } : rule)));
+  };
+  const addRule = () => onChange([...rules, { source_col: '', match_type: 'starts_with', value: '', result: '' }]);
+  const removeRule = (index: number) => onChange(rules.filter((_, ruleIndex) => ruleIndex !== index));
+  return (
+    <div className="transform-rule-editor">
+      <div className="transform-rule-editor-header">
+        <span>IF</span>
+        <button type="button" className="btn-secondary compact-table-button" onClick={addRule}>Thêm</button>
+      </div>
+      {rules.map((rule, index) => {
+        const matchType = TRANSFORM_RULE_MATCH_OPTIONS.some((option) => option.value === rule.match_type) ? String(rule.match_type) : 'starts_with';
+        const needsValue = TRANSFORM_RULE_MATCH_OPTIONS.find((option) => option.value === matchType)?.needsValue !== false;
+        return (
+          <div className="transform-rule-row" key={index}>
+            <select value={rule.source_col || ''} onChange={(event) => updateRule(index, { source_col: event.currentTarget.value })}>
+              <option value="">Cột điều kiện</option>
+              {sourceColumns.map((column) => <option key={column.letter} value={column.letter}>{column.label}</option>)}
+            </select>
+            <select value={matchType} onChange={(event) => updateRule(index, { match_type: event.currentTarget.value, value: TRANSFORM_RULE_MATCH_OPTIONS.find((option) => option.value === event.currentTarget.value)?.needsValue === false ? '' : rule.value || '' })}>
+              {TRANSFORM_RULE_MATCH_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+            <input value={rule.value || ''} disabled={!needsValue} placeholder={needsValue ? 'Giá trị so sánh' : '-'} onChange={(event) => updateRule(index, { value: event.currentTarget.value })} />
+            <input value={rule.result || ''} placeholder="Giá trị gán cho output" onChange={(event) => updateRule(index, { result: event.currentTarget.value })} />
+            <button type="button" className="btn-secondary compact-table-button" onClick={() => removeRule(index)}>Xóa</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function FormatSamplePanel({ title, summary, columns, preview }: { title: string; summary?: UploadSummary | null; columns: FormColumn[]; preview?: Array<Record<string, string>> }) {
+  const rows = preview || summary?.preview || [];
+  return (
+    <div className="format-sample-panel">
+      <strong>{title}</strong>
+      {summary?.original_name && <span>{summary.original_name}</span>}
+      <div className="format-chip-list">{columns.slice(0, 18).map((column) => <span key={column.letter}>{column.label}</span>)}</div>
+      {rows.length > 0 && <SmallPreviewTable rows={rows.slice(0, 3)} />}
+    </div>
+  );
+}
+
+function SmallPreviewTable({ rows }: { rows: Array<Record<string, string>> }) {
+  const columns = Object.keys(rows[0] || {}).slice(0, 8);
+  if (!rows.length || !columns.length) return null;
+  return (
+    <div className="small-preview-table-wrap">
+      <table className="small-preview-table">
+        <thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
+        <tbody>{rows.map((row, index) => <tr key={index}>{columns.map((column) => <td key={column}>{row[column]}</td>)}</tr>)}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function mappingExpression(rule: NonNullable<FormMappingPreset['mappings']>[number], sourceColumns: FormColumn[], outputColumns: FormColumn[]) {
+  const source = sourceColumns.find((column) => column.letter === rule.source_col);
+  const firstRuleSourceCol = rule.transform_rules?.find((item) => item.source_col)?.source_col;
+  const conditionSource = sourceColumns.find((column) => column.letter === (rule.condition_source_col || rule.fallback_source_col || firstRuleSourceCol));
+  const target = outputColumns.find((column) => column.letter === rule.target_col);
+  const left = isTextMappingRule(rule)
+    ? (rule.value || 'Giá trị cố định')
+    : source?.label || 'Chọn cột input';
+  const suffix = mappingRuleControlValue(rule) === 'if_rules'
+    ? ` | IF ${conditionSource?.label || 'chọn cột'}`
+    : '';
+  return `${left}${suffix} -> ${target?.label || 'Chọn output'}`;
+}
+
+function CompanyRulesStage({ companies, selectedCompanyIndex, processingGroups = defaultProcessingGroups('purchase'), productPreviewCodes, productCodeOverrides, productCodeReplacements, wordRules, repeatedPhrases, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, busy, showCompanyPrefixControls = false, includeCompanyPrefix = false, prefixStrategy = 'last_2_words', prefixMstDigits = 3, prefixNameWords = 2, prefixNameChars = 1, missingMstPrefixStrategy = 'all_name_words', missingMstCompanies = [], onIncludeCompanyPrefixChange, onCompanyPrefixChange, onPrefixMstDigitsChange, onPrefixNameWordsChange, onPrefixNameCharsChange, onMissingMstPrefixStrategyChange, onApplyPrefixPresetToAll, onCompanySelect, onCompanyChange, onCompanyGroupChange, onBulkCompanyChange, onProductChange, onProductCodeChange, onApplyChoices, onRefreshPreviews, onWordRuleChange, onAddWordRule, onRepeatedChange, onAddRepeated, onRemoveRepeated, onProductCodeReplacementChange, onAddProductCodeReplacement, onRemoveProductCodeReplacement, onImportProductCodeReplacements, onAddInventoryPair, onInventoryPairChange, onRemoveInventoryPair, onInventoryDefaultsChange, onAddInventoryRule, onInventoryRuleChange, onRemoveInventoryRule }: { companies: CompanyRow[]; selectedCompanyIndex: number; processingGroups?: ProcessingGroup[]; productPreviewCodes: Record<string, string>; productCodeOverrides: Record<string, string>; productCodeReplacements: Record<string, string>; wordRules: Record<string, string>; repeatedPhrases: string[]; inventoryPairs: InventoryPair[]; useDefaultInventoryPair: boolean; defaultInventoryPairId: string; inventoryPairRules: InventoryRule[]; busy: boolean; showCompanyPrefixControls?: boolean; includeCompanyPrefix?: boolean; prefixStrategy?: string; prefixMstDigits?: number; prefixNameWords?: number; prefixNameChars?: number; missingMstPrefixStrategy?: PrefixPresetStrategy; missingMstCompanies?: MissingMstCompanyWarning[]; onIncludeCompanyPrefixChange?: (include: boolean) => void; onCompanyPrefixChange?: (index: number, value: string) => void; onPrefixMstDigitsChange?: (digits: number) => void; onPrefixNameWordsChange?: (words: number) => void; onPrefixNameCharsChange?: (chars: number) => void; onMissingMstPrefixStrategyChange?: (strategy: PrefixPresetStrategy) => void; onApplyPrefixPresetToAll?: (strategy: PrefixPresetStrategy) => void; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onCompanyGroupChange?: (index: number, groupId: string) => void; onBulkCompanyChange?: (pending: boolean) => void; onProductChange: (companyIndex: number, productName: string, selected: boolean) => void; onProductCodeChange: (companyIndex: number, productName: string, code: string) => void; onApplyChoices: () => void; onRefreshPreviews: () => void; onWordRuleChange: (index: number, field: 'from' | 'to', value: string) => void; onAddWordRule: () => void; onRepeatedChange: (index: number, value: string) => void; onAddRepeated: () => void; onRemoveRepeated: (index: number) => void; onProductCodeReplacementChange: (index: number, field: 'from' | 'to', value: string) => void; onAddProductCodeReplacement: () => void; onRemoveProductCodeReplacement: (index: number) => void; onImportProductCodeReplacements: (file: File | undefined) => void; onAddInventoryPair: () => void; onInventoryPairChange: (index: number, field: 'ma_kho' | 'tk_vat_tu', value: string) => void; onRemoveInventoryPair: (index: number) => void; onInventoryDefaultsChange: (update: Partial<Pick<WorkflowState, 'useDefaultInventoryPair' | 'defaultInventoryPairId'>>) => void; onAddInventoryRule: () => void; onInventoryRuleChange: (index: number, update: Partial<InventoryRule>) => void; onRemoveInventoryRule: (index: number) => void }) {
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState({ wordRules: true, repeatedPhrases: true });
   const wordEntries = Object.entries(wordRules);
@@ -2459,23 +4193,20 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
   const selectedCompany = safeSelectedIndex >= 0 ? companies[safeSelectedIndex] : undefined;
   const selectedProducts = new Set(selectedCompany?.selected_product_names.length ? selectedCompany.selected_product_names : selectedCompany?.all_products.map((product) => product.name));
   const productRows = selectedCompany?.all_products ?? [];
-  const longProducts = selectedCompany ? productRows.filter((product) => selectedProducts.has(product.name) && productDisplayCode(selectedCompany, product.name, productPreviewCodes, productCodeOverrides, includeCompanyPrefix).length > maxCodeLength) : [];
+  const longProducts = selectedCompany ? productRows.filter((product) => selectedProducts.has(product.name) && productDisplayCode(selectedCompany, product.name, productPreviewCodes, productCodeOverrides, productCodeReplacements, includeCompanyPrefix).length > maxCodeLength) : [];
   const normalProducts = selectedCompany ? productRows.filter((product) => !longProducts.includes(product)) : [];
   const companyCodeLong = Boolean(selectedCompany?.value && selectedCompany.value.length > maxCodeLength);
   const duplicatePrefixSet = new Set<string>();
-  
-  // Detect duplicates from committed state only; drafts apply after the main Apply button.
   const prefixCounts = new Map<string, number>();
   companies.forEach(c => {
-    const isActive = c.process ?? true;
     const normalizedPrefix = committedCompanyPrefix(c);
-    if (isActive && normalizedPrefix) {
+    if (pendingCompanyGroup(c) === MATERIALS_GROUP_ID && normalizedPrefix) {
       prefixCounts.set(normalizedPrefix, (prefixCounts.get(normalizedPrefix) || 0) + 1);
     }
   });
   const duplicatePrefixes = Array.from(prefixCounts.entries()).filter(([, count]) => count > 1).sort(([left], [right]) => left.localeCompare(right, 'vi', { numeric: true, sensitivity: 'base' }));
   duplicatePrefixes.forEach(([prefix]) => duplicatePrefixSet.add(prefix));
-  const groups = companyDisplayGroups(companies, duplicatePrefixSet);
+  const groups = companyDisplayGroups(companies, processingGroups, duplicatePrefixSet);
   const activePrefixStrategy = normalizedPrefixStrategy(prefixStrategy);
   const activeMissingMstPrefixStrategy = normalizeMissingMstPrefixStrategy(missingMstPrefixStrategy);
   const hasMissingMstCompanies = companies.some(isMissingMstCompany);
@@ -2484,7 +4215,7 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
   
   const renderProductRow = (product: { name: string; count?: number }, forceWarning = false) => {
     if (!selectedCompany) return null;
-    const code = productDisplayCode(selectedCompany, product.name, productPreviewCodes, productCodeOverrides, includeCompanyPrefix);
+    const code = productDisplayCode(selectedCompany, product.name, productPreviewCodes, productCodeOverrides, productCodeReplacements, includeCompanyPrefix);
     const selected = selectedProducts.has(product.name);
     const longCode = selected && code.length > maxCodeLength;
     return <tr key={product.name} className={longCode || forceWarning ? 'danger-row big-select-row' : 'big-select-row'}><td><input type="checkbox" checked={selected} onChange={(event) => onProductChange(safeSelectedIndex, product.name, event.currentTarget.checked)} /></td><td>{product.name}</td><td>{product.count ?? ''}</td><td><input className="code-edit" value={code} onChange={(event) => onProductCodeChange(safeSelectedIndex, product.name, event.currentTarget.value)} /></td></tr>;
@@ -2529,6 +4260,7 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
         onClose={() => setShowConfigModal(false)} 
         wordRules={wordRules}
         repeatedPhrases={repeatedPhrases}
+        productCodeReplacements={productCodeReplacements}
         inventoryPairs={inventoryPairs}
         useDefaultInventoryPair={useDefaultInventoryPair}
         defaultInventoryPairId={defaultInventoryPairId}
@@ -2538,6 +4270,10 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
         onRepeatedChange={onRepeatedChange}
         onAddRepeated={onAddRepeated}
         onRemoveRepeated={onRemoveRepeated}
+        onProductCodeReplacementChange={onProductCodeReplacementChange}
+        onAddProductCodeReplacement={onAddProductCodeReplacement}
+        onRemoveProductCodeReplacement={onRemoveProductCodeReplacement}
+        onImportProductCodeReplacements={onImportProductCodeReplacements}
         onAddInventoryPair={onAddInventoryPair}
         onInventoryPairChange={onInventoryPairChange}
         onRemoveInventoryPair={onRemoveInventoryPair}
@@ -2564,7 +4300,7 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
               <p className="warning-text">Cảnh báo: Prefix trùng lặp</p>
               <ul>
                 {duplicatePrefixes.map(([prefix, count]) => {
-                  const dupCompanies = companies.filter((c) => (c.process ?? true) && committedCompanyPrefix(c) === prefix);
+                  const dupCompanies = companies.filter((c) => pendingCompanyGroup(c) === MATERIALS_GROUP_ID && committedCompanyPrefix(c) === prefix);
                   return (
                     <li key={prefix}>
                       <strong>{prefix}</strong> ({count} công ty): {dupCompanies.map((c) => c.company).join(', ')}
@@ -2574,7 +4310,7 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
               </ul>
             </div>
           )}
-          {!companies.length ? <p className="muted">Đang chờ dữ liệu công ty. Danh sách sẽ tự tải khi vào stage này sau khi đã chọn file mua vào.</p> : <div className="inner-scroll company-table-scroll"><table className="company-table grouped-company-table"><thead><tr><th>Dùng</th><th>Công ty</th><th>MST</th>{showCompanyPrefixControls && <th>Prefix</th>}<th>Số hàng</th></tr></thead><tbody>{groups.map((group) => <CompanyGroupRows key={group.title} group={group} safeSelectedIndex={safeSelectedIndex} showPrefix={showCompanyPrefixControls} onCompanySelect={onCompanySelect} onCompanyChange={onCompanyChange} onCompanyPrefixChange={onCompanyPrefixChange} />)}</tbody></table><div className="scroll-bottom-spacer" aria-hidden="true" /></div>}
+          {!companies.length ? <p className="muted">Đang chờ dữ liệu công ty. Danh sách sẽ tự tải khi vào stage này sau khi đã chọn file mua vào.</p> : <div className="inner-scroll company-table-scroll"><table className="company-table grouped-company-table"><thead><tr><th>Nhóm</th><th>Công ty</th><th>MST</th>{showCompanyPrefixControls && <th>Prefix</th>}<th>Số hàng</th></tr></thead><tbody>{groups.map((group) => <CompanyGroupRows key={group.title} group={group} safeSelectedIndex={safeSelectedIndex} showPrefix={showCompanyPrefixControls} processingGroups={processingGroups} onCompanySelect={onCompanySelect} onCompanyChange={onCompanyChange} onCompanyGroupChange={onCompanyGroupChange} onCompanyPrefixChange={onCompanyPrefixChange} />)}</tbody></table><div className="scroll-bottom-spacer" aria-hidden="true" /></div>}
         </div>
 
         <div className="list-stage product-list-card">
@@ -2589,13 +4325,13 @@ function CompanyRulesStage({ companies, selectedCompanyIndex, productPreviewCode
   );
 }
 
-function CompanyGroupRows({ group, safeSelectedIndex, showPrefix = false, onCompanySelect, onCompanyChange, onCompanyPrefixChange }: { group: CompanyDisplayGroup; safeSelectedIndex: number; showPrefix?: boolean; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onCompanyPrefixChange?: (index: number, value: string) => void }) {
+function CompanyGroupRows({ group, safeSelectedIndex, showPrefix = false, processingGroups = defaultProcessingGroups('purchase'), onCompanySelect, onCompanyChange, onCompanyGroupChange, onCompanyPrefixChange }: { group: CompanyDisplayGroup; safeSelectedIndex: number; showPrefix?: boolean; processingGroups?: ProcessingGroup[]; onCompanySelect: (index: number) => void; onCompanyChange: (index: number, pending: boolean) => void; onCompanyGroupChange?: (index: number, groupId: string) => void; onCompanyPrefixChange?: (index: number, value: string) => void }) {
   if (!group.rows.length) return null;
   return <>{<tr className={`company-section-row ${group.className}`}><td colSpan={showPrefix ? 5 : 4}>{group.title} ({group.rows.length})</td></tr>}{group.rows.map(({ company, index }) => {
-    const pending = company.pending_process ?? company.process ?? true;
+    const groupId = pendingCompanyGroup(company);
     const selectedCount = company.selected_product_names.length || company.all_products.length;
     const rowClass = group.className === 'duplicate-section' ? 'duplicate-company-row' : group.className === 'missing-mst-section' ? 'missing-mst-company-row' : '';
-    return <tr key={companyRowKey(company, index)} className={`big-select-row ${rowClass} ${index === safeSelectedIndex ? 'selected-row' : ''}`} onClick={() => onCompanySelect(index)}><td onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={pending} onChange={(event) => onCompanyChange(index, event.currentTarget.checked)} /></td><td>{company.company}</td><td>{companyDisplayMst(company)}</td>{showPrefix && <td onClick={(event) => event.stopPropagation()}><input className="company-prefix-input" value={company.value || ''} onChange={(event) => onCompanyPrefixChange?.(index, event.currentTarget.value)} /></td>}<td>{selectedCount} / {company.all_products.length}</td></tr>;
+    return <tr key={companyRowKey(company, index)} className={`big-select-row ${rowClass} ${index === safeSelectedIndex ? 'selected-row' : ''}`} onClick={() => onCompanySelect(index)}><td onClick={(event) => event.stopPropagation()}><select value={groupId} onChange={(event) => { const nextGroupId = event.currentTarget.value; if (onCompanyGroupChange) onCompanyGroupChange(index, nextGroupId); else onCompanyChange(index, nextGroupId === MATERIALS_GROUP_ID); }}>{processingGroups.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></td><td>{company.company}</td><td>{companyDisplayMst(company)}</td>{showPrefix && <td onClick={(event) => event.stopPropagation()}><input className="company-prefix-input" value={company.value || ''} onChange={(event) => onCompanyPrefixChange?.(index, event.currentTarget.value)} /></td>}<td>{selectedCount} / {company.all_products.length}</td></tr>;
   })}</>;
 }
 
@@ -2864,18 +4600,33 @@ function normalizedPrefixStrategy(strategy: string): PrefixPresetStrategy {
 function normalizeMissingMstPrefixStrategy(strategy: unknown): PrefixPresetStrategy {
   return strategy === 'last_2_words' || strategy === 'all_name_words' ? strategy : 'all_name_words';
 }
-function companyDisplayGroups(companies: CompanyRow[], duplicatePrefixSet = duplicatePrefixSetForRows(companies)): CompanyDisplayGroup[] {
+function companyDisplayGroups(companies: CompanyRow[], processingGroups: ProcessingGroup[] = defaultProcessingGroups('purchase'), duplicatePrefixes: Set<string> = new Set()): CompanyDisplayGroup[] {
   const rows = companies.map((company, index) => ({ company, index }));
-  const isActive = (company: CompanyRow) => company.process ?? true;
-  const isActiveMissingMst = (company: CompanyRow) => isActive(company) && isMissingMstCompany(company);
-  const hasDuplicatePrefix = (company: CompanyRow) => isActive(company) && !isActiveMissingMst(company) && duplicatePrefixSet.has(committedCompanyPrefix(company));
-  const missingMstRows = rows.filter(({ company }) => isActiveMissingMst(company));
-  const duplicateRows = rows.filter(({ company }) => hasDuplicatePrefix(company)).sort(compareCompanyRowsByPrefix);
+  const groups = normalizeProcessingGroups(processingGroups, 'purchase');
+  const groupIds = new Set(groups.map((group) => group.id));
+  const duplicateRows = rows
+    .filter(({ company }) => pendingCompanyGroup(company) === MATERIALS_GROUP_ID && duplicatePrefixes.has(committedCompanyPrefix(company)))
+    .sort((left, right) => {
+      const prefixCompare = committedCompanyPrefix(left.company).localeCompare(committedCompanyPrefix(right.company), 'vi', { numeric: true, sensitivity: 'base' });
+      return prefixCompare || left.index - right.index;
+    });
+  const displayGroups = groups
+    .filter((group) => group.id !== IGNORED_GROUP_ID)
+    .map((group) => ({
+      title: group.label || group.id,
+      className: group.id === MATERIALS_GROUP_ID ? 'active-section' : 'company-group-section',
+      rows: rows.filter(({ company }) => {
+        const groupId = pendingCompanyGroup(company);
+        if (group.id === MATERIALS_GROUP_ID && duplicatePrefixes.has(committedCompanyPrefix(company))) return false;
+        return groupId === group.id || (!groupIds.has(groupId) && group.id === MATERIALS_GROUP_ID);
+      }),
+    }))
+    .filter((group) => group.rows.length);
+  const skippedRows = rows.filter(({ company }) => pendingCompanyGroup(company) === IGNORED_GROUP_ID);
   return [
-    { title: 'Công ty không có MST - cần kiểm tra', className: 'missing-mst-section', rows: missingMstRows },
-    { title: 'Prefix trùng nhau - cần kiểm tra', className: 'duplicate-section', rows: duplicateRows },
-    { title: 'Các công ty đang xử lý', className: 'active-section', rows: rows.filter(({ company }) => isActive(company) && !isActiveMissingMst(company) && !hasDuplicatePrefix(company)) },
-    { title: 'Các công ty đã bỏ qua', className: 'skipped-section', rows: rows.filter(({ company }) => !isActive(company)) },
+    ...(duplicateRows.length ? [{ title: 'Prefix trùng lặp - cần kiểm tra', className: 'duplicate-section', rows: duplicateRows }] : []),
+    ...displayGroups,
+    { title: 'Các công ty đã bỏ qua', className: 'skipped-section', rows: skippedRows },
   ];
 }
 function compareCompanyRowsByPrefix(left: { company: CompanyRow; index: number }, right: { company: CompanyRow; index: number }): number {
@@ -2883,11 +4634,23 @@ function compareCompanyRowsByPrefix(left: { company: CompanyRow; index: number }
   return prefixCompare || left.index - right.index;
 }
 
-function firstDisplayedCompanyIndex(companies: CompanyRow[]): number {
-  for (const group of companyDisplayGroups(companies)) {
-    if (group.rows.length) return group.rows[0].index;
-  }
-  return -1;
+function firstDisplayedCompanyIndex(companies: CompanyRow[], processingGroups: ProcessingGroup[] = defaultProcessingGroups('purchase')): number {
+  return selectableCompanyIndexes(companies, processingGroups)[0] ?? -1;
+}
+
+function selectableCompanyIndexes(companies: CompanyRow[], processingGroups: ProcessingGroup[] = defaultProcessingGroups('purchase')): number[] {
+  return companyDisplayGroups(companies, processingGroups)
+    .filter((group) => group.className !== 'skipped-section')
+    .flatMap((group) => group.rows)
+    .filter(({ company }) => pendingCompanyGroup(company) !== IGNORED_GROUP_ID)
+    .map(({ index }) => index);
+}
+
+function selectedCompanyIndexAfterGrouping(companies: CompanyRow[], currentIndex: number, processingGroups: ProcessingGroup[] = defaultProcessingGroups('purchase')): number {
+  const indexes = selectableCompanyIndexes(companies, processingGroups);
+  if (!indexes.length) return -1;
+  if (indexes.includes(currentIndex)) return currentIndex;
+  return indexes.find((index) => index > currentIndex) ?? [...indexes].reverse().find((index) => index < currentIndex) ?? indexes[0];
 }
 
 function normalizedCompanyPrefix(company: CompanyRow): string {
@@ -2898,16 +4661,32 @@ function committedCompanyPrefix(company: CompanyRow): string {
   return (company.committed_prefix ?? company.value ?? '').trim().toUpperCase();
 }
 
+function committedCompanyGroup(company: CompanyRow): string {
+  return String(company.group_id || (company.process === false ? IGNORED_GROUP_ID : MATERIALS_GROUP_ID));
+}
+
+function pendingCompanyGroup(company: CompanyRow): string {
+  return String(company.pending_group_id || company.group_id || (company.pending_process === false || company.process === false ? IGNORED_GROUP_ID : MATERIALS_GROUP_ID));
+}
+
+function isMaterialCompany(company: CompanyRow): boolean {
+  return committedCompanyGroup(company) === MATERIALS_GROUP_ID;
+}
+
+function isIgnoredCompany(company: CompanyRow): boolean {
+  return committedCompanyGroup(company) === IGNORED_GROUP_ID;
+}
+
 function hasCompanyDraftChanges(company: CompanyRow): boolean {
   const pendingProcess = company.pending_process ?? company.process ?? true;
   const appliedProcess = company.process ?? true;
-  return pendingProcess !== appliedProcess || normalizedCompanyPrefix(company) !== committedCompanyPrefix(company);
+  return pendingProcess !== appliedProcess || pendingCompanyGroup(company) !== committedCompanyGroup(company) || normalizedCompanyPrefix(company) !== committedCompanyPrefix(company);
 }
 
 function duplicatePrefixSetForRows(companies: CompanyRow[]): Set<string> {
   const counts = new Map<string, number>();
   companies.forEach((company) => {
-    if (!(company.process ?? true)) return;
+    if (!isMaterialCompany(company)) return;
     const prefix = committedCompanyPrefix(company);
     if (!prefix) return;
     counts.set(prefix, (counts.get(prefix) || 0) + 1);
@@ -2915,30 +4694,34 @@ function duplicatePrefixSetForRows(companies: CompanyRow[]): Set<string> {
   return new Set(Array.from(counts.entries()).filter(([, count]) => count > 1).map(([prefix]) => prefix));
 }
 
-function sortAppliedCompanyRows(companies: CompanyRow[]): CompanyRow[] {
+function sortAppliedCompanyRows(companies: CompanyRow[], processingGroups: ProcessingGroup[] = defaultProcessingGroups('purchase')): CompanyRow[] {
   const duplicatePrefixSet = duplicatePrefixSetForRows(companies);
+  const groupOrder = new Map(normalizeProcessingGroups(processingGroups, 'purchase').map((group, index) => [group.id, index]));
+  const ignoredOrder = Number.MAX_SAFE_INTEGER;
   return companies
     .map((company, index) => ({ company, index }))
     .sort((left, right) => {
-      const leftProcess = left.company.process ?? true;
-      const rightProcess = right.company.process ?? true;
-      const leftGroup = leftProcess ? (duplicatePrefixSet.has(committedCompanyPrefix(left.company)) ? 0 : 1) : 2;
-      const rightGroup = rightProcess ? (duplicatePrefixSet.has(committedCompanyPrefix(right.company)) ? 0 : 1) : 2;
+      const leftGroupId = committedCompanyGroup(left.company);
+      const rightGroupId = committedCompanyGroup(right.company);
+      const leftGroup = leftGroupId === IGNORED_GROUP_ID ? ignoredOrder : (groupOrder.get(leftGroupId) ?? groupOrder.get(MATERIALS_GROUP_ID) ?? 0);
+      const rightGroup = rightGroupId === IGNORED_GROUP_ID ? ignoredOrder : (groupOrder.get(rightGroupId) ?? groupOrder.get(MATERIALS_GROUP_ID) ?? 0);
       const groupCompare = leftGroup - rightGroup;
       if (groupCompare) return groupCompare;
-      if (leftGroup === 0) return compareCompanyRowsByPrefix(left, right);
+      if (duplicatePrefixSet.has(committedCompanyPrefix(left.company)) || duplicatePrefixSet.has(committedCompanyPrefix(right.company))) {
+        return compareCompanyRowsByPrefix(left, right);
+      }
       return left.index - right.index;
     })
     .map(({ company }) => company);
 }
 
-function productDisplayCode(company: CompanyRow, productName: string, previewCodes: Record<string, string>, overrides: Record<string, string>, includePrefix: boolean = false) {
+function productDisplayCode(company: CompanyRow, productName: string, previewCodes: Record<string, string>, overrides: Record<string, string>, replacements: Record<string, string> = {}, includePrefix: boolean = false) {
   const override = overrides[productKey(companyConfigKey(company), productName)];
-  if (override) return sanitizeDisplayProductCode(override);
-  const preview = sanitizeDisplayProductCode(previewCodes[productName] || '');
+  if (override) return applyDisplayProductCodeReplacement(override, replacements);
+  const preview = applyDisplayProductCodeReplacement(previewCodes[productName] || '', replacements);
   const appliedPrefix = sanitizeDisplayProductCode(committedCompanyPrefix(company));
   if (includePrefix && appliedPrefix) {
-    return `${appliedPrefix}.${preview}`;
+    return applyDisplayProductCodeReplacement(`${appliedPrefix}.${preview}`, replacements);
   }
   return preview;
 }
@@ -3043,12 +4826,12 @@ function CaoThanhPriceStage({
       </div>
 
       {!groups.length ? (
-        <PlaceholderStage title="Chua co nhom gia" detail="Bam Tao nhom gia de tao danh sach loc don gia tu cac cong ty/hang hoa da ap dung." />
+        <PlaceholderStage title="Chưa có nhóm giá" detail="Bấm Tạo nhóm giá để tạo danh sách lọc đơn giá từ các công ty/hàng hóa đã áp dụng." />
       ) : (
         <div className="inner-scroll cao-price-scroll">
           <table className="cao-price-table">
             <thead>
-              <tr><th>Ma VT</th><th>Hang hoa</th><th>Dong gia</th><th>Gia min/max</th><th>% loc</th><th>Nhom sau loc</th></tr>
+              <tr><th>Mã VT</th><th>Hàng hóa</th><th>Dòng giá</th><th>Giá min/max</th><th>% lọc</th><th>Nhóm sau lọc</th></tr>
             </thead>
             <tbody>
               {groups.map((group) => (
@@ -3435,7 +5218,7 @@ function CaoThanhWorkflow({ label, setShellStatus }: { label: string; setShellSt
             <div className="stage-toolbar"><h3>Cột xử lý Cao Thành</h3><div className="toolbar-actions"><button type="button" disabled={busy || !summary} onClick={analyzeCompanies}>{companies.length ? 'Tải lại danh sách' : 'Tải danh sách công ty'}</button></div></div>
             <div className="column-grid">{caoThanhColumnFields.map((field) => <label key={field.key}><span>{field.label}</span><select value={columns[field.key]} onChange={(event) => setColumns({ ...columns, [field.key]: event.currentTarget.value })}>{summary?.columns.map((column) => <option key={`${field.key}-${column.letter}`} value={column.letter}>{column.label}</option>) ?? <option value={columns[field.key]}>{columns[field.key]}</option>}</select></label>)}</div>
           </div>
-          {companies.length ? <CompanyRulesStage companies={companies} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={previewCodes} productCodeOverrides={manualOverrides} wordRules={wordRules} repeatedPhrases={repeatedPhrases} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy="last_2_words" prefixMstDigits={3} prefixNameWords={2} onIncludeCompanyPrefixChange={(include) => { setIncludeCompanyPrefix(include); setPriceGroups([]); }} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={() => {}} onPrefixNameWordsChange={() => {}} onApplyPrefixPresetToAll={() => {}} onCompanySelect={setSelectedCompanyIndex} onCompanyChange={updateCompanyPending} onBulkCompanyChange={bulkUpdateCompanies} onProductChange={updateProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyChoices} onRefreshPreviews={refreshPreviewCodes} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeated} onAddRepeated={addRepeated} onRemoveRepeated={removeRepeated} onAddInventoryPair={() => { const id = `pair-${Date.now()}`; setInventoryPairs([...inventoryPairs, { id, ma_kho: '', tk_vat_tu: '' }]); setDefaultInventoryPairId(defaultInventoryPairId || id); }} onInventoryPairChange={(index, field, value) => setInventoryPairs((rows) => rows.map((pair, rowIndex) => rowIndex === index ? { ...pair, [field]: value.toUpperCase() } : pair))} onRemoveInventoryPair={(index) => setInventoryPairs((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} onInventoryDefaultsChange={(update) => { if ('useDefaultInventoryPair' in update) setUseDefaultInventoryPair(Boolean(update.useDefaultInventoryPair)); if ('defaultInventoryPairId' in update) setDefaultInventoryPairId(String(update.defaultInventoryPairId || '')); }} onAddInventoryRule={() => setInventoryPairRules((rows) => [...rows, { source_col: 'M', operator: 'contains', value: '', pair_id: defaultInventoryPairId || inventoryPairs[0]?.id || '', enabled: true, priority: 1 }])} onInventoryRuleChange={(index, update) => setInventoryPairRules((rows) => rows.map((rule, rowIndex) => rowIndex === index ? { ...rule, ...update } : rule))} onRemoveInventoryRule={(index) => setInventoryPairRules((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} /> : <PreviewPanel summary={summary} />}
+          {companies.length ? <CompanyRulesStage companies={companies} selectedCompanyIndex={selectedCompanyIndex} productPreviewCodes={previewCodes} productCodeOverrides={manualOverrides} productCodeReplacements={{}} wordRules={wordRules} repeatedPhrases={repeatedPhrases} inventoryPairs={inventoryPairs} useDefaultInventoryPair={useDefaultInventoryPair} defaultInventoryPairId={defaultInventoryPairId} inventoryPairRules={inventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy="last_2_words" prefixMstDigits={3} prefixNameWords={2} onIncludeCompanyPrefixChange={(include) => { setIncludeCompanyPrefix(include); setPriceGroups([]); }} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={() => {}} onPrefixNameWordsChange={() => {}} onApplyPrefixPresetToAll={() => {}} onCompanySelect={setSelectedCompanyIndex} onCompanyChange={updateCompanyPending} onBulkCompanyChange={bulkUpdateCompanies} onProductChange={updateProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyChoices} onRefreshPreviews={refreshPreviewCodes} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeated} onAddRepeated={addRepeated} onRemoveRepeated={removeRepeated} onProductCodeReplacementChange={() => {}} onAddProductCodeReplacement={() => {}} onRemoveProductCodeReplacement={() => {}} onImportProductCodeReplacements={() => {}} onAddInventoryPair={() => { const id = `pair-${Date.now()}`; setInventoryPairs([...inventoryPairs, { id, ma_kho: '', tk_vat_tu: '' }]); setDefaultInventoryPairId(defaultInventoryPairId || id); }} onInventoryPairChange={(index, field, value) => setInventoryPairs((rows) => rows.map((pair, rowIndex) => rowIndex === index ? { ...pair, [field]: value.toUpperCase() } : pair))} onRemoveInventoryPair={(index) => setInventoryPairs((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} onInventoryDefaultsChange={(update) => { if ('useDefaultInventoryPair' in update) setUseDefaultInventoryPair(Boolean(update.useDefaultInventoryPair)); if ('defaultInventoryPairId' in update) setDefaultInventoryPairId(String(update.defaultInventoryPairId || '')); }} onAddInventoryRule={() => setInventoryPairRules((rows) => [...rows, { source_col: 'M', operator: 'contains', value: '', pair_id: defaultInventoryPairId || inventoryPairs[0]?.id || '', enabled: true, priority: 1 }])} onInventoryRuleChange={(index, update) => setInventoryPairRules((rows) => rows.map((rule, rowIndex) => rowIndex === index ? { ...rule, ...update } : rule))} onRemoveInventoryRule={(index) => setInventoryPairRules((rows) => rows.filter((_, rowIndex) => rowIndex !== index))} /> : <PreviewPanel summary={summary} />}
         </div>
       )}
 
@@ -3560,7 +5343,7 @@ function buildCaoThanhPriceGroups(
     const selected = new Set(selectedProductNames(company));
     company.all_products.forEach((product) => {
       if (!selected.has(product.name)) return;
-      const code = productDisplayCode(company, product.name, previewCodes, manualOverrides, includePrefix);
+      const code = productDisplayCode(company, product.name, previewCodes, manualOverrides, {}, includePrefix);
       if (!code) return;
       const rows = product.priceRows || [];
       rows.forEach((row, rowIndex) => {
@@ -4176,23 +5959,45 @@ function normalizeReviewRows(rows: ReviewRow[]) {
   return rows.map((row) => ({ ...row, confirmed: row.confirmed === true, code_choice: row.code_choice || 'current' }));
 }
 
-async function loadProductPreviewCodes(companies: CompanyRow[], wordRules: Record<string, string>, repeatedPhraseRemovals: string[], phase: 'purchase' | 'sales' = 'purchase') {
+async function loadProductPreviewCodes(companies: CompanyRow[], wordRules: Record<string, string>, repeatedPhraseRemovals: string[], phase: 'purchase' | 'sales' = 'purchase', productCodeReplacements: Record<string, string> = {}) {
   const products = Array.from(new Set(companies.flatMap((company) => company.all_products.map((product) => product.name)).filter(Boolean)));
   if (!products.length) return {};
-  const result = await previewVietmaxProductCodes(products, wordRules, repeatedPhraseRemovals, phase);
+  const result = await previewVietmaxProductCodes(products, wordRules, repeatedPhraseRemovals, phase, productCodeReplacements);
   return result.codes;
 }
 
-async function loadGenericProductPreviewCodes(profile: ProfileKey, companies: CompanyRow[], wordRules: Record<string, string>, firstWordRules: Record<string, string>, repeatedPhraseRemovals: string[]) {
+function normalizeProductCodeReplacements(raw: Record<string, string> = {}) {
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([oldCode, newCode]) => [sanitizeDisplayProductCode(oldCode), sanitizeDisplayProductCode(newCode)])
+      .filter(([oldCode, newCode]) => oldCode && newCode),
+  );
+}
+
+function applyDisplayProductCodeReplacement(code: string, replacements: Record<string, string> = {}) {
+  const cleanCode = sanitizeDisplayProductCode(code);
+  const normalized = normalizeProductCodeReplacements(replacements);
+  if (!cleanCode || !Object.keys(normalized).length) return cleanCode;
+  if (normalized[cleanCode]) return normalized[cleanCode];
+  const lastDot = cleanCode.lastIndexOf('.');
+  if (lastDot >= 0) {
+    const prefix = cleanCode.slice(0, lastDot);
+    const body = cleanCode.slice(lastDot + 1);
+    if (normalized[body]) return sanitizeDisplayProductCode(`${prefix}.${normalized[body]}`);
+  }
+  return cleanCode;
+}
+
+async function loadGenericProductPreviewCodes(profile: ProfileKey, companies: CompanyRow[], wordRules: Record<string, string>, firstWordRules: Record<string, string>, repeatedPhraseRemovals: string[], productCodeReplacements: Record<string, string> = {}) {
   const products = Array.from(new Set(companies.flatMap((company) => company.all_products.map((product) => product.name)).filter(Boolean)));
   if (!products.length) return {};
-  const result = await previewGenericProductCodes({ profile, products, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals });
+  const result = await previewGenericProductCodes({ profile, products, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals, product_code_replacements: productCodeReplacements });
   return result.codes;
 }
 
 function buildPurchaseProcessPayload(workflow: WorkflowState) {
   const companies = workflow.companyRows;
-  const activeCompanies = companies.filter((company) => company.process !== false);
+  const activeCompanies = companies.filter(isMaterialCompany);
   const activePrefixStrategy = normalizedPrefixStrategy(workflow.purchasePrefixStrategy);
   const purchasePrefixStrategyValues = rememberManualPrefixValues(workflow.purchasePrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits, workflow.prefixNameWords, workflow.prefixNameChars);
   const reviewScope = reviewScopeValue(workflow.purchaseReviewScope);
@@ -4213,23 +6018,25 @@ function buildPurchaseProcessPayload(workflow: WorkflowState) {
     word_rules: workflow.purchaseWordRules,
     repeated_phrase_removals: workflow.purchaseRepeatedPhraseRemovals.filter((phrase) => phrase.trim()),
     manual_code_overrides: workflow.productCodeOverrides,
+    product_code_replacements: workflow.productCodeReplacements,
     vietmax_mua_vao_internal_merges: buildReviewRules(workflow.purchaseReviewRules, workflow.purchaseReviewRows, reviewScope),
     inventory_pairs: workflow.purchaseInventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
     use_default_inventory_pair: workflow.purchaseUseDefaultInventoryPair,
     default_inventory_pair_id: workflow.purchaseDefaultInventoryPairId,
     inventory_pair_rules: inventoryRulesForPayload(workflow.purchaseInventoryPairRules, workflow.purchaseInventoryPairs),
+    company_group_assignments: groupAssignmentsFromRows(companies),
     prefixes: companyPrefixes(companies),
     all_mst: companies.map((company) => companyConfigKey(company)),
     process_mst: activeCompanies.map((company) => companyConfigKey(company)),
     mst_safe_id: companies.map((company, index) => `${companyConfigKey(company)}|||${index}`),
     ...companyPrefixFields(companies),
-    ...Object.fromEntries(companies.flatMap((company, index) => (company.process === false ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
+    ...Object.fromEntries(companies.flatMap((company, index) => (!isMaterialCompany(company) ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
   };
 }
 
 function buildSalesProcessPayload(workflow: WorkflowState) {
   const companies = workflow.salesCompanyRows;
-  const activeCompanies = companies.filter((company) => company.process !== false);
+  const activeCompanies = companies.filter(isMaterialCompany);
   const activePrefixStrategy = normalizedPrefixStrategy(workflow.salesPrefixStrategy);
   const salesPrefixStrategyValues = rememberManualPrefixValues(workflow.salesPrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits, workflow.prefixNameWords, workflow.prefixNameChars);
   const reviewScope = reviewScopeValue(workflow.salesReviewScope);
@@ -4250,6 +6057,7 @@ function buildSalesProcessPayload(workflow: WorkflowState) {
     word_rules: workflow.salesWordRules,
     repeated_phrase_removals: workflow.salesRepeatedPhraseRemovals.filter((phrase) => phrase.trim()),
     manual_code_overrides: workflow.salesProductCodeOverrides,
+    product_code_replacements: workflow.salesProductCodeReplacements,
     inventory_pairs: workflow.salesInventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
     use_default_inventory_pair: workflow.salesUseDefaultInventoryPair,
     default_inventory_pair_id: workflow.salesDefaultInventoryPairId,
@@ -4258,12 +6066,13 @@ function buildSalesProcessPayload(workflow: WorkflowState) {
     vietmax_ban_ra_purchase_matches: workflow.matches.filter((match) => match.confirmed !== false),
     vietmax_ban_ra_purchase_match_rules: buildSalesMatchRules(workflow),
     vietmax_ban_ra_sales_internal_merges: buildReviewRules(workflow.salesReviewRules, workflow.salesReviewRows, reviewScope),
+    company_group_assignments: groupAssignmentsFromRows(companies),
     prefixes: companyPrefixes(companies),
     all_mst: companies.map((company) => companyConfigKey(company)),
     process_mst: activeCompanies.map((company) => companyConfigKey(company)),
     mst_safe_id: companies.map((company, index) => `${companyConfigKey(company)}|||${index}`),
     ...companyPrefixFields(companies),
-    ...Object.fromEntries(companies.flatMap((company, index) => (company.process === false ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
+    ...Object.fromEntries(companies.flatMap((company, index) => (!isMaterialCompany(company) ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
   };
 }
 
@@ -4277,16 +6086,24 @@ function buildSalesReviewProducts(workflow: WorkflowState): ReviewProduct[] {
 
 function buildGenericProcessPayload(workflow: WorkflowState, profile: ProfileKey) {
   const companies = workflow.companyRows;
-  const activeCompanies = companies.filter((company) => company.process !== false);
+  const activeCompanies = companies.filter(isMaterialCompany);
+  const twoPhase = isTwoPhaseGenericProfile(profile);
   const activePrefixStrategy = normalizedPrefixStrategy(workflow.purchasePrefixStrategy);
   const prefixStrategyValues = rememberManualPrefixValues(workflow.purchasePrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits, workflow.prefixNameWords, workflow.prefixNameChars);
-  const columns = normalizeGenericColumns(workflow.genericColumns);
+  const columns = twoPhase ? normalizeVietmaxColumns(workflow.purchaseColumns, 'purchase') : normalizeGenericColumns(workflow.genericColumns);
   const reviewScope = reviewScopeValue(workflow.purchaseReviewScope);
   const priceRangeRules = profile === 'cao_thanh'
     ? { ...workflow.priceRangeRules, ...caoThanhRangeRules(workflow.priceGroups) }
     : {};
+  const wordRules = twoPhase ? workflow.purchaseWordRules : workflow.wordRules;
+  const repeatedPhrases = twoPhase ? workflow.purchaseRepeatedPhraseRemovals : workflow.repeatedPhraseRemovals;
+  const manualOverrides = twoPhase ? workflow.productCodeOverrides : workflow.productCodeOverrides;
+  const productReplacements = twoPhase ? workflow.productCodeReplacements : workflow.productCodeReplacements;
+  const inventoryPairs = twoPhase ? workflow.purchaseInventoryPairs : workflow.inventoryPairs;
+  const inventoryRules = twoPhase ? workflow.purchaseInventoryPairRules : workflow.inventoryPairRules;
   return {
     profile,
+    vietmax_phase: 'purchase',
     ...columns,
     include_company_prefix: workflow.includeCompanyPrefix,
     prefix_strategy: activePrefixStrategy,
@@ -4295,25 +6112,76 @@ function buildGenericProcessPayload(workflow: WorkflowState, profile: ProfileKey
     prefix_name_chars: workflow.prefixNameChars,
     prefix_missing_mst_strategy: normalizeMissingMstPrefixStrategy(workflow.prefixMissingMstStrategy),
     prefix_strategy_values: prefixStrategyValues,
-    word_rules: workflow.wordRules,
+    word_rules: wordRules,
     first_word_rules: workflow.firstWordRules,
-    repeated_phrase_removals: workflow.repeatedPhraseRemovals.filter((phrase) => phrase.trim()),
-    manual_code_overrides: workflow.productCodeOverrides,
+    repeated_phrase_removals: repeatedPhrases.filter((phrase) => phrase.trim()),
+    manual_code_overrides: manualOverrides,
+    product_code_replacements: productReplacements,
     product_review_merges: buildReviewRules(workflow.purchaseReviewRules, workflow.purchaseReviewRows, reviewScope),
     price_range_rules: priceRangeRules,
     price_adjust_all_percent: profile === 'cao_thanh' ? workflow.priceAdjustAllPercent : 0,
-    inventory_pairs: workflow.inventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
-    use_default_inventory_pair: workflow.useDefaultInventoryPair,
-    default_inventory_pair_id: workflow.defaultInventoryPairId,
-    inventory_pair_rules: inventoryRulesForPayload(workflow.inventoryPairRules, workflow.inventoryPairs),
+    inventory_pairs: inventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
+    use_default_inventory_pair: twoPhase ? workflow.purchaseUseDefaultInventoryPair : workflow.useDefaultInventoryPair,
+    default_inventory_pair_id: twoPhase ? workflow.purchaseDefaultInventoryPairId : workflow.defaultInventoryPairId,
+    inventory_pair_rules: inventoryRulesForPayload(inventoryRules, inventoryPairs),
+    processing_groups: workflow.purchaseProcessingGroups,
+    company_group_assignments: groupAssignmentsFromRows(companies),
+    form_mapping_presets: normalizeFormsForSave(workflow.purchaseFormMappingPresets),
     prefixes: companyPrefixes(companies),
     all_mst: companies.map((company) => companyConfigKey(company)),
     process_mst: activeCompanies.map((company) => companyConfigKey(company)),
     mst_safe_id: companies.map((company, index) => `${companyConfigKey(company)}|||${index}`),
     ...companyPrefixFields(companies),
-    ...Object.fromEntries(companies.flatMap((company, index) => (company.process === false ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
+    ...Object.fromEntries(companies.flatMap((company, index) => (!isMaterialCompany(company) ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
     columns,
-    removed_companies: Object.fromEntries(companies.filter((company) => company.process === false).map((company) => [companyConfigKey(company), true])),
+    removed_companies: Object.fromEntries(companies.filter(isIgnoredCompany).map((company) => [companyConfigKey(company), true])),
+    skipped_products_map: Object.fromEntries(companies.map((company) => {
+      const selected = new Set(selectedProductNames(company));
+      const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
+      return [companyConfigKey(company), skipped];
+    }).filter(([, skipped]) => Array.isArray(skipped) && skipped.length)),
+  };
+}
+
+function buildGenericSalesProcessPayload(workflow: WorkflowState, profile: ProfileKey) {
+  const companies = workflow.salesCompanyRows;
+  const activeCompanies = companies.filter(isMaterialCompany);
+  const activePrefixStrategy = normalizedPrefixStrategy(workflow.salesPrefixStrategy);
+  const prefixStrategyValues = rememberManualPrefixValues(workflow.salesPrefixStrategyValues, activePrefixStrategy, companies, workflow.prefixMstDigits, workflow.prefixNameWords, workflow.prefixNameChars);
+  const columns = normalizeVietmaxColumns(workflow.salesColumns, 'sales');
+  const reviewScope = reviewScopeValue(workflow.salesReviewScope);
+  return {
+    profile,
+    vietmax_phase: 'sales',
+    ...columns,
+    include_company_prefix: workflow.includeCompanyPrefix,
+    prefix_strategy: activePrefixStrategy,
+    prefix_mst_digits: workflow.prefixMstDigits,
+    prefix_name_words: workflow.prefixNameWords,
+    prefix_name_chars: workflow.prefixNameChars,
+    prefix_missing_mst_strategy: normalizeMissingMstPrefixStrategy(workflow.prefixMissingMstStrategy),
+    prefix_strategy_values: prefixStrategyValues,
+    word_rules: workflow.salesWordRules,
+    first_word_rules: workflow.firstWordRules,
+    repeated_phrase_removals: workflow.salesRepeatedPhraseRemovals.filter((phrase) => phrase.trim()),
+    manual_code_overrides: workflow.salesProductCodeOverrides,
+    product_code_replacements: workflow.salesProductCodeReplacements,
+    product_review_merges: buildReviewRules(workflow.salesReviewRules, workflow.salesReviewRows, reviewScope),
+    inventory_pairs: workflow.salesInventoryPairs.filter((pair) => pair.ma_kho.trim() || pair.tk_vat_tu.trim()),
+    use_default_inventory_pair: workflow.salesUseDefaultInventoryPair,
+    default_inventory_pair_id: workflow.salesDefaultInventoryPairId,
+    inventory_pair_rules: inventoryRulesForPayload(workflow.salesInventoryPairRules, workflow.salesInventoryPairs),
+    processing_groups: workflow.salesProcessingGroups,
+    company_group_assignments: groupAssignmentsFromRows(companies),
+    form_mapping_presets: normalizeFormsForSave(workflow.salesFormMappingPresets),
+    prefixes: companyPrefixes(companies),
+    all_mst: companies.map((company) => companyConfigKey(company)),
+    process_mst: activeCompanies.map((company) => companyConfigKey(company)),
+    mst_safe_id: companies.map((company, index) => `${companyConfigKey(company)}|||${index}`),
+    ...companyPrefixFields(companies),
+    ...Object.fromEntries(companies.flatMap((company, index) => (!isMaterialCompany(company) ? [] : [[`selected_products_${index}`, selectedProductNames(company)]]))),
+    columns,
+    removed_companies: Object.fromEntries(companies.filter(isIgnoredCompany).map((company) => [companyConfigKey(company), true])),
     skipped_products_map: Object.fromEntries(companies.map((company) => {
       const selected = new Set(selectedProductNames(company));
       const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
@@ -4354,7 +6222,7 @@ function normalizeGenericColumns(raw: Record<string, unknown>): GenericColumns {
 
 function buildReviewProducts(companies: CompanyRow[], phase: 'purchase' | 'sales', manualCodeOverrides: Record<string, string> = {}): ReviewProduct[] {
   return companies.flatMap((company, companyIndex) => {
-    if (company.process === false) return [];
+    if (!isMaterialCompany(company)) return [];
     const selected = new Set(selectedProductNames(company));
     return company.all_products.flatMap((product, productIndex) => {
       if (!selected.has(product.name)) return [];
@@ -4513,12 +6381,21 @@ function reviewRulePart(product: string | undefined, company: string | undefined
 }
 
 function buildConfigPayloads(workflow: WorkflowState, phase: 'purchase' | 'sales' | 'all' = 'all', profile: ProfileKey = 'vietmax') {
-  if (isGenericProfileKey(profile)) return [buildGenericProcessPayload(workflow, profile)];
+  if (isGenericProfileKey(profile)) {
+    if (isTwoPhaseGenericProfile(profile)) {
+      const payloads = [];
+      if (phase === 'purchase' || phase === 'all') payloads.push(buildGenericProcessPayload(workflow, profile));
+      if (phase === 'sales' || phase === 'all') payloads.push(buildGenericSalesProcessPayload(workflow, profile));
+      return payloads.length ? payloads : [buildGenericProcessPayload(workflow, profile)];
+    }
+    return [buildGenericProcessPayload(workflow, profile)];
+  }
   const payloads = [];
   if ((phase === 'purchase' || phase === 'all') && workflow.companyRows.length) payloads.push(buildConfigPayload(workflow));
   if ((phase === 'sales' || phase === 'all') && (workflow.salesCompanyRows.length || workflow.salesFile || workflow.matches.length || workflow.salesMatchRules.length)) payloads.push(buildSalesConfigPayload(workflow));
   if (!payloads.length && phase === 'sales') return [buildSalesConfigPayload(workflow)];
   if (!payloads.length && phase === 'purchase') return [buildConfigPayload(workflow)];
+  if (!payloads.length && phase === 'all') return [buildConfigPayload(workflow), buildSalesConfigPayload(workflow)];
   return payloads.length ? payloads : [buildConfigPayload(workflow)];
 }
 
@@ -4528,13 +6405,17 @@ function buildConfigPayload(workflow: WorkflowState) {
     ...buildPurchaseProcessPayload(workflow),
     columns: { ...normalizeVietmaxColumns(workflow.purchaseColumns, 'purchase'), purchase_price_col: normalizeVietmaxColumns(workflow.purchaseColumns, 'purchase').price_col || 'P' },
     prefixes: companyPrefixes(companies),
-    removed_companies: Object.fromEntries(companies.filter((company) => company.process === false).map((company) => [companyConfigKey(company), true])),
+    removed_companies: Object.fromEntries(companies.filter(isIgnoredCompany).map((company) => [companyConfigKey(company), true])),
+    processing_groups: workflow.purchaseProcessingGroups,
+    company_group_assignments: groupAssignmentsFromRows(companies),
+    form_mapping_presets: normalizeFormsForSave(workflow.purchaseFormMappingPresets),
     skipped_products_map: Object.fromEntries(companies.map((company) => {
       const selected = new Set(selectedProductNames(company));
       const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
       return [companyConfigKey(company), skipped];
     }).filter(([, skipped]) => Array.isArray(skipped) && skipped.length)),
     manual_code_overrides: workflow.productCodeOverrides,
+    product_code_replacements: workflow.productCodeReplacements,
   };
 }
 
@@ -4543,13 +6424,17 @@ function buildSalesConfigPayload(workflow: WorkflowState) {
   return {
     ...buildSalesProcessPayload(workflow),
     columns: { ...normalizeVietmaxColumns(workflow.salesColumns, 'sales'), purchase_price_col: normalizeVietmaxColumns(workflow.purchaseColumns, 'purchase').price_col || 'P' },
-    removed_companies: Object.fromEntries(companies.filter((company) => company.process === false).map((company) => [companyConfigKey(company), true])),
+    removed_companies: Object.fromEntries(companies.filter(isIgnoredCompany).map((company) => [companyConfigKey(company), true])),
+    processing_groups: workflow.salesProcessingGroups,
+    company_group_assignments: groupAssignmentsFromRows(companies),
+    form_mapping_presets: normalizeFormsForSave(workflow.salesFormMappingPresets),
     skipped_products_map: Object.fromEntries(companies.map((company) => {
       const selected = new Set(selectedProductNames(company));
       const skipped = company.all_products.map((product) => product.name).filter((name) => !selected.has(name));
       return [companyConfigKey(company), skipped];
     }).filter(([, skipped]) => Array.isArray(skipped) && skipped.length)),
     manual_code_overrides: workflow.salesProductCodeOverrides,
+    product_code_replacements: workflow.salesProductCodeReplacements,
     vietmax_ban_ra_purchase_match_rules: buildSalesMatchRules(workflow),
   };
 }
@@ -4638,6 +6523,7 @@ function buildVietmaxUiConfigSnapshot(workflow: WorkflowState, phase: 'purchase'
     word_rules: isSales ? workflow.salesWordRules : workflow.purchaseWordRules,
     repeated_phrase_removals: isSales ? workflow.salesRepeatedPhraseRemovals : workflow.purchaseRepeatedPhraseRemovals,
     manual_code_overrides: isSales ? workflow.salesProductCodeOverrides : workflow.productCodeOverrides,
+    product_code_replacements: isSales ? workflow.salesProductCodeReplacements : workflow.productCodeReplacements,
     review_scope: reviewScope,
     review_rows: reviewRows,
     saved_review_rules: buildReviewRules(reviewRules, reviewRows, reviewScopeValue(reviewScope)),
@@ -4825,6 +6711,8 @@ async function saveBlob(blob: Blob, filename: string) {
       const lowerName = filename.toLowerCase();
       const pickerType: { description: string; accept: Record<string, string[]> } = lowerName.endsWith('.json')
         ? { description: 'JSON config', accept: { 'application/json': ['.json'] } }
+        : lowerName.endsWith('.zip')
+          ? { description: 'ZIP package', accept: { 'application/zip': ['.zip'] } }
         : lowerName.endsWith('.xls')
           ? { description: 'Excel workbook', accept: { 'application/vnd.ms-excel': ['.xls'] } }
           : lowerName.endsWith('.xlsm')

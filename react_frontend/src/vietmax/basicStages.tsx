@@ -1,4 +1,4 @@
-import type { OperationProgress, ProcessedFileStats, UploadSummary } from '../types';
+import type { InvoiceStatusOption, OperationProgress, ProcessedFileStats, UploadSummary } from '../types';
 
 export type GenericColumns = {
   company_col: string;
@@ -86,19 +86,72 @@ export function ProcessedStatsSummary({ stats }: { stats: ProcessedFileStats | n
   );
 }
 
-export function MappingStage({ summary, phase, scope, setScope }: { summary: UploadSummary | null; phase: 'purchase' | 'sales'; scope: string; setScope: (value: string) => void }) {
+export function MappingStage({ summary, phase, scope, setScope, columns, invoiceStatuses, onColumnsChange, onInvoiceStatusSkipValuesChange }: { summary: UploadSummary | null; phase: 'purchase' | 'sales'; scope: string; setScope: (value: string) => void; columns: GenericColumns; invoiceStatuses: InvoiceStatusOption[]; onColumnsChange: (update: Partial<GenericColumns>) => void; onInvoiceStatusSkipValuesChange: (values: string[]) => void }) {
   if (!summary) return <PlaceholderStage title="Chưa có file" detail="Quay lại stage tải file trước khi chọn cột." />;
   const previewKeys = summary.preview.length ? Object.keys(summary.preview[0]) : [];
-  const columnLetters = phase === 'sales' ? salesColumnLetters : purchaseColumnLetters;
+  const titlePrefix = phase === 'sales' ? 'bán ra' : 'mua vào';
+  const statusColumn = String(columns.invoice_status_col || '').trim().toUpperCase();
+  const skippedStatuses = new Set(columns.invoice_status_skip_values || []);
+  const columnFields: Array<{ key: keyof GenericColumns; label: string; help: string; allowBlank?: boolean }> = [
+    { key: 'company_col', label: phase === 'sales' ? 'Tên người mua' : 'Tên người bán', help: 'Cột tên công ty để gom theo MST' },
+    { key: 'mst_col', label: phase === 'sales' ? 'MST người mua' : 'MST người bán', help: 'Cột mã số thuế' },
+    { key: 'address_col', label: phase === 'sales' ? 'Địa chỉ người mua' : 'Địa chỉ người bán', help: 'Dùng để hiển thị/đối chiếu', allowBlank: true },
+    { key: 'product_col', label: 'Tên hàng hóa, dịch vụ', help: 'Cột tên hàng để tạo Mã VT' },
+    { key: 'qty_col', label: 'Số lượng', help: 'Chỉ xử lý dòng có số lượng lớn hơn 0', allowBlank: true },
+    { key: 'price_col', label: 'Đơn giá', help: 'Dùng cho review/khớp mua bán', allowBlank: true },
+    { key: 'output_col', label: 'Cột xuất Mã VT', help: 'Nơi ghi mã vật tư mới' },
+    { key: 'invoice_status_col', label: 'Trạng thái hóa đơn', help: 'Chọn cột rồi tick trạng thái cần bỏ qua hoặc xử lý', allowBlank: true },
+  ];
+  const setSkipped = (status: string, skip: boolean) => {
+    const next = new Set(columns.invoice_status_skip_values || []);
+    if (skip) next.add(status);
+    else next.delete(status);
+    onInvoiceStatusSkipValuesChange(Array.from(next));
+  };
   return (
-    <div className="stage-grid">
-      <div className="form-panel">
-        <p className="description left">File: <strong>{summary.original_name}</strong>. Mặc định Vietmax dùng cột P cho đơn giá bán/mua.</p>
+    <div className="stage-grid vietmax-mapping-stage">
+      <div className="form-panel vietmax-mapping-panel">
+        <p className="description left">File: <strong>{summary.original_name}</strong>. Chọn đúng cột cho HD {titlePrefix} trước khi đi tiếp.</p>
         <label><span>Phạm vi so sánh</span><select value={scope} onChange={(event) => setScope(event.currentTarget.value)}><option value="all_companies">Nhiều công ty</option><option value="same_company">Chỉ cùng công ty</option></select></label>
-        <div className="column-grid">{['Tên công ty', 'MST', 'Tên hàng', 'Số lượng', 'Đơn giá', 'Mã VT'].map((label) => {
-          const defaultLetter = columnLetters[label];
-          return <label key={label}><span>{label}</span><select defaultValue={defaultLetter}><option value={defaultLetter} title="Mặc định theo Vietmax">{defaultLetter}</option>{summary.columns.filter((column) => column.letter !== defaultLetter).map((column) => <option key={`${label}-${column.letter}`} value={column.letter} title={column.label}>{column.letter}</option>)}</select></label>;
-        })}</div>
+        <div className="column-grid mapping-column-grid">
+          {columnFields.map((field) => (
+            <label key={field.key} className={field.key === 'invoice_status_col' ? 'invoice-status-column-card' : ''}>
+              <span>{field.label}</span>
+              <small>{field.help}</small>
+              <select value={String(columns[field.key] || '')} onChange={(event) => onColumnsChange({ [field.key]: event.currentTarget.value } as Partial<GenericColumns>)}>
+                {field.allowBlank && <option value="">Không dùng</option>}
+                {summary.columns.map((column) => <option key={`${field.key}-${column.letter}`} value={column.letter} title={column.label}>{column.label}</option>)}
+              </select>
+            </label>
+          ))}
+        </div>
+        <section className="invoice-status-panel">
+          <div className="invoice-status-heading">
+            <div>
+              <h3>{statusColumn ? `Trạng thái hóa đơn trong cột ${statusColumn}` : 'Không dùng lọc trạng thái hóa đơn'}</h3>
+              <p>Tick là bỏ qua khi kiểm tra và xử lý file. Bỏ tick là vẫn xử lý dòng đó.</p>
+            </div>
+            <div className="invoice-status-actions">
+              <button type="button" className="btn-secondary" disabled={!invoiceStatuses.length} onClick={() => onInvoiceStatusSkipValuesChange(invoiceStatuses.map((item) => item.value))}>Bỏ qua tất cả</button>
+              <button type="button" className="btn-secondary" disabled={!invoiceStatuses.length} onClick={() => onInvoiceStatusSkipValuesChange([])}>Xử lý tất cả</button>
+            </div>
+          </div>
+          {!statusColumn ? <p className="muted">Chọn một cột trạng thái hóa đơn nếu cần bỏ qua hóa đơn hủy.</p> : !invoiceStatuses.length ? <p className="muted">Không tìm thấy giá trị trạng thái trong cột {statusColumn}.</p> : (
+            <div className="invoice-status-list">
+              {invoiceStatuses.map((item) => {
+                const skipped = skippedStatuses.has(item.value);
+                return (
+                  <label key={item.value || '(blank)'} className={`invoice-status-row ${skipped ? 'skipped' : 'processed'}`}>
+                    <input type="checkbox" checked={skipped} onChange={(event) => setSkipped(item.value, event.currentTarget.checked)} />
+                    <strong>{item.value || '(trống)'}</strong>
+                    <span>{formatCount(item.count)} dòng</span>
+                    <em>{skipped ? 'Bỏ qua' : 'Xử lý'}</em>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </section>
       </div>
       <div className="preview-panel">
         <h3>Xem trước dữ liệu</h3>
@@ -174,6 +227,8 @@ export function FastImportExportStage({
   processedSalesSavedName,
   processedPurchaseStats,
   processedSalesStats,
+  needsPurchase = true,
+  needsSales = true,
   busy,
   onProcessedPurchaseUpload,
   onProcessedSalesUpload,
@@ -183,12 +238,14 @@ export function FastImportExportStage({
   processedSalesSavedName: string;
   processedPurchaseStats: ProcessedFileStats | null;
   processedSalesStats: ProcessedFileStats | null;
+  needsPurchase?: boolean;
+  needsSales?: boolean;
   busy: boolean;
   onProcessedPurchaseUpload: (file: File | undefined) => void;
   onProcessedSalesUpload: (file: File | undefined) => void;
   onDownload: () => void;
 }) {
-  const canExport = Boolean(processedPurchaseSavedName && processedSalesSavedName);
+  const canExport = Boolean((!needsPurchase || processedPurchaseSavedName) && (!needsSales || processedSalesSavedName));
   const renderUpload = (
     label: string,
     ready: boolean,
@@ -262,7 +319,7 @@ export function LoadingStage({ title, detail, progress }: { title: string; detai
 
 function processedStatsSentence(stats: ProcessedFileStats | null) {
   if (!stats) return '';
-  return `CÃ´ng ty ${formatCount(stats.processed_company_count)}/${formatCount(stats.company_count)}, dÃ²ng hÃ ng ${formatCount(stats.processed_product_row_count)}/${formatCount(stats.product_row_count)}.`;
+  return `Công ty ${formatCount(stats.processed_company_count)}/${formatCount(stats.company_count)}, dòng hàng ${formatCount(stats.processed_product_row_count)}/${formatCount(stats.product_row_count)}.`;
 }
 
 function formatCount(value: number | undefined) {

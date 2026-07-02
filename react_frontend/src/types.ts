@@ -94,6 +94,7 @@ export type GenericAnalyzeResult = {
   original_name?: string;
   saved_name?: string;
   manual_code_overrides?: Record<string, string>;
+  product_code_replacements?: Record<string, string>;
   word_rules?: Record<string, string>;
   first_word_rules?: Record<string, string>;
   repeated_phrase_removals?: string[];
@@ -108,6 +109,9 @@ export type GenericAnalyzeResult = {
   prefix_name_chars?: number;
   prefix_missing_mst_strategy?: string;
   prefix_strategy_values?: Record<string, Record<string, string>>;
+  processing_groups?: ProcessingGroup[];
+  company_group_assignments?: Record<string, string>;
+  form_mapping_presets?: FormMappingPreset[];
   product_review_merges?: unknown[];
   price_range_rules?: Record<string, unknown>;
   price_adjust_all_percent?: number;
@@ -305,9 +309,74 @@ export type CompanyRow = {
   all_products: Array<{ name: string; count?: number; minPrice?: number | null; maxPrice?: number | null; priceCount?: number; priceRows?: Array<{ price?: number | null; quantity?: number | null; amount?: number | null; excelRow?: string | number; stt?: string; unit?: string; invoiceNo?: string; invoiceDate?: string; name?: string }> }>;
   process?: boolean;
   pending_process?: boolean;
+  group_id?: string;
+  pending_group_id?: string;
   committed_prefix?: string;
   default_prefix?: string;
   prefix_strategies?: Record<string, string>;
+};
+
+export type ProcessingForm = {
+  id: string;
+  label: string;
+  type: 'builtin' | 'template_mapping' | string;
+  scope?: 'purchase' | 'sales' | 'both' | string;
+  enabled?: boolean;
+  builtin_exporter?: string;
+  group_id?: string;
+  input_phase?: 'purchase' | 'sales' | 'both' | string;
+  template_saved_name?: string;
+  template_original_name?: string;
+  sheet?: string;
+  header_row?: number;
+  data_start_row?: number;
+  copy_style_row?: number;
+  output_columns?: FormColumn[];
+  input_columns?: FormColumn[];
+  output_preview?: Array<Record<string, string>>;
+  mappings?: FormMappingRule[];
+};
+
+export type ProcessingGroup = {
+  id: string;
+  label: string;
+  builtin?: boolean;
+  uses_product_code?: boolean;
+  forms?: ProcessingForm[];
+};
+
+export type FormMappingRule = {
+  target_col: string;
+  target_label?: string;
+  source_type: 'source_column' | 'constant' | 'empty' | 'text_template' | string;
+  source_phase?: 'purchase' | 'sales' | 'both' | string;
+  source_col?: string;
+  source_label?: string;
+  condition_source_col?: string;
+  fallback_source_col?: string;
+  fallback_delimiter?: string;
+  transform?: string;
+  transform_rules?: Array<{ source_col?: string; match_type?: 'starts_with' | 'equals' | 'not_equals' | 'contains' | 'not_contains' | 'ends_with' | 'regex' | 'blank' | 'not_blank' | 'gt' | 'gte' | 'lt' | 'lte' | 'default' | string; value?: string; result?: string }>;
+  value?: string;
+};
+
+export type FormMappingPreset = ProcessingForm & {
+  id: string;
+  label: string;
+};
+
+export type FormColumn = {
+  letter: string;
+  label: string;
+  header?: string;
+};
+
+export type FormatMappingDefaults = {
+  source_columns: {
+    purchase: FormColumn[];
+    sales: FormColumn[];
+  };
+  form_mapping_presets: FormMappingPreset[];
 };
 
 export type InventoryPair = {

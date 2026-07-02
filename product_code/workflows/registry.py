@@ -34,6 +34,12 @@ WORKFLOW_REGISTRY = {
         "native_react": False,
         "notes": "Legacy-compatible company profile; confirm flow before changes.",
     },
+    "ho_guom": {
+        "label": "Ho Guom",
+        "workflow": WORKFLOW_ESTIMATE_EXTRACTION,
+        "native_react": True,
+        "notes": "Estimate extraction workflow for Du thau/Chiet tinh/THVT.",
+    },
     "yen_thanh": {
         "label": "Yen Thanh",
         "workflow": WORKFLOW_INVENTORY_ALLOCATION,

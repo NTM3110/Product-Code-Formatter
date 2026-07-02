@@ -1,15 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import sys
 
 datas = [('app_icon.ico', '.'), ('mau HD ban ra.xlsx', '.'), ('mau_mua_vao_up.xlsx', '.'), ('mau_ban_ra_up.xlsx', '.')]
 react_dist = Path('react_frontend') / 'dist'
 if react_dist.exists():
     datas.append((str(react_dist), 'react_frontend/dist'))
 
+pathex = []
+venv_site_packages = Path('.venv') / 'Lib' / 'site-packages'
+venv_root = Path('.venv').resolve()
+if venv_site_packages.exists() and Path(sys.prefix).resolve() != venv_root:
+    pathex.append(str(venv_site_packages))
+
 a = Analysis(
     ['web_desktop_app.py'],
-    pathex=[],
+    pathex=pathex,
     binaries=[],
     datas=datas,
     hiddenimports=['webview', 'webview.platforms.edgechromium', 'uvicorn', 'uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto', 'uvicorn.protocols', 'uvicorn.protocols.http', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto', 'fastapi', 'fastapi.middleware.cors', 'pydantic', 'pandas', 'openpyxl', 'xlrd', 'xlwt', 'numpy'],

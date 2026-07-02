@@ -1,24 +1,28 @@
-export type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax';
-export type StageId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
-export type StagePhase = 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'fast';
+export type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax' | 'ho_guom';
+export type StageId = 0.5 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
+export type StagePhase = 'format' | 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'fast' | 'estimate';
 
 export type StageDefinition = {
   id: StageId;
   label: string;
   phase: StagePhase;
   short: string;
+  disabled?: boolean;
+  disabledReason?: string;
 };
 
-export type PrefixPresetStrategy = 'last_2_words' | 'last_3_mst' | '2_words_mst';
+export type PrefixPresetStrategy = 'last_2_words' | 'last_3_mst' | '2_words_mst' | 'all_name_words';
 
 export const profiles: Array<{ key: ProfileKey; label: string; note: string }> = [
   { key: 'son_phuong', label: 'Sơn Phương', note: 'Sẽ migrate sau Vietmax.' },
   { key: 'cao_thanh', label: 'Cao Thành', note: 'Sẽ migrate sau Vietmax, gồm stage lọc đơn giá.' },
   { key: 'quang_thinh', label: 'Quang Thịnh', note: 'Sẽ migrate sau Vietmax.' },
-  { key: 'vietmax', label: 'Vietmax', note: 'Đang migrate trước: mua vào rồi bán ra, stage 1-11.' },
+  { key: 'vietmax', label: 'Vietmax', note: 'Mua vào, bán ra, tồn kho và FAST.' },
+  { key: 'ho_guom', label: 'Hồ Gươm', note: 'Bóc tách dự toán từ Dự thầu và Chiết tính.' },
 ];
 
 export const vietmaxStages: StageDefinition[] = [
+  { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
   { id: 1, label: 'Tải file mua vào', phase: 'purchase', short: 'Tải mua vào' },
   { id: 2, label: 'Chọn cột / preview / trạng thái', phase: 'purchase', short: 'Chọn cột' },
   { id: 3, label: 'Công ty & prefix', phase: 'purchase', short: 'Công ty' },
@@ -26,7 +30,7 @@ export const vietmaxStages: StageDefinition[] = [
   { id: 5, label: 'Tạo file mua vào', phase: 'purchase', short: 'Tạo mua vào' },
   { id: 6, label: 'Tải file bán ra', phase: 'sales', short: 'Tải bán ra' },
   { id: 7, label: 'Chọn cột / preview / trạng thái', phase: 'sales', short: 'Cột bán ra' },
-  { id: 8, label: 'Khớp HD mua vào', phase: 'sales', short: 'Khớp mua vào' },
+  { id: 8, label: 'Khớp HĐ mua vào', phase: 'sales', short: 'Khớp mua vào' },
   { id: 9, label: 'Công ty & prefix', phase: 'sales', short: 'Công ty' },
   { id: 10, label: 'Review Mã VT', phase: 'sales', short: 'Review bán ra' },
   { id: 11, label: 'Tạo file bán ra', phase: 'sales', short: 'Tạo bán ra' },
@@ -37,13 +41,30 @@ export const vietmaxStages: StageDefinition[] = [
 ];
 
 export const commonProfileStages: StageDefinition[] = [
+  { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
   { id: 1, label: 'Tải file', phase: 'generic', short: 'Tải file' },
   { id: 2, label: 'Chọn cột', phase: 'generic', short: 'Chọn cột' },
   { id: 3, label: 'Công ty & hàng hóa', phase: 'generic', short: 'Công ty' },
   { id: 4, label: 'Xuất file', phase: 'generic', short: 'Xuất file' },
 ];
 
+export const sonPhuongStages: StageDefinition[] = [
+  { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
+  { id: 1, label: 'Tải file mua vào', phase: 'purchase', short: 'Tải mua vào' },
+  { id: 2, label: 'Chọn cột mua vào', phase: 'purchase', short: 'Chọn cột' },
+  { id: 3, label: 'Công ty & hàng hóa mua vào', phase: 'purchase', short: 'Công ty' },
+  { id: 4, label: 'Review Mã VT mua vào', phase: 'purchase', short: 'Review Mã VT' },
+  { id: 5, label: 'Tạo file mua vào', phase: 'purchase', short: 'Tạo mua vào' },
+  { id: 6, label: 'Tải file bán ra', phase: 'sales', short: 'Tải bán ra' },
+  { id: 7, label: 'Chọn cột bán ra', phase: 'sales', short: 'Cột bán ra' },
+  { id: 8, label: 'Công ty & hàng hóa bán ra', phase: 'sales', short: 'Công ty' },
+  { id: 9, label: 'Review Mã VT bán ra', phase: 'sales', short: 'Review bán ra' },
+  { id: 10, label: 'Tạo file bán ra', phase: 'sales', short: 'Tạo bán ra' },
+  { id: 15, label: 'Xuất FAST', phase: 'fast', short: 'Xuất FAST' },
+];
+
 export const caoThanhStages: StageDefinition[] = [
+  { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
   { id: 1, label: 'Tải file bán ra', phase: 'generic', short: 'Tải file' },
   { id: 2, label: 'Chọn cột', phase: 'generic', short: 'Chọn cột' },
   { id: 3, label: 'Công ty & hàng hóa', phase: 'generic', short: 'Công ty' },
@@ -52,8 +73,26 @@ export const caoThanhStages: StageDefinition[] = [
   { id: 6, label: 'Xuất file', phase: 'generic', short: 'Xuất file' },
 ];
 
+export const estimateStages: StageDefinition[] = [
+  { id: 1, label: 'Tải file dự toán', phase: 'estimate', short: 'Tải file' },
+  { id: 2, label: 'Chọn sheet', phase: 'estimate', short: 'Chọn sheet' },
+  { id: 3, label: 'Bóc tách / xuất file', phase: 'estimate', short: 'Bóc tách' },
+];
+
+const baseTwoPhaseStageIds = new Set<StageId>([0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15]);
+
+export function baseTwoPhaseProfileStages(): StageDefinition[] {
+  return vietmaxStages
+    .filter((stage) => baseTwoPhaseStageIds.has(stage.id))
+    .map((stage) => (
+      stage.id === 8
+        ? { ...stage, disabled: true, disabledReason: 'Stage này chỉ dùng cho Vietmax.' }
+        : stage
+    ));
+}
+
 export function isStageId(value: unknown): value is StageId {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 15;
+  return typeof value === 'number' && [0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(value);
 }
 
 export function isGenericProfileKey(value: ProfileKey) {
@@ -62,9 +101,11 @@ export function isGenericProfileKey(value: ProfileKey) {
 
 export function stagesForProfile(profile: ProfileKey): StageDefinition[] {
   if (profile === 'vietmax') return vietmaxStages;
+  if (profile === 'ho_guom') return estimateStages;
+  if (profile === 'son_phuong') return baseTwoPhaseProfileStages();
   if (profile === 'cao_thanh') return caoThanhStages;
   return [
-    ...commonProfileStages.slice(0, 3),
+    ...commonProfileStages.slice(0, 4),
     { id: 4, label: 'Review Mã VT', phase: 'generic', short: 'Review Mã VT' },
     { id: 5, label: 'Xuất file', phase: 'generic', short: 'Xuất file' },
   ];

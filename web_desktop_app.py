@@ -39,6 +39,9 @@ class DesktopApi:
         elif requested_suffix == ".xlsm":
             file_types = ("Excel macro workbook (*.xlsm)", "All files (*.*)")
             default_suffix = ".xlsm"
+        elif requested_suffix == ".zip":
+            file_types = ("ZIP archive (*.zip)", "All files (*.*)")
+            default_suffix = ".zip"
         else:
             file_types = ("Excel workbook (*.xlsx)", "All files (*.*)")
             default_suffix = ".xlsx"

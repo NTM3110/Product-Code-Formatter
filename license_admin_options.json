@@ -3,7 +3,8 @@
     { "key": "son_phuong", "label": "Sơn Phương" },
     { "key": "cao_thanh", "label": "Cao Thành" },
     { "key": "quang_thinh", "label": "Quang Thịnh" },
-    { "key": "vietmax", "label": "Vietmax" }
+    { "key": "vietmax", "label": "Vietmax" },
+    { "key": "ho_guom", "label": "Hồ Gươm" }
   ],
   "products": [
     {

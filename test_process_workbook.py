@@ -1,4 +1,7 @@
+import json
+import re
 import unittest
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 import xlrd
 
 import app
-from app import build_vietmax_ban_ra_purchase_matches, create_up_ban_ra_workbook, create_up_mua_vao_workbook, default_config, license_allows_company, license_allows_profile, license_has_local_activation, make_product_part, normalize_config, process_workbook, profile_key, resolve_output_path, suggest_prefix, up_ban_ra_output_path, up_mua_vao_output_path, vietmax_ban_ra_sales_products_from_workbook, vietmax_product_review_rows, vietmax_purchase_match_export_rows, vietmax_purchase_products_from_workbook
+from app import build_vietmax_ban_ra_purchase_matches, create_up_ban_ra_workbook, create_up_mua_vao_workbook, default_config, excel_col_to_index, license_allows_company, license_allows_profile, license_has_local_activation, make_product_part, normalize_config, process_workbook, profile_key, resolve_output_path, suggest_prefix, up_ban_ra_output_path, up_mua_vao_output_path, vietmax_ban_ra_sales_products_from_workbook, vietmax_product_review_rows, vietmax_purchase_match_export_rows, vietmax_purchase_products_from_workbook
 
 
 class XlsCellAdapter:
@@ -39,6 +42,12 @@ class XlsWorkbookAdapter:
 
 
 class ProcessWorkbookTests(unittest.TestCase):
+    def test_product_code_replacement_ignores_company_prefix(self):
+        replacements = app.normalize_product_code_replacements({"TU100": "TU100.001"})
+        self.assertEqual(app.apply_product_code_replacement("TU100", replacements), "TU100.001")
+        self.assertEqual(app.apply_product_code_replacement("TA.TU100", replacements), "TA.TU100.001")
+        self.assertEqual(app.apply_product_code_replacement("TP.TU100", replacements), "TP.TU100.001")
+
     def test_invoice_status_filter_keeps_new_invoices(self):
         self.assertFalse(app.ignored_invoice_status("Hóa đơn mới"))
         self.assertFalse(app.ignored_invoice_status("Hóa đơn mới", ["Hóa đơn đã bị hủy"]))
@@ -223,6 +232,43 @@ class ProcessWorkbookTests(unittest.TestCase):
             app.legacy_machine_fingerprint = original_legacy_fingerprint
             app.current_machine_name = original_machine_name
 
+    def test_load_config_recovers_local_license_from_backup(self):
+        original_config_path = app.CONFIG_PATH
+        original_fingerprint = app.local_machine_fingerprint
+        original_legacy_fingerprint = app.legacy_machine_fingerprint
+        try:
+            with TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "product_code_config.json"
+                backup_path = Path(tmp) / "product_code_config.manual_code_overrides_backup.json"
+                current = default_config()
+                backup = default_config()
+                backup["license"].update({
+                    "server_url": "http://license-server.local:3000",
+                    "account_id": "acct",
+                    "license_key": "KEY",
+                    "activated": True,
+                    "machine_fingerprint": "TEST-FINGERPRINT",
+                    "status": "ACTIVE",
+                    "allowed_profiles": ["vietmax"],
+                })
+                config_path.write_text(json.dumps(current), encoding="utf-8")
+                backup_path.write_text(json.dumps(backup), encoding="utf-8")
+                app.CONFIG_PATH = config_path
+                app.local_machine_fingerprint = lambda: "TEST-FINGERPRINT"
+                app.legacy_machine_fingerprint = lambda: "LEGACY-FINGERPRINT"
+
+                loaded = app.load_config()
+                persisted = json.loads(config_path.read_text(encoding="utf-8"))
+
+                self.assertTrue(loaded["license"]["activated"])
+                self.assertEqual(loaded["license"]["license_key"], "KEY")
+                self.assertEqual(loaded["license"]["allowed_profiles"], ["vietmax"])
+                self.assertTrue(persisted["license"]["activated"])
+        finally:
+            app.CONFIG_PATH = original_config_path
+            app.local_machine_fingerprint = original_fingerprint
+            app.legacy_machine_fingerprint = original_legacy_fingerprint
+
     def test_keygen_metadata_accepts_camel_case_profile_keys(self):
         response = {
             "data": {
@@ -253,6 +299,86 @@ class ProcessWorkbookTests(unittest.TestCase):
     def test_suggest_prefix_skips_viet_nam_and_provinces(self):
         self.assertEqual(suggest_prefix("Công ty TNHH In Bao Bì Việt Nam"), "BB")
         self.assertEqual(suggest_prefix("Công ty TNHH In Bao Bì Hà Nội"), "BB")
+
+    def test_son_phuong_decimal_comma_dimensions_keep_original_normalization(self):
+        self.assertEqual(
+            app.make_code("", "Dầu Điêzen 0,001S Mức 5", 1, {}, "son_phuong", {}, require_qty=True, include_company_prefix=False),
+            "DD0.001SM5",
+        )
+        self.assertEqual(
+            app.make_code("", "ống thép mạ tròn 21,2 x 2,1 x 6.0", 1, {}, "son_phuong", {}, require_qty=True, include_company_prefix=False),
+            "OTMT21.2X2.1X6.0",
+        )
+        self.assertEqual(
+            app.make_code("", "Φ88.3x1.8", 1, {}, "son_phuong", {}, require_qty=True, include_company_prefix=False),
+            "F88.3X1.8",
+        )
+
+    def test_son_phuong_sample_product_codes_match_legacy_output(self):
+        base = Path("E:/Excel Mom") / "D\u00f3c" / "Son Phuong" / "input_ouput"
+        source = base / "Chi_tiet_HD_mua_vao_theo_tung_san_pham_01-01-2026_30-05-2026.xlsx"
+        expected = base / "Chi_tiet_HD_mua_vao_theo_tung_san_pham_01-01-2026_30-05-2026_ket_qua_xu_ly" / "Chi_tiet_HD_mua_vao_theo_tung_san_pham_01-01-2026_30-05-2026_formatted.xlsx"
+        if not source.exists() or not expected.exists():
+            self.skipTest("Sơn Phương sample input/output files are not available on this machine.")
+
+        _, source_df = app.read_workbook(source)
+        _, expected_df = app.read_workbook(expected)
+        word_rules = {"t\u00f4n": "TON", "\u0111en": "DEN"}
+
+        def row_key(df, row_index):
+            return (
+                app.raw_text(app.cell(df, row_index, 2)),
+                app.raw_text(app.cell(df, row_index, 5)),
+                app.raw_text(app.cell(df, row_index, 6)),
+                app.raw_text(app.cell(df, row_index, 12)),
+                app.raw_text(app.cell(df, row_index, 14)),
+            )
+
+        source_keys = Counter(
+            row_key(source_df, row_index)
+            for row_index in range(2, len(source_df))
+            if app.raw_text(app.cell(source_df, row_index, 2)) and app.raw_text(app.cell(source_df, row_index, 12))
+        )
+        prefix_map = {}
+        expected_rows = []
+        for row_index in range(2, len(expected_df)):
+            key = row_key(expected_df, row_index)
+            invoice_no, seller, mst, product, qty = key
+            expected_code = app.raw_text(app.cell(expected_df, row_index, 11))
+            if not invoice_no or not product or not qty or not expected_code:
+                continue
+            company_id = app.company_selection_key(seller, mst)
+            prefix = expected_code.split(".", 1)[0] if "." in expected_code else ""
+            if prefix:
+                prefix_map.setdefault(company_id, prefix)
+            expected_rows.append((row_index + 1, key, company_id, product, app.cell(expected_df, row_index, 14), expected_code))
+
+        missing = []
+        mismatches = []
+        compared_rows = 0
+        skipped_decimal_comma_rows = 0
+        for excel_row, key, company_id, product, qty, expected_code in expected_rows:
+            if source_keys[key] <= 0:
+                missing.append((excel_row, key))
+                if len(missing) >= 5:
+                    break
+            else:
+                source_keys[key] -= 1
+            if re.search(r"(?<=\d),(?=\d)", app.raw_text(product)):
+                skipped_decimal_comma_rows += 1
+                continue
+            compared_rows += 1
+            actual_code = app.make_code(company_id, product, qty, prefix_map, "son_phuong", word_rules, {}, require_qty=True, include_company_prefix=True)
+            if actual_code != expected_code:
+                mismatches.append((excel_row, expected_code, actual_code, product))
+                if len(mismatches) >= 5:
+                    break
+
+        self.assertEqual(len(expected_rows), 6753)
+        self.assertEqual(skipped_decimal_comma_rows, 60)
+        self.assertEqual(compared_rows, 6693)
+        self.assertFalse(missing, [(row, tuple(str(value).encode("unicode_escape").decode() for value in key)) for row, key in missing])
+        self.assertFalse(mismatches, [(row, expected_code, actual_code, str(product).encode("unicode_escape").decode()) for row, expected_code, actual_code, product in mismatches])
 
     def test_keygen_url_allows_lan_http(self):
         self.assertTrue(app.keygen_url("http://license-server.local:3000", "acct", "licenses/actions/validate-key").startswith("http://license-server.local:3000/"))
@@ -2190,8 +2316,8 @@ class ProcessWorkbookTests(unittest.TestCase):
     def test_output_suffixes_are_fdi_and_up_files(self):
         output = resolve_output_path("hoa_don.xlsx", "")
         self.assertEqual(output.name, "hoa_don_fdi.xls")
-        self.assertEqual(up_mua_vao_output_path(output).name, "hoa_don_fdi_UP_mua_vao.xlsx")
-        self.assertEqual(up_ban_ra_output_path(output).name, "hoa_don_fdi_UP_ban_ra.xlsx")
+        self.assertEqual(up_mua_vao_output_path(output).name, "hoa_don_fdi_UP_mua_vao.xls")
+        self.assertEqual(up_ban_ra_output_path(output).name, "hoa_don_fdi_UP_ban_ra.xls")
 
     def test_selected_output_filename_is_normalized_to_fdi_suffix(self):
         output = resolve_output_path("hoa_don.xlsx", "outputs/custom_name.xlsx")
@@ -2204,6 +2330,7 @@ class ProcessWorkbookTests(unittest.TestCase):
         run_id = uuid4().hex
         source = outputs / f"_test_nhap_kho_source_{run_id}.xlsx"
         result = outputs / f"_test_nhap_kho_result_{run_id}.xlsx"
+        result_no_inventory = outputs / f"_test_nhap_kho_result_no_inventory_{run_id}.xlsx"
         try:
             workbook = Workbook()
             sheet = workbook.active
@@ -2250,27 +2377,53 @@ class ProcessWorkbookTests(unittest.TestCase):
                 "inventory_pairs": [{"id": "only", "ma_kho": "KVT", "tk_vat_tu": "152"}],
             })
             purchase_stream = create_up_mua_vao_workbook(processed)
-            purchase_output = load_workbook(purchase_stream, data_only=True)
+            purchase_output = xlrd.open_workbook(file_contents=purchase_stream.getvalue())
             try:
-                purchase_sheet = purchase_output.active
-                self.assertEqual(purchase_sheet["J2"].value, "KVT")
-                self.assertEqual(purchase_sheet["O2"].value, "152")
+                purchase_sheet = purchase_output.sheet_by_index(0)
+                self.assertEqual(purchase_sheet.cell_value(1, excel_col_to_index("J")), "KVT")
+                self.assertEqual(purchase_sheet.cell_value(1, excel_col_to_index("O")), "152")
             finally:
-                purchase_output.close()
+                purchase_output.release_resources()
 
             sales_stream = create_up_ban_ra_workbook(processed)
-            sales_output = load_workbook(sales_stream, data_only=True)
+            sales_output = xlrd.open_workbook(file_contents=sales_stream.getvalue())
             try:
-                sales_sheet = sales_output.active
-                self.assertEqual(sales_sheet["AB2"].value, "152")
-                self.assertEqual(sales_sheet["AF2"].value, "KVT")
-                self.assertNotEqual(sales_sheet["AB2"].value, "KVT")
-                self.assertNotEqual(sales_sheet["AF2"].value, "152")
+                sales_sheet = sales_output.sheet_by_index(0)
+                self.assertEqual(sales_sheet.cell_value(1, excel_col_to_index("AB")), "152")
+                self.assertEqual(sales_sheet.cell_value(1, excel_col_to_index("AF")), "KVT")
+                self.assertNotEqual(sales_sheet.cell_value(1, excel_col_to_index("AB")), "KVT")
+                self.assertNotEqual(sales_sheet.cell_value(1, excel_col_to_index("AF")), "152")
             finally:
-                sales_output.close()
+                sales_output.release_resources()
+
+            processed_without_inventory = process_workbook(source, result_no_inventory, {
+                "company_col": "F",
+                "mst_col": "G",
+                "product_col": "N",
+                "qty_col": "P",
+                "output_col": "L",
+                "profile": "son_phuong",
+                "include_company_prefix": False,
+                "all_mst": ["MST"],
+                "process_mst": ["MST"],
+                "mst_safe_id": ["MST|||0"],
+                "selected_products_0": ["Hang A"],
+            })
+            with self.assertRaises(ValueError):
+                create_up_mua_vao_workbook(processed_without_inventory)
+            optional_purchase_stream = create_up_mua_vao_workbook(processed_without_inventory, require_inventory_columns=False)
+            optional_purchase_output = xlrd.open_workbook(file_contents=optional_purchase_stream.getvalue())
+            try:
+                optional_sheet = optional_purchase_output.sheet_by_index(0)
+                self.assertEqual(optional_sheet.cell_value(1, excel_col_to_index("K")), "HA")
+                self.assertEqual(optional_sheet.cell_value(1, excel_col_to_index("J")), "")
+                self.assertEqual(optional_sheet.cell_value(1, excel_col_to_index("O")), "")
+            finally:
+                optional_purchase_output.release_resources()
         finally:
             source.unlink(missing_ok=True)
             result.unlink(missing_ok=True)
+            result_no_inventory.unlink(missing_ok=True)
 
     def test_fast_import_package_uses_processed_fdi_sources(self):
         outputs = Path(__file__).parent / "outputs"
@@ -2479,6 +2632,275 @@ class ProcessWorkbookTests(unittest.TestCase):
             purchase_source.unlink(missing_ok=True)
             sales_source.unlink(missing_ok=True)
 
+    def test_fast_import_package_adds_custom_form_mapping_sheet(self):
+        outputs = Path(__file__).parent / "outputs"
+        outputs.mkdir(exist_ok=True)
+        run_id = uuid4().hex
+        source = outputs / f"_test_fast_custom_mapping_{run_id}.xlsx"
+        try:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Invoices"
+            for column, header in {
+                "C": "So HD",
+                "L": "Ma VT",
+                "O": "So luong",
+                "AS": "TK vat tu",
+                "AT": "Ma kho",
+            }.items():
+                sheet.cell(2, app.excel_col_to_index(column) + 1, header)
+            for column, value in {
+                "C": "777",
+                "D": "20/01/2026",
+                "F": "CONG TY DICH VU",
+                "G": "010SERVICE",
+                "L": "DV.TEST",
+                "M": "Dich vu test",
+                "N": "Lan",
+                "O": 1,
+                "P": 1000,
+                "V": 1000,
+                "AS": "642",
+                "AT": "KDV",
+            }.items():
+                sheet.cell(3, app.excel_col_to_index(column) + 1, value)
+            workbook.save(source)
+            workbook.close()
+            _, df = app.read_workbook(source)
+            stream = app.fast_import_multi_sheet_workbook(
+                df,
+                None,
+                form_mapping_presets=[{
+                    "id": "service_form",
+                    "label": "PhieuDichVu",
+                    "scope": "purchase",
+                    "group_id": "services",
+                    "output_columns": [
+                        {"letter": "A", "header": "Ma khach hang"},
+                        {"letter": "B", "header": "Loai"},
+                        {"letter": "C", "header": "Dien giai"},
+                    ],
+                    "mappings": [
+                        {"target_col": "A", "source_col": "G", "source_phase": "purchase", "source_type": "source_column"},
+                        {"target_col": "B", "source_phase": "purchase", "source_type": "constant", "value": "DV"},
+                        {"target_col": "C", "source_phase": "purchase", "source_type": "text_template", "value": "HD{C}"},
+                    ],
+                }],
+                purchase_company_group_assignments={"010SERVICE": "services"},
+            )
+            result = XlsWorkbookAdapter(stream.getvalue())
+            try:
+                self.assertIn("PhieuDichVu", result.sheetnames)
+                mapped_sheet = result["PhieuDichVu"]
+                self.assertEqual(mapped_sheet.cell(2, 1).value, "010SERVICE")
+                self.assertEqual(mapped_sheet.cell(2, 2).value, "DV")
+                self.assertEqual(mapped_sheet.cell(2, 3).value, "HD777")
+            finally:
+                result.close()
+        finally:
+            source.unlink(missing_ok=True)
+
+    def test_fast_import_custom_group_matches_missing_mst_company_key(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "no_mst_service.xlsx"
+            wb = Workbook()
+            sheet = wb.active
+            sheet.title = "Invoices"
+            for column, value in {
+                "C": "778",
+                "D": "21/01/2026",
+                "F": "CONG TY KHONG MST",
+                "G": "",
+                "L": "DV.NOMST",
+                "M": "Dich vu khong mst",
+                "N": "Lan",
+                "O": 1,
+                "P": 2000,
+                "V": 2000,
+            }.items():
+                sheet.cell(3, app.excel_col_to_index(column) + 1, value)
+            wb.save(path)
+            wb.close()
+            _, df = app.read_workbook(path)
+
+        service_key = app.company_selection_key("CONG TY KHONG MST", "")
+        stream = app.fast_import_multi_sheet_workbook(
+            df,
+            None,
+            form_mapping_presets=[{
+                "id": "service_no_mst",
+                "label": "DichVuKhongMst",
+                "scope": "purchase",
+                "group_id": "services",
+                "output_columns": [
+                    {"letter": "A", "header": "Cong ty"},
+                    {"letter": "B", "header": "So HD"},
+                ],
+                "mappings": [
+                    {"target_col": "A", "source_col": "F", "source_phase": "purchase", "source_type": "source_column"},
+                    {"target_col": "B", "source_col": "C", "source_phase": "purchase", "source_type": "source_column"},
+                ],
+            }],
+            purchase_company_group_assignments={service_key: "services"},
+            require_inventory_columns=False,
+        )
+        result = XlsWorkbookAdapter(stream.getvalue())
+        try:
+            self.assertIn("DichVuKhongMst", result.sheetnames)
+            mapped_sheet = result["DichVuKhongMst"]
+            self.assertEqual(mapped_sheet.cell(2, 1).value, "CONG TY KHONG MST")
+            self.assertEqual(mapped_sheet.cell(2, 2).value, "778")
+        finally:
+            result.close()
+
+    def test_fast_mapping_transform_rules_are_configurable(self):
+        revenue_rules = [
+            {"match_type": "regex", "value": "^33", "result": "515"},
+            {"match_type": "contains", "value": "711", "result": "7111"},
+            {"match_type": "gte", "value": "900", "result": "9999"},
+            {"match_type": "default", "result": "5119"},
+        ]
+        self.assertEqual(app.fast_apply_mapping_transform("revenue_account_from_inventory_account", "331", {}, revenue_rules), "515")
+        self.assertEqual(app.fast_apply_mapping_transform("revenue_account_from_inventory_account", "711", {}, revenue_rules), "7111")
+        self.assertEqual(app.fast_apply_mapping_transform("revenue_account_from_inventory_account", "950", {}, revenue_rules), "9999")
+        self.assertEqual(app.fast_apply_mapping_transform("revenue_account_from_inventory_account", "642", {}, revenue_rules), "5119")
+        self.assertEqual(
+            app.fast_apply_mapping_transform(
+                "revenue_account_from_inventory_account",
+                "642",
+                {},
+                [{"match_type": "starts_with", "value": "155", "result": "5112"}],
+            ),
+            "642",
+        )
+        self.assertEqual(
+            app.fast_apply_mapping_transform(
+                "material_type_from_inventory_account",
+                "331",
+                {},
+                [{"match_type": "default", "result": "99"}],
+            ),
+            "99",
+        )
+        self.assertEqual(
+            app.fast_mapping_rule_value(
+                {
+                    "source_type": "conditional_rules",
+                    "source_col": "B",
+                    "transform_rules": [
+                        {"match_type": "contains", "value": "dịch vụ", "result": "DV"},
+                        {"match_type": "default", "result": "VT"},
+                    ],
+                },
+                {"source_values": {"B": "Phí dịch vụ tháng 1"}},
+            ),
+            "DV",
+        )
+        self.assertEqual(
+            app.fast_mapping_rule_value(
+                {
+                    "source_type": "conditional_rules",
+                    "source_col": "C",
+                    "transform_rules": [{"match_type": "starts_with", "value": "HD", "result": "invoice"}],
+                },
+                {"source_values": {"C": "PX001"}},
+            ),
+            "PX001",
+        )
+        self.assertEqual(
+            app.fast_mapping_rule_value(
+                {
+                    "source_type": "if_rules",
+                    "transform_rules": [
+                        {"source_col": "B", "match_type": "starts_with", "value": "152", "result": "21"},
+                        {"match_type": "default", "result": "51"},
+                    ],
+                },
+                {"source_values": {"A": "Giữ giá trị gốc", "B": "1521"}},
+            ),
+            "21",
+        )
+        self.assertEqual(
+            app.fast_mapping_rule_value(
+                {
+                    "source_type": "if_rules",
+                    "source_col": "A",
+                    "transform_rules": [{"source_col": "B", "match_type": "starts_with", "value": "155", "result": "51"}],
+                },
+                {"source_values": {"A": "Giữ giá trị gốc", "B": "1521"}},
+            ),
+            "Giữ giá trị gốc",
+        )
+
+        self.assertEqual(
+            app.fast_mapping_rule_value(
+                {
+                    "source_type": "if_rules",
+                    "transform_rules": [{"source_col": "B", "match_type": "equals", "value": "OK", "result": "HD{A}"}],
+                },
+                {"source_values": {"A": "123", "B": "OK"}},
+            ),
+            "HD123",
+        )
+
+    def test_fast_import_splits_sales_duplicate_invoice_numbers_by_customer(self):
+        max_col = app.excel_col_to_index("AU") + 1
+        rows = [[""] * max_col for _ in range(4)]
+        for col, header in {
+            "C": "So HD",
+            "D": "Ngay HD",
+            "I": "Ten nguoi mua",
+            "J": "MST nguoi mua",
+            "L": "Ma VT",
+            "M": "Ten hang hoa",
+            "N": "DVT",
+            "O": "So luong",
+            "P": "Don gia",
+            "R": "Thue",
+            "V": "Tien hang",
+            "W": "Tien thue",
+            "AQ": "Ma ngoai te",
+            "AR": "Ty gia",
+            "AS": "TK vat tu",
+            "AT": "Ma kho",
+            "AU": "Ma khach hang",
+        }.items():
+            rows[1][app.excel_col_to_index(col)] = header
+
+        for row_index, customer_code, customer_mst, customer_name, ma_vt in [
+            (2, "KH-A", "010A", "Customer A", "A.HANG"),
+            (3, "KH-B", "010B", "Customer B", "B.HANG"),
+        ]:
+            for col, value in {
+                "C": "777",
+                "D": "20/01/2026",
+                "I": customer_name,
+                "J": customer_mst,
+                "L": ma_vt,
+                "M": f"Hang {customer_code}",
+                "N": "Cai",
+                "O": 1,
+                "P": 1000,
+                "R": 0.08,
+                "V": 1000,
+                "W": 80,
+                "AQ": "VND",
+                "AR": 1,
+                "AS": "155",
+                "AT": "KTP",
+                "AU": customer_code,
+            }.items():
+                rows[row_index][app.excel_col_to_index(col)] = value
+
+        sheets = app.fast_import_sheet_rows(None, app.pd.DataFrame(rows))
+        self.assertIn("Hoadonbanhang-1", sheets)
+        self.assertIn("Hoadonbanhang-2", sheets)
+        self.assertNotIn("Hoadonbanhang", sheets)
+        report_rows = sheets["Bao_cao_trung_so_ct"][1]
+        self.assertEqual(len(report_rows), 2)
+        self.assertEqual({row[0] for row in report_rows}, {"777"})
+        self.assertEqual({row[1] for row in report_rows}, {"KH-A", "KH-B"})
+
     def test_fast_import_validation_requires_inventory_columns(self):
         outputs = Path(__file__).parent / "outputs"
         outputs.mkdir(exist_ok=True)
@@ -2506,6 +2928,55 @@ class ProcessWorkbookTests(unittest.TestCase):
         finally:
             workbook.close()
             source.unlink(missing_ok=True)
+
+    def test_fast_import_generic_mapping_can_skip_inventory_requirement(self):
+        rows = [[""] * (app.excel_col_to_index("O") + 1) for _ in range(4)]
+        for col, header in {
+            "C": "Số HĐ",
+            "F": "Tên người bán",
+            "G": "MST người bán",
+            "L": "Mã VT",
+            "M": "Tên hàng",
+            "O": "Số lượng",
+        }.items():
+            rows[1][app.excel_col_to_index(col)] = header
+        for col, value in {
+            "C": "SP-001",
+            "F": "Công ty Sơn Phương Test",
+            "G": "010TEST",
+            "L": "SP.TEST",
+            "M": "Hàng test",
+            "O": 1,
+        }.items():
+            rows[2][app.excel_col_to_index(col)] = value
+
+        stream = app.fast_import_multi_sheet_workbook(
+            app.pd.DataFrame(rows),
+            None,
+            form_mapping_presets=[{
+                "id": "generic_form",
+                "label": "GenericForm",
+                "scope": "purchase",
+                "group_id": "materials",
+                "output_columns": [
+                    {"letter": "A", "header": "Mã khách hàng"},
+                    {"letter": "B", "header": "Mã VT"},
+                ],
+                "mappings": [
+                    {"target_col": "A", "source_col": "G", "source_phase": "purchase", "source_type": "source_column"},
+                    {"target_col": "B", "source_col": "L", "source_phase": "purchase", "source_type": "source_column"},
+                ],
+            }],
+            require_inventory_columns=False,
+        )
+        workbook = XlsWorkbookAdapter(stream.getvalue())
+        try:
+            self.assertIn("GenericForm", workbook.sheetnames)
+            sheet = workbook["GenericForm"]
+            self.assertEqual(sheet.cell(2, 1).value, "010TEST")
+            self.assertEqual(sheet.cell(2, 2).value, "SP.TEST")
+        finally:
+            workbook.close()
 
 
 

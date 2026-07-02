@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 import webbrowser
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +37,7 @@ from app import (
     activate_keygen_license,
     build_vietmax_ban_ra_purchase_matches,
     build_vietmax_khh_exact_purchase_matches,
+    default_vietmax_form_mapping_presets,
     apply_word_rules_to_words,
     cell,
     code_words,
@@ -49,12 +52,16 @@ from app import (
     make_excel_workbook,
     make_product_part,
     merge_price_ranges,
+    mixed_xls_workbook,
+    apply_product_code_replacement,
     normalize_config,
+    normalize_product_code_replacements,
     normalize_vietmax_comparison_scope,
     normalize_inventory_pair_rules,
     normalize_inventory_pairs,
     normalize_missing_mst_prefix_strategy,
     normalize_phrase_list,
+    normalize_vietmax_phase,
     normalized_header_label,
     openpyxl_workbook_to_xls_stream,
     preview_data,
@@ -68,9 +75,12 @@ from app import (
     sanitize_product_code,
     save_config,
     should_process_qty,
+    fast_import_sheet_rows,
+    fast_merge_mapping_forms,
     fast_import_multi_sheet_workbook,
     validate_vietmax_processed_purchase_workbook,
     validate_fast_import_processed_dataframe,
+    vietmax_default_source_columns,
     vietmax_ban_ra_match_key,
     vietmax_ban_ra_sales_products_from_workbook,
     vietmax_company_identity_key,
@@ -136,6 +146,41 @@ def keep_company_config_when_unloaded(payload: dict, profile_cfg: dict, payload_
     return profile_cfg.get(profile_key_name, default)
 
 
+def scoped_profile_config_from_profiles(profiles: dict, profile: str, phase: str):
+    profile = profile_key(profile)
+    phase = normalize_vietmax_phase(phase)
+    profile_cfg = profiles.get(profile) if isinstance(profiles, dict) else {}
+    profile_cfg = profile_cfg if isinstance(profile_cfg, dict) else {}
+    scopes = profile_cfg.get("scopes") if isinstance(profile_cfg.get("scopes"), dict) else {}
+    scoped = scopes.get(phase)
+    if isinstance(scoped, dict) and scoped:
+        return scoped
+    if profile == VIETMAX_PROFILE:
+        legacy_key = effective_processing_profile(profile, phase)
+        legacy_cfg = profiles.get(legacy_key) if isinstance(profiles, dict) else {}
+        if isinstance(legacy_cfg, dict) and legacy_cfg:
+            return legacy_cfg
+    return profile_cfg or empty_profile_config(profile)
+
+
+def scoped_profile_config(cfg: dict, profile: str, phase: str):
+    profiles = cfg.get("profiles", {}) if isinstance(cfg.get("profiles"), dict) else {}
+    return scoped_profile_config_from_profiles(profiles, profile, phase)
+
+
+def ensure_profile_scope(cfg: dict, profile: str, phase: str):
+    profile = profile_key(profile)
+    phase = normalize_vietmax_phase(phase)
+    cfg.setdefault("profiles", {}).setdefault(profile, empty_profile_config(profile))
+    root = cfg["profiles"].get(profile) or empty_profile_config(profile)
+    if not isinstance(root, dict):
+        root = empty_profile_config(profile)
+    root.setdefault("scopes", {})
+    root["scopes"].setdefault(phase, empty_profile_config(profile, include_scopes=False))
+    cfg["profiles"][profile] = root
+    return root, root["scopes"][phase]
+
+
 def normalize_prefix_strategy_values(raw):
     values = {strategy: {} for strategy in PREFIX_STRATEGIES}
     if not isinstance(raw, dict):
@@ -160,6 +205,7 @@ VIETMAX_CONFIG_PROFILE_KEYS = {
     "first_word_rules",
     "repeated_phrase_removals",
     "manual_code_overrides",
+    "product_code_replacements",
     "product_review_merges",
     "vietmax_mua_vao_internal_merges",
     "vietmax_ban_ra_sales_internal_merges",
@@ -175,6 +221,9 @@ VIETMAX_CONFIG_PROFILE_KEYS = {
     "prefix_name_chars",
     "prefix_missing_mst_strategy",
     "prefix_strategy_values",
+    "processing_groups",
+    "company_group_assignments",
+    "form_mapping_presets",
     "columns",
 }
 
@@ -206,11 +255,15 @@ def vietmax_profile_from_process_payload(payload: dict, phase: str) -> dict:
         "prefix_name_chars",
         "prefix_missing_mst_strategy",
         "prefix_strategy_values",
+        "processing_groups",
+        "company_group_assignments",
+        "form_mapping_presets",
         "columns",
         "word_rules",
         "first_word_rules",
         "repeated_phrase_removals",
         "manual_code_overrides",
+        "product_code_replacements",
         "product_review_merges",
         "inventory_pairs",
         "use_default_inventory_pair",
@@ -240,6 +293,8 @@ def vietmax_profile_from_process_payload(payload: dict, phase: str) -> dict:
         profile_cfg["inventory_pair_rules"] = normalize_inventory_pair_rules(profile_cfg.get("inventory_pair_rules") or [])
     if "repeated_phrase_removals" in profile_cfg:
         profile_cfg["repeated_phrase_removals"] = normalize_phrase_list(profile_cfg.get("repeated_phrase_removals") or [])
+    if "product_code_replacements" in profile_cfg:
+        profile_cfg["product_code_replacements"] = normalize_product_code_replacements(profile_cfg.get("product_code_replacements") or {})
     return profile_cfg
 
 
@@ -385,6 +440,7 @@ class GenericAnalyzeRequest(BaseModel):
     saved_name: str
     original_name: str = "output.xlsx"
     profile: str = "son_phuong"
+    vietmax_phase: str = VIETMAX_PHASE_PURCHASE
     company_col: str = "F"
     mst_col: str = "G"
     address_col: str = "H"
@@ -399,6 +455,7 @@ class GenericAnalyzeRequest(BaseModel):
 class GenericReviewRequest(BaseModel):
     saved_name: str
     profile: str = "son_phuong"
+    vietmax_phase: str = VIETMAX_PHASE_PURCHASE
     comparison_scope: str = VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES
     word_rules: dict[str, str] | None = None
     first_word_rules: dict[str, str] | None = None
@@ -412,6 +469,7 @@ class VietmaxProductPreviewRequest(BaseModel):
     products: list[str]
     word_rules: dict[str, str] | None = None
     repeated_phrase_removals: list[str] | None = None
+    product_code_replacements: dict[str, str] | None = None
 
 
 class GenericProductPreviewRequest(BaseModel):
@@ -420,6 +478,7 @@ class GenericProductPreviewRequest(BaseModel):
     word_rules: dict[str, str] | None = None
     first_word_rules: dict[str, str] | None = None
     repeated_phrase_removals: list[str] | None = None
+    product_code_replacements: dict[str, str] | None = None
 
 
 class VietmaxSalesMatchRequest(BaseModel):
@@ -444,8 +503,15 @@ class VietmaxProcessedFileStatsRequest(BaseModel):
 
 
 class VietmaxFastImportPackageRequest(BaseModel):
+    profile: str = VIETMAX_PROFILE
     purchase_saved_name: str = ""
     sales_saved_name: str = ""
+    purchase_original_saved_name: str = ""
+    sales_original_saved_name: str = ""
+    purchase_form_mapping_presets: list[dict] | None = None
+    sales_form_mapping_presets: list[dict] | None = None
+    purchase_company_group_assignments: dict | None = None
+    sales_company_group_assignments: dict | None = None
     operation_id: str = ""
 
 
@@ -531,6 +597,12 @@ def create_app() -> FastAPI:
 
     @api.post("/api/config")
     def set_config(payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            payload = {}
+        if "license" not in payload:
+            current = load_config()
+            payload = dict(payload)
+            payload["license"] = current.get("license") or {}
         return save_config(payload)
 
     @api.post("/api/config/profile/{profile}")
@@ -666,6 +738,16 @@ def create_app() -> FastAPI:
     async def mapping(file: UploadFile = File(...)) -> dict:
         return await upload_excel(file)
 
+    @api.get("/api/vietmax/format-mapping-defaults")
+    def vietmax_format_mapping_defaults() -> dict:
+        return json_safe({
+            "source_columns": {
+                "purchase": vietmax_default_source_columns(VIETMAX_PHASE_PURCHASE),
+                "sales": vietmax_default_source_columns(VIETMAX_PHASE_SALES),
+            },
+            "form_mapping_presets": default_vietmax_form_mapping_presets(),
+        })
+
     @api.post("/api/invoice_statuses")
     def invoice_statuses(payload: dict) -> dict:
         path = uploaded_path(str(payload.get("saved_name", "")))
@@ -685,7 +767,7 @@ def create_app() -> FastAPI:
         path = uploaded_path(payload.saved_name)
         profile = profile_key(payload.profile)
         cfg = load_config()
-        profile_cfg = (cfg.get("profiles") or {}).get(profile) or empty_profile_config(profile)
+        profile_cfg = scoped_profile_config(cfg, profile, payload.vietmax_phase)
         try:
             result = analyze(
                 path,
@@ -713,6 +795,7 @@ def create_app() -> FastAPI:
             "original_name": payload.original_name,
             "saved_name": payload.saved_name,
             "manual_code_overrides": profile_cfg.get("manual_code_overrides") or {},
+            "product_code_replacements": profile_cfg.get("product_code_replacements") or {},
             "word_rules": profile_cfg.get("word_rules") or {},
             "first_word_rules": profile_cfg.get("first_word_rules") or {},
             "repeated_phrase_removals": profile_cfg.get("repeated_phrase_removals") or [],
@@ -727,6 +810,9 @@ def create_app() -> FastAPI:
             "prefix_name_chars": profile_cfg.get("prefix_name_chars") or 1,
             "prefix_missing_mst_strategy": profile_cfg.get("prefix_missing_mst_strategy") or "all_name_words",
             "prefix_strategy_values": profile_cfg.get("prefix_strategy_values") or {},
+            "processing_groups": profile_cfg.get("processing_groups") or [],
+            "company_group_assignments": profile_cfg.get("company_group_assignments") or {},
+            "form_mapping_presets": profile_cfg.get("form_mapping_presets") or [],
             "product_review_merges": profile_cfg.get("product_review_merges") or [],
             "price_range_rules": profile_cfg.get("price_range_rules") or {},
             "price_adjust_all_percent": profile_cfg.get("price_adjust_all_percent") or 0,
@@ -798,7 +884,7 @@ def create_app() -> FastAPI:
                 comparison_scope=payload.comparison_scope,
                 progress_callback=progress,
             )
-            profile_cfg = (load_config().get("profiles") or {}).get(profile) or {}
+            profile_cfg = scoped_profile_config(load_config(), profile, payload.vietmax_phase)
             rows = apply_saved_review_choices(rows, profile_cfg.get("product_review_merges") or [], payload.comparison_scope)
         except Exception as exc:
             update_progress_job(operation_id, 1, 1, str(exc), status="error")
@@ -832,6 +918,7 @@ def create_app() -> FastAPI:
                 company["process"] = process
                 company["pending_process"] = process
             result["manual_code_overrides"] = profile_cfg.get("manual_code_overrides") or {}
+            result["product_code_replacements"] = profile_cfg.get("product_code_replacements") or {}
             result["word_rules"] = profile_cfg.get("word_rules") or {}
             result["repeated_phrase_removals"] = profile_cfg.get("repeated_phrase_removals") or []
             result["inventory_pairs"] = profile_cfg.get("inventory_pairs") or []
@@ -848,6 +935,9 @@ def create_app() -> FastAPI:
             result["prefix_name_chars"] = profile_cfg.get("prefix_name_chars") or 1
             result["prefix_missing_mst_strategy"] = profile_cfg.get("prefix_missing_mst_strategy") or "all_name_words"
             result["prefix_strategy_values"] = profile_cfg.get("prefix_strategy_values") or {}
+            result["processing_groups"] = profile_cfg.get("processing_groups") or []
+            result["company_group_assignments"] = profile_cfg.get("company_group_assignments") or {}
+            result["form_mapping_presets"] = profile_cfg.get("form_mapping_presets") or []
             return json_safe(result)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -869,21 +959,29 @@ def create_app() -> FastAPI:
         )
 
     @api.post("/api/process")
-    def process_generic(payload: dict) -> Response:
+    def process_generic(payload: dict):
         saved_name = str(payload.get("saved_name", ""))
         original_name = str(payload.get("original_name") or "output.xlsx")
         path = uploaded_path(saved_name)
         process_payload = dict(payload)
+        operation_id = raw_text(process_payload.get("operation_id"))
+        cache_only = bool(process_payload.get("cache_only"))
+        started_at = time.perf_counter()
+        update_progress_job(operation_id, 0, 5, "Đang chuẩn bị tạo file", status="running")
+
+        def progress(done: int, total: int, label: str) -> None:
+            update_progress_job(operation_id, done, total, label, status="running")
+
         try:
             out = resolve_output_path(original_name, "")
-            process_workbook(path, out, process_payload)
+            processed_df = process_workbook(path, out, process_payload, progress_callback=progress)
             cfg = load_config()
             profile = profile_key(process_payload.get("profile", cfg.get("selected_profile", "son_phuong")))
-            storage_profile = effective_processing_profile(profile, process_payload.get("vietmax_phase")) if profile == VIETMAX_PROFILE else profile
-            uses_price_rules = storage_profile == "cao_thanh"
+            phase = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
+            uses_price_rules = profile == "cao_thanh"
             cfg["selected_profile"] = profile
-            cfg.setdefault("profiles", {}).setdefault(storage_profile, empty_profile_config(storage_profile))
-            old_profile = cfg["profiles"].get(storage_profile) or empty_profile_config(storage_profile)
+            _, profile_cfg = ensure_profile_scope(cfg, profile, phase)
+            old_profile = profile_cfg or empty_profile_config(profile, include_scopes=False)
             merged_price_ranges = merge_price_ranges(old_profile.get("price_range_rules"), process_payload.get("price_range_rules", {})) if uses_price_rules else {}
             columns = {
                 "company_col": process_payload.get("company_col", ""),
@@ -897,7 +995,7 @@ def create_app() -> FastAPI:
                 "invoice_status_skip_values": process_payload.get("invoice_status_skip_values", DEFAULT_INVOICE_STATUS_SKIP_VALUES),
             }
             cfg.setdefault("columns", {}).update(columns)
-            cfg["profiles"][storage_profile].update({
+            profile_cfg.update({
                 "prefixes": keep_company_config_when_unloaded(process_payload, old_profile, "prefixes", "prefixes", {}),
                 "selected_products": keep_company_config_when_unloaded(process_payload, old_profile, "skipped_products_map", "selected_products", {}),
                 "removed_companies": keep_company_config_when_unloaded(process_payload, old_profile, "removed_companies", "removed_companies", {}),
@@ -908,6 +1006,7 @@ def create_app() -> FastAPI:
                 "price_range_rules": merged_price_ranges,
                 "price_adjust_all_percent": float(process_payload.get("price_adjust_all_percent") or 0) if uses_price_rules else 0,
                 "manual_code_overrides": keep_company_config_when_unloaded(process_payload, old_profile, "manual_code_overrides", "manual_code_overrides", {}),
+                "product_code_replacements": normalize_product_code_replacements(keep_existing_when_empty(process_payload, old_profile, "product_code_replacements", {})),
                 "product_review_merges": process_payload.get("product_review_merges", old_profile.get("product_review_merges", [])),
                 "vietmax_mua_vao_internal_merges": process_payload.get("vietmax_mua_vao_internal_merges", old_profile.get("vietmax_mua_vao_internal_merges", [])),
                 "vietmax_ban_ra_sales_internal_merges": process_payload.get("vietmax_ban_ra_sales_internal_merges", old_profile.get("vietmax_ban_ra_sales_internal_merges", [])),
@@ -922,11 +1021,49 @@ def create_app() -> FastAPI:
                 "prefix_name_chars": process_payload.get("prefix_name_chars", old_profile.get("prefix_name_chars", 1)),
                 "prefix_missing_mst_strategy": normalize_missing_mst_prefix_strategy(process_payload.get("prefix_missing_mst_strategy", old_profile.get("prefix_missing_mst_strategy", "all_name_words"))),
                 "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(process_payload, old_profile, "prefix_strategy_values", "prefix_strategy_values", {})),
+                "processing_groups": keep_existing_when_empty(process_payload, old_profile, "processing_groups", []),
+                "company_group_assignments": keep_company_config_when_unloaded(process_payload, old_profile, "company_group_assignments", "company_group_assignments", {}),
+                "form_mapping_presets": keep_existing_when_empty(process_payload, old_profile, "form_mapping_presets", []),
                 "columns": columns,
             })
             save_config(cfg)
+            if process_payload.get("export_form_mappings"):
+                progress(3, 5, "Đang dựng workbook form mapping từ FDI đã xử lý")
+                input_phase = generic_profile_form_input_phase(profile)
+                form_mapping_presets = (
+                    process_payload.get("form_mapping_presets")
+                    or profile_cfg.get("form_mapping_presets")
+                    or default_vietmax_form_mapping_presets(input_phase)
+                )
+                final_stream = generic_form_mapping_export_workbook_stream(
+                    processed_df,
+                    form_mapping_presets=form_mapping_presets,
+                    company_group_assignments=process_payload.get("company_group_assignments") or profile_cfg.get("company_group_assignments"),
+                    profile=profile,
+                    progress_callback=progress,
+                )
+                safe_stem = re.sub(r'[^A-Za-z0-9_.-]+', "_", Path(original_name or out.name).stem).strip("._") or "ket_qua"
+                filename = f"{safe_stem}_fast.xls"
+                if cache_only:
+                    cached_saved_name = cache_workbook_stream(final_stream, f"{profile}_fast")
+                    update_progress_job(operation_id, 5, 5, "Đã cache workbook form mapping", status="complete")
+                    diagnostic_log(f"generic/process cache complete operation={operation_id or '-'} profile={profile} elapsed={time.perf_counter() - started_at:.2f}s saved={cached_saved_name}")
+                    return {"processedSavedName": cached_saved_name}
+                update_progress_job(operation_id, 5, 5, "Đã tạo workbook form mapping", status="complete")
+                return Response(
+                    final_stream.getvalue(),
+                    media_type=XLS_MEDIA_TYPE,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
+            if cache_only:
+                cached_saved_name = cache_processed_workbook(out)
+                update_progress_job(operation_id, 5, 5, "Đã cache file kết quả", status="complete")
+                diagnostic_log(f"generic/process cache complete operation={operation_id or '-'} profile={profile} elapsed={time.perf_counter() - started_at:.2f}s saved={cached_saved_name}")
+                return {"processedSavedName": cached_saved_name}
         except Exception as exc:
+            update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        update_progress_job(operation_id, 5, 5, "Đã tạo file kết quả", status="complete")
         return Response(
             out.read_bytes(),
             media_type=XLS_MEDIA_TYPE,
@@ -938,11 +1075,12 @@ def create_app() -> FastAPI:
         profile = "vietmax_ban_ra" if payload.phase == VIETMAX_PHASE_SALES else "vietmax_mua_vao"
         word_rules = payload.word_rules or {}
         repeated = payload.repeated_phrase_removals or []
+        replacements = normalize_product_code_replacements(payload.product_code_replacements or {})
         codes = {}
         for product in payload.products:
             name = raw_text(product)
             if name:
-                codes[name] = sanitize_product_code(make_product_part(profile, name, word_rules, repeated_phrase_removals=repeated))
+                codes[name] = apply_product_code_replacement(make_product_part(profile, name, word_rules, repeated_phrase_removals=repeated), replacements)
         return {"codes": codes}
 
     @api.post("/api/product-preview")
@@ -951,12 +1089,43 @@ def create_app() -> FastAPI:
         word_rules = payload.word_rules or {}
         first_word_rules = payload.first_word_rules or {}
         repeated = payload.repeated_phrase_removals or []
+        replacements = normalize_product_code_replacements(payload.product_code_replacements or {})
         codes = {}
         for product in payload.products:
             name = raw_text(product)
             if name:
-                codes[name] = sanitize_product_code(make_product_part(profile, name, word_rules, first_word_rules, repeated))
+                codes[name] = apply_product_code_replacement(make_product_part(profile, name, word_rules, first_word_rules, repeated), replacements)
         return {"codes": codes}
+
+    @api.post("/api/product-code-replacements/import")
+    async def import_product_code_replacements(file: UploadFile = File(...)) -> dict:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="File import đang trống.")
+        try:
+            workbook_content = uploaded_workbook_content_for_openpyxl(content, file.filename)
+            df = pd.read_excel(BytesIO(workbook_content), sheet_name=0, header=None, dtype=object, engine="openpyxl")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Không đọc được file import đổi mã VT: {exc}") from exc
+        replacements: dict[str, str] = {}
+        skipped_header = False
+        for _, row in df.iterrows():
+            old_raw = raw_text(row.iloc[0]) if len(row) > 0 else ""
+            new_raw = raw_text(row.iloc[1]) if len(row) > 1 else ""
+            old_norm = re.sub(r"\s+", " ", raw_text(old_raw)).strip().lower()
+            new_norm = re.sub(r"\s+", " ", raw_text(new_raw)).strip().lower()
+            if not skipped_header and (
+                ("gốc" in old_norm or "goc" in old_norm or "old" in old_norm or "original" in old_norm)
+                and ("mới" in new_norm or "moi" in new_norm or "new" in new_norm)
+            ):
+                skipped_header = True
+                continue
+            old_code = sanitize_product_code(old_raw)
+            new_code = sanitize_product_code(new_raw)
+            if old_code and new_code:
+                replacements[old_code] = new_code
+        normalized = normalize_product_code_replacements(replacements)
+        return {"product_code_replacements": normalized, "count": len(normalized)}
 
     @api.post("/api/vietmax/sales-match")
     def vietmax_sales_match(payload: VietmaxSalesMatchRequest) -> dict:
@@ -1046,10 +1215,28 @@ def create_app() -> FastAPI:
             if purchase_df is None and sales_df is None:
                 raise ValueError("Cần có ít nhất một file FDI đã xử lý để tạo file import.")
 
+            cfg = load_config()
+            profiles = cfg.get("profiles", {}) if isinstance(cfg.get("profiles"), dict) else {}
+            profile = profile_key(payload.profile)
+            purchase_profile = scoped_profile_config_from_profiles(profiles, profile, VIETMAX_PHASE_PURCHASE)
+            sales_profile = scoped_profile_config_from_profiles(profiles, profile, VIETMAX_PHASE_SALES)
+            purchase_forms = payload.purchase_form_mapping_presets if payload.purchase_form_mapping_presets is not None else purchase_profile.get("form_mapping_presets")
+            sales_forms = payload.sales_form_mapping_presets if payload.sales_form_mapping_presets is not None else sales_profile.get("form_mapping_presets")
+            form_mapping_presets = fast_merge_mapping_forms(purchase_forms, sales_forms)
+            purchase_assignments = payload.purchase_company_group_assignments if payload.purchase_company_group_assignments is not None else purchase_profile.get("company_group_assignments")
+            sales_assignments = payload.sales_company_group_assignments if payload.sales_company_group_assignments is not None else sales_profile.get("company_group_assignments")
+
             def progress(done, total, label):
                 update_progress_job(operation_id, done, total, label, status="running")
 
-            stream = fast_import_multi_sheet_workbook(purchase_df, sales_df, progress_callback=progress)
+            stream = fast_import_multi_sheet_workbook(
+                purchase_df,
+                sales_df,
+                progress_callback=progress,
+                form_mapping_presets=form_mapping_presets,
+                purchase_company_group_assignments=purchase_assignments,
+                sales_company_group_assignments=sales_assignments,
+            )
         except Exception as exc:
             diagnostic_log(
                 "vietmax/process error "
@@ -1095,11 +1282,10 @@ def create_app() -> FastAPI:
     def save_vietmax_config(payload: dict) -> dict:
         cfg = load_config()
         profile = profile_key(payload.get("profile") or VIETMAX_PROFILE)
-        storage_profile = effective_processing_profile(profile, payload.get("vietmax_phase")) if profile == VIETMAX_PROFILE else profile
+        phase = normalize_vietmax_phase(payload.get("vietmax_phase"))
         cfg["selected_profile"] = profile
         cfg.setdefault("columns", {}).update(payload.get("columns") or {})
-        cfg.setdefault("profiles", {}).setdefault(storage_profile, empty_profile_config(storage_profile))
-        profile_cfg = cfg["profiles"].get(storage_profile) or empty_profile_config(storage_profile)
+        _, profile_cfg = ensure_profile_scope(cfg, profile, phase)
         profile_cfg.update({
             "prefixes": keep_company_config_when_unloaded(payload, profile_cfg, "prefixes", "prefixes", {}),
             "selected_products": keep_company_config_when_unloaded(payload, profile_cfg, "skipped_products_map", "selected_products", {}),
@@ -1111,23 +1297,26 @@ def create_app() -> FastAPI:
             "prefix_name_chars": payload.get("prefix_name_chars", profile_cfg.get("prefix_name_chars", 1)),
             "prefix_missing_mst_strategy": normalize_missing_mst_prefix_strategy(payload.get("prefix_missing_mst_strategy", profile_cfg.get("prefix_missing_mst_strategy", "all_name_words"))),
             "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(payload, profile_cfg, "prefix_strategy_values", "prefix_strategy_values", {})),
+            "processing_groups": keep_existing_when_empty(payload, profile_cfg, "processing_groups", []),
+            "company_group_assignments": keep_company_config_when_unloaded(payload, profile_cfg, "company_group_assignments", "company_group_assignments", {}),
+            "form_mapping_presets": keep_existing_when_empty(payload, profile_cfg, "form_mapping_presets", []),
             "columns": payload.get("columns", {}),
             "word_rules": keep_existing_when_empty(payload, profile_cfg, "word_rules", {}),
             "first_word_rules": keep_existing_when_empty(payload, profile_cfg, "first_word_rules", {}),
             "repeated_phrase_removals": normalize_phrase_list(keep_existing_when_empty(payload, profile_cfg, "repeated_phrase_removals", [])),
             "manual_code_overrides": keep_company_config_when_unloaded(payload, profile_cfg, "manual_code_overrides", "manual_code_overrides", {}),
+            "product_code_replacements": normalize_product_code_replacements(keep_existing_when_empty(payload, profile_cfg, "product_code_replacements", {})),
             "product_review_merges": payload.get("product_review_merges", profile_cfg.get("product_review_merges", [])),
             "vietmax_mua_vao_internal_merges": payload.get("vietmax_mua_vao_internal_merges", profile_cfg.get("vietmax_mua_vao_internal_merges", [])),
             "vietmax_ban_ra_sales_internal_merges": payload.get("vietmax_ban_ra_sales_internal_merges", profile_cfg.get("vietmax_ban_ra_sales_internal_merges", [])),
             "vietmax_ban_ra_purchase_match_rules": payload.get("vietmax_ban_ra_purchase_match_rules", profile_cfg.get("vietmax_ban_ra_purchase_match_rules", [])),
-            "price_range_rules": merge_price_ranges(profile_cfg.get("price_range_rules"), payload.get("price_range_rules", {})) if storage_profile == "cao_thanh" else profile_cfg.get("price_range_rules", {}),
-            "price_adjust_all_percent": float(payload.get("price_adjust_all_percent", profile_cfg.get("price_adjust_all_percent", 0)) or 0) if storage_profile == "cao_thanh" else profile_cfg.get("price_adjust_all_percent", 0),
+            "price_range_rules": merge_price_ranges(profile_cfg.get("price_range_rules"), payload.get("price_range_rules", {})) if profile == "cao_thanh" else profile_cfg.get("price_range_rules", {}),
+            "price_adjust_all_percent": float(payload.get("price_adjust_all_percent", profile_cfg.get("price_adjust_all_percent", 0)) or 0) if profile == "cao_thanh" else profile_cfg.get("price_adjust_all_percent", 0),
             "inventory_pairs": normalize_inventory_pairs(keep_existing_when_empty(payload, profile_cfg, "inventory_pairs", [])),
             "use_default_inventory_pair": bool(payload.get("use_default_inventory_pair", profile_cfg.get("use_default_inventory_pair", False))),
             "default_inventory_pair_id": str(payload.get("default_inventory_pair_id", profile_cfg.get("default_inventory_pair_id", "")) or "").strip(),
             "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(payload, profile_cfg, "inventory_pair_rules", [])),
         })
-        cfg["profiles"][storage_profile] = profile_cfg
         return save_config(cfg)
 
     @api.post("/api/vietmax/import-config/{phase}")
@@ -1169,8 +1358,7 @@ def create_app() -> FastAPI:
             processed_purchase_saved_name = raw_text(process_payload.get("vietmax_processed_purchase_saved_name"))
             if process_payload.get("vietmax_phase") == VIETMAX_PHASE_SALES and not process_payload.get("vietmax_ban_ra_purchase_match_rules"):
                 profile = profile_key(process_payload.get("profile") or VIETMAX_PROFILE)
-                storage_profile = effective_processing_profile(profile, process_payload.get("vietmax_phase")) if profile == VIETMAX_PROFILE else profile
-                profile_cfg = (load_config().get("profiles", {}).get(storage_profile, {}) or {})
+                profile_cfg = scoped_profile_config(load_config(), profile, process_payload.get("vietmax_phase"))
                 saved_match_rules = profile_cfg.get("vietmax_ban_ra_purchase_match_rules") or []
                 if saved_match_rules:
                     process_payload["vietmax_ban_ra_purchase_match_rules"] = saved_match_rules
@@ -1310,8 +1498,7 @@ def create_app() -> FastAPI:
 
 def vietmax_profile_config(phase: str) -> dict:
     cfg = load_config()
-    storage_profile = effective_processing_profile(VIETMAX_PROFILE, phase)
-    return dict((cfg.get("profiles") or {}).get(storage_profile) or empty_profile_config(storage_profile))
+    return dict(scoped_profile_config(cfg, VIETMAX_PROFILE, phase))
 
 
 def workbook_summary(df, original_name: str, saved_name: str) -> dict:
@@ -1425,6 +1612,81 @@ def cache_workbook_stream(stream, prefix="processed") -> str:
     return saved_name
 
 
+def dataframe_raw_rows(df: pd.DataFrame) -> list[list]:
+    return [
+        [cell(df, row_index, col_index) for col_index in range(df.shape[1])]
+        for row_index in range(len(df))
+    ]
+
+
+def generic_profile_form_input_phase(profile):
+    return VIETMAX_PHASE_SALES if profile_key(profile) == "cao_thanh" else VIETMAX_PHASE_PURCHASE
+
+
+def form_scope_matches_available_phase(form, available_phase):
+    scope = raw_text(form.get("scope") or form.get("input_phase") or "both")
+    return scope in {"", "both", available_phase}
+
+
+def single_phase_form_presets(forms, available_phase):
+    source_forms = forms or default_vietmax_form_mapping_presets(available_phase)
+    result = []
+    for form in source_forms:
+        if not isinstance(form, dict) or form.get("enabled") is False:
+            continue
+        if not form_scope_matches_available_phase(form, available_phase):
+            continue
+        next_form = dict(form)
+        next_form["scope"] = available_phase if raw_text(next_form.get("scope")) in {"", "both"} else raw_text(next_form.get("scope"))
+        next_form["input_phase"] = available_phase if raw_text(next_form.get("input_phase")) in {"", "both"} else raw_text(next_form.get("input_phase"))
+        mappings = []
+        for rule in next_form.get("mappings") or []:
+            if not isinstance(rule, dict):
+                continue
+            source_phase = raw_text(rule.get("source_phase") or available_phase)
+            if source_phase not in {"", "both", available_phase}:
+                continue
+            next_rule = dict(rule)
+            if source_phase in {"", "both"}:
+                next_rule["source_phase"] = available_phase
+            mappings.append(next_rule)
+        next_form["mappings"] = mappings
+        result.append(next_form)
+    return result
+
+
+def generic_form_mapping_export_workbook_stream(processed_df, form_mapping_presets, company_group_assignments, profile, progress_callback=None):
+    def progress(done, total, label):
+        if progress_callback:
+            progress_callback(done, total, label)
+
+    available_phase = generic_profile_form_input_phase(profile)
+    forms = single_phase_form_presets(form_mapping_presets, available_phase)
+    progress(1, 4, "Đang chuẩn bị sheet FDI đã xử lý")
+    raw_sheets = [("FDI_da_xu_ly", dataframe_raw_rows(processed_df))]
+    progress(2, 4, "Đang dựng các sheet form mapping")
+    purchase_df = processed_df if available_phase == VIETMAX_PHASE_PURCHASE else None
+    sales_df = processed_df if available_phase == VIETMAX_PHASE_SALES else None
+    purchase_assignments = company_group_assignments if available_phase == VIETMAX_PHASE_PURCHASE else None
+    sales_assignments = company_group_assignments if available_phase == VIETMAX_PHASE_SALES else None
+    form_sheets = fast_import_sheet_rows(
+        purchase_df,
+        sales_df,
+        progress_callback=None,
+        form_mapping_presets=forms,
+        purchase_company_group_assignments=purchase_assignments,
+        sales_company_group_assignments=sales_assignments,
+        require_inventory_columns=False,
+        include_duplicate_report=False,
+        use_default_forms_when_empty=False,
+    )
+    tabular_sheets = dict(form_sheets)
+    if not tabular_sheets:
+        raise ValueError("Chưa có form mapping nào đang hoạt động để xuất file.")
+    progress(4, 4, "Đang đóng gói workbook form mapping")
+    return mixed_xls_workbook(raw_sheets=raw_sheets, tabular_sheets=tabular_sheets)
+
+
 def cleanup_progress_jobs(now=None):
     now = now or time.time()
     expired = [key for key, value in PROGRESS_JOBS.items() if now - float(value.get("updated_at", now)) > PROGRESS_TTL_SECONDS]
@@ -1516,9 +1778,9 @@ def enrich_generic_review_products(products, profile: str, payload: GenericRevie
     enriched = []
     for item in products or []:
         row = dict(item)
-        product = raw_text(row.get("purchase_product") or row.get("product") or row.get("name"))
-        company = raw_text(row.get("purchase_company") or row.get("company"))
-        mst = raw_text(row.get("purchase_mst") or row.get("mst"))
+        product = raw_text(row.get("purchase_product") or row.get("sales_product") or row.get("product") or row.get("name"))
+        company = raw_text(row.get("purchase_company") or row.get("sales_company") or row.get("company"))
+        mst = raw_text(row.get("purchase_mst") or row.get("sales_mst") or row.get("mst"))
         review_words = remove_repeated_phrases(code_words(product), repeated)
         if word_rules:
             review_words = apply_word_rules_to_words(review_words, word_rules)
