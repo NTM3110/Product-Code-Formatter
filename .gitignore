@@ -33,6 +33,8 @@ frontend/.angular/
 build/
 dist/
 deploy/
+.pyinstaller_tmp/
+*/.pyinstaller_tmp/
 *.exe
 *.dll
 *.pyd
@@ -87,6 +89,7 @@ test_vietmax_codes.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+~$*
 .idea/
 .vscode/*
 !.vscode/settings.json
