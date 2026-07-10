@@ -174,6 +174,11 @@ th { position: sticky; top: 0; z-index: 1; background: var(--color-table-head); 
 .status-strip { display: flex; align-items: center; gap: 4px; min-height: 24px; margin: 0; overflow: hidden; font-size: .88rem; line-height: 1.35; }
 .status-strip strong { flex: 0 0 auto; }
 .status-strip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-strip.status-warning { gap: 7px; min-height: 30px; padding: 4px 10px; border: 1px solid #f1c46f; border-radius: 10px; background: #fff5d9; color: #8a5a00; }
+.status-strip.status-warning strong,
+.status-strip.status-warning span { color: #8a5a00; }
+.status-strip.status-warning > span:last-child { white-space: normal; }
+.status-icon { flex: 0 0 auto; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 999px; background: #f4a62a; color: white; font-size: .8rem; font-weight: 900; }
 .license-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--color-line); border-radius: 12px; background: var(--color-surface-soft); }
 .license-bar > div:first-child { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
 .license-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -283,6 +288,38 @@ th { position: sticky; top: 0; z-index: 1; background: var(--color-table-head); 
 .company-table { min-width: 760px; }
 .company-table th:first-child, .company-table td:first-child { width: 58px; text-align: center; }
 .company-prefix-input, .code-edit { width: 100%; min-width: 120px; padding: .45rem .55rem; border-radius: 8px; }
+.company-list-card .company-table-scroll { overflow-x: hidden; }
+.company-list-card .grouped-company-table { width: 100%; min-width: 0; table-layout: fixed; }
+.company-list-card .grouped-company-table th,
+.company-list-card .grouped-company-table td { padding: 8px 7px; font-size: .82rem; line-height: 1.25; }
+.company-list-card .grouped-company-table th:first-child,
+.company-list-card .grouped-company-table td:first-child { width: 122px; text-align: left; }
+.company-list-card .grouped-company-table th:nth-child(2),
+.company-list-card .grouped-company-table td:nth-child(2) { width: auto; }
+.company-list-card .grouped-company-table th:nth-child(3),
+.company-list-card .grouped-company-table td:nth-child(3) { width: 96px; }
+.company-list-card .grouped-company-table th:last-child,
+.company-list-card .grouped-company-table td:last-child { width: 58px; text-align: center; white-space: nowrap; }
+.company-list-card .grouped-company-table.has-prefix-column th:first-child,
+.company-list-card .grouped-company-table.has-prefix-column td:first-child { width: 116px; }
+.company-list-card .grouped-company-table.has-prefix-column th:nth-child(3),
+.company-list-card .grouped-company-table.has-prefix-column td:nth-child(3) { width: 94px; }
+.company-list-card .grouped-company-table.has-prefix-column th:nth-child(4),
+.company-list-card .grouped-company-table.has-prefix-column td:nth-child(4) { width: 86px; }
+.company-list-card .grouped-company-table.has-prefix-column th:last-child,
+.company-list-card .grouped-company-table.has-prefix-column td:last-child { width: 54px; }
+.company-list-card .grouped-company-table select { width: 100%; min-width: 0; padding: .42rem .45rem; border-radius: 9px; }
+.company-list-card .company-name-cell { overflow-wrap: anywhere; word-break: normal; }
+.company-list-card .company-mst-cell { overflow-wrap: anywhere; font-size: .78rem; }
+.company-list-card .company-prefix-input { width: 100%; min-width: 0; padding: .42rem .46rem; text-align: center; font-weight: 900; }
+.product-list-card .product-table { table-layout: fixed; width: 100%; min-width: 0; }
+.product-list-card .product-table th:first-child,
+.product-list-card .product-table td:first-child { width: 64px; }
+.product-list-card .product-table th:nth-child(2),
+.product-list-card .product-table td:nth-child(2) { width: 38%; }
+.product-list-card .product-table th:nth-child(3),
+.product-list-card .product-table td:nth-child(3) { width: 70px; text-align: center; }
+.product-list-card .product-name-cell { overflow-wrap: anywhere; font-size: .84rem; line-height: 1.25; }
 .company-section-row td { position: sticky; top: 0; z-index: 2; padding: 8px 10px; font-weight: 900; color: var(--color-text); background: var(--color-surface); }
 .company-section-row.missing-mst-section td, .missing-mst-company-row td { background: #fff8e8; }
 .company-section-row.missing-mst-section td { color: #9a5f00; }

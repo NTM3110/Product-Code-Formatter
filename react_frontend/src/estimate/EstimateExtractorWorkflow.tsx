@@ -7,7 +7,7 @@ type Props = {
   licenseReady: boolean;
   onStatus: (message: string) => void;
   stage: StageId;
-  onStageChange: (stage: StageId) => void;
+  onStageChange: (stage: StageId) => void | Promise<void>;
 };
 
 type WarningSection = {
@@ -353,7 +353,7 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
       const nextSelection = buildInitialSelection(nextSummary);
       setSummary(nextSummary);
       setSheetSelection(nextSelection);
-      onStageChange(2);
+      void onStageChange(2);
       onStatus(`Đã đọc ${file.name}. Chọn sheet Dự thầu và Chiết tính trước khi phân tích.`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -378,7 +378,7 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
     try {
       const nextAnalysis = await analyzeEstimateWorkbook(summary.saved_name, sheetSelection);
       setAnalysis(nextAnalysis);
-      onStageChange(3);
+      void onStageChange(3);
       const count = warningCount(nextAnalysis);
       onStatus(count ? `Đã phân tích. Có ${count.toLocaleString('en-US')} cảnh báo cần xem trước khi xuất.` : 'Đã phân tích. Không có cảnh báo lớn.');
     } catch (err) {
@@ -447,7 +447,7 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
                 Đổi file
                 <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy || !licenseReady} onChange={(event) => void handleUpload(event.currentTarget.files?.[0] || null)} />
               </label>
-              {stage !== 2 && <button type="button" className="btn-secondary" disabled={busy || !licenseReady} onClick={() => onStageChange(2)}>Chọn lại sheet</button>}
+              {stage !== 2 && <button type="button" className="btn-secondary" disabled={busy || !licenseReady} onClick={() => void onStageChange(2)}>Chọn lại sheet</button>}
               {stage === 3 && <button type="button" className="btn-secondary" disabled={busy || !licenseReady} onClick={() => void refreshAnalysis()}>Phân tích lại</button>}
               {stage === 3 && <button type="button" disabled={!canExport} onClick={() => void exportWorkbook()}>{busy ? 'Đang xử lý...' : 'Xuất file bóc tách'}</button>}
             </div>

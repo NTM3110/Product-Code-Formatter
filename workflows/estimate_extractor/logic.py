@@ -98,6 +98,7 @@ class ThvtRow:
     name: str
     unit: str
     norm: float
+    coef: float
     bid_qty: float
     total_qty: float
     unit_price: float
@@ -135,6 +136,7 @@ class ThvtRow:
             "name": self.name,
             "unit": self.unit,
             "norm": self.norm,
+            "coef": self.coef,
             "bid_qty": self.bid_qty,
             "total_qty": self.total_qty,
             "unit_price": self.unit_price,
@@ -960,10 +962,27 @@ def _detail_material_unit_price(sheet, row: int, columns: SheetColumns) -> float
     return _number(_cell(sheet, row, columns.price))
 
 
+def _detail_coef(sheet, row: int, columns: SheetColumns) -> float:
+    if columns.coef is None:
+        return 1.0
+    raw = _cell(sheet, row, columns.coef)
+    if _text(raw) == "":
+        return 1.0
+    return _number(raw)
+
+
 def _detail_material_total_qty(sheet, row: int, columns: SheetColumns, bid_qty: float, detail_qty: float, norm: float, coef: float) -> float:
     if _is_other_material_row(sheet, row, columns):
         return bid_qty
     return norm * detail_qty * coef
+
+
+def _detail_material_amount(sheet, row: int, columns: SheetColumns, detail_qty: float, total_qty: float, unit_price: float) -> float:
+    if _is_other_material_row(sheet, row, columns):
+        return total_qty * unit_price
+    if columns.amount is not None:
+        return _number(_cell(sheet, row, columns.amount)) * detail_qty
+    return total_qty * unit_price
 
 
 def _generate_thvt_rows(bid_sheet, bid_rows, bid_cols, detail_sheet, detail_blocks, detail_cols, bid_multipliers=None) -> list[ThvtRow]:
@@ -988,11 +1007,10 @@ def _generate_thvt_rows(bid_sheet, bid_rows, bid_cols, detail_sheet, detail_bloc
             label_seen[label] += 1
             sequence = str(label_seen[label]) if label_counts[label] > 1 else ""
             norm = _number(_cell(detail_sheet, item["row"], detail_cols.norm))
-            coef = _number(_cell(detail_sheet, item["row"], detail_cols.coef)) if detail_cols.coef is not None else 0.0
-            if not coef:
-                coef = 1.0
+            coef = _detail_coef(detail_sheet, item["row"], detail_cols)
             unit_price = _detail_material_unit_price(detail_sheet, item["row"], detail_cols)
             total_qty = _detail_material_total_qty(detail_sheet, item["row"], detail_cols, bid_qty, detail_qty, norm, coef)
+            amount = _detail_material_amount(detail_sheet, item["row"], detail_cols, detail_qty, total_qty, unit_price)
             rows.append(
                 ThvtRow(
                     source_no=source_no,
@@ -1004,10 +1022,11 @@ def _generate_thvt_rows(bid_sheet, bid_rows, bid_cols, detail_sheet, detail_bloc
                     name=_text(_cell(detail_sheet, item["row"], detail_cols.name)),
                     unit=_text(_cell(detail_sheet, item["row"], detail_cols.unit)),
                     norm=norm,
+                    coef=coef,
                     bid_qty=bid_qty,
                     total_qty=total_qty,
                     unit_price=unit_price,
-                    amount=total_qty * unit_price,
+                    amount=amount,
                     source_bid_row=bid_row + 1,
                     source_detail_row=item["row"] + 1,
                 )
@@ -1055,6 +1074,13 @@ def _direct_detail_rows(sheet, start: int, end: int, columns: SheetColumns) -> l
 
 def _read_thvt_rows(sheet) -> list[ThvtRow]:
     header_row = _find_header_row(sheet, ["ma so", "thanh phan hao phi", "kl tong"])
+    headers = {_fold(_cell(sheet, header_row, col)): col for col in range(sheet.ncols)}
+    has_coef = "he so" in headers
+    coef_col = headers.get("he so")
+    bid_qty_col = headers.get("khoi luong", 9)
+    total_qty_col = headers.get("kl tong", 10)
+    unit_price_col = headers.get("don gia", 11)
+    amount_col = headers.get("thanh tien", 12)
     rows: list[ThvtRow] = []
     for row in range(header_row + 1, sheet.nrows):
         label = _text(_cell(sheet, row, 3)).upper()
@@ -1071,10 +1097,11 @@ def _read_thvt_rows(sheet) -> list[ThvtRow]:
                 name=_text(_cell(sheet, row, 6)),
                 unit=_text(_cell(sheet, row, 7)),
                 norm=_number(_cell(sheet, row, 8)),
-                bid_qty=_number(_cell(sheet, row, 9)),
-                total_qty=_number(_cell(sheet, row, 10)),
-                unit_price=_number(_cell(sheet, row, 11)),
-                amount=_number(_cell(sheet, row, 12)),
+                coef=_number(_cell(sheet, row, coef_col)) if has_coef else 1.0,
+                bid_qty=_number(_cell(sheet, row, bid_qty_col)),
+                total_qty=_number(_cell(sheet, row, total_qty_col)),
+                unit_price=_number(_cell(sheet, row, unit_price_col)),
+                amount=_number(_cell(sheet, row, amount_col)),
             )
         )
     return rows
@@ -1241,6 +1268,7 @@ def _write_thvt_sheet(worksheet, rows: list[ThvtRow]) -> None:
         "Thanh phan hao phi",
         "Don vi",
         "Dinh muc",
+        "He so",
         "Khoi luong",
         "KL tong",
         "Don gia",
@@ -1261,6 +1289,7 @@ def _write_thvt_sheet(worksheet, rows: list[ThvtRow]) -> None:
                 row.name,
                 row.unit,
                 row.norm,
+                row.coef,
                 row.bid_qty,
                 row.total_qty,
                 row.unit_price,
@@ -1271,7 +1300,7 @@ def _write_thvt_sheet(worksheet, rows: list[ThvtRow]) -> None:
         )
     _style_basic_sheet(worksheet, len(headers))
     worksheet.freeze_panes = "A2"
-    for col, width in enumerate([8, 12, 14, 8, 8, 14, 42, 10, 12, 12, 14, 14, 16, 14, 14], start=1):
+    for col, width in enumerate([8, 12, 14, 8, 8, 14, 42, 10, 12, 10, 12, 14, 14, 16, 14, 14], start=1):
         worksheet.column_dimensions[get_column_letter(col)].width = width
 
 

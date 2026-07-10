@@ -8,20 +8,22 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   throw new Error(String(payload.detail || payload.error || response.statusText));
 }
 
-async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000): Promise<Response> {
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000, timeoutMessage = 'Yêu cầu xử lý quá lâu và đã được dừng. Vui lòng thử lại hoặc kiểm tra file có đang mở trong Excel không.'): Promise<Response> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('Request took too long and was stopped. Please try again or check whether the workbook is open in Excel.');
+      throw new Error(timeoutMessage);
     }
     throw error;
   } finally {
     window.clearTimeout(timeout);
   }
 }
+
+const workbookTimeoutMessage = 'Tạo file quá 5 phút chưa xong. Vui lòng kiểm tra cấu hình cột/form mapping, hoặc đóng file Excel đang mở rồi thử lại.';
 
 export async function uploadExcel(file: File): Promise<UploadSummary> {
   const form = new FormData();
@@ -94,11 +96,11 @@ export async function previewGenericProductCodes(payload: { profile: string; pro
 }
 
 export async function processGenericWorkbook(payload: Record<string, unknown>): Promise<Blob> {
-  const response = await fetch('/api/process', {
+  const response = await fetchWithTimeout('/api/process', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-  });
+  }, 300000, workbookTimeoutMessage);
   if (!response.ok) {
     const errorPayload = await response.json().catch(() => ({}));
     throw new Error(String(errorPayload.detail || errorPayload.error || response.statusText));
@@ -116,11 +118,11 @@ export async function importProductCodeReplacements(file: File) {
 
 export async function processGenericWorkbookCache(payload: Record<string, unknown>, operationId = ''): Promise<ProcessResult> {
   return parseJsonResponse<ProcessResult>(
-    await fetch('/api/process', {
+    await fetchWithTimeout('/api/process', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...payload, cache_only: true, operation_id: operationId }),
-    }),
+    }, 300000, workbookTimeoutMessage),
   );
 }
 
@@ -180,7 +182,9 @@ export async function reloadLicense(): Promise<LicenseStatus> {
 }
 
 export async function getOperationProgress(operationId: string): Promise<OperationProgress> {
-  return parseJsonResponse<OperationProgress>(await fetch(`/api/progress/${encodeURIComponent(operationId)}`));
+  return parseJsonResponse<OperationProgress>(
+    await fetchWithTimeout(`/api/progress/${encodeURIComponent(operationId)}`, {}, 15000, 'Không đọc được trạng thái xử lý từ backend.'),
+  );
 }
 
 export async function createPurchaseReview(savedName: string, comparisonScope: string, wordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[], operationId = '', phase: 'purchase' | 'sales' = 'purchase', allowSameCodeSplit = false) {
@@ -253,24 +257,11 @@ export async function importVietmaxConfig(phase: 'purchase' | 'sales', payload: 
 }
 
 export async function processVietmaxPurchase(savedName: string, originalName: string, payload: Record<string, unknown>, options: { cacheOnly?: boolean; operationId?: string } = {}): Promise<ProcessResult> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 300000);
-  let response: Response;
-  try {
-    response = await fetch('/api/vietmax/process', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ saved_name: savedName, original_name: originalName, payload, operation_id: options.operationId || '', cache_only: Boolean(options.cacheOnly) }),
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('Tạo file đã xử lý quá 5 phút chưa xong. Vui lòng thử lại hoặc kiểm tra log trên máy này.');
-    }
-    throw error;
-  } finally {
-    window.clearTimeout(timeout);
-  }
+  const response = await fetchWithTimeout('/api/vietmax/process', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ saved_name: savedName, original_name: originalName, payload, operation_id: options.operationId || '', cache_only: Boolean(options.cacheOnly) }),
+  }, 300000, workbookTimeoutMessage);
   if (!response.ok) {
     const errorPayload = await response.json().catch(() => ({}));
     throw new Error(String(errorPayload.detail || errorPayload.error || response.statusText));
@@ -304,7 +295,7 @@ export type VietmaxFastImportMappingPayload = {
 };
 
 export async function createVietmaxFastImportPackage(purchaseSavedName: string, salesSavedName: string, operationId = '', mappingPayload: VietmaxFastImportMappingPayload = {}): Promise<Blob> {
-  const response = await fetch('/api/vietmax/fast-import-package', {
+  const response = await fetchWithTimeout('/api/vietmax/fast-import-package', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -319,7 +310,7 @@ export async function createVietmaxFastImportPackage(purchaseSavedName: string, 
       sales_company_group_assignments: mappingPayload.salesCompanyGroupAssignments,
       operation_id: operationId,
     }),
-  });
+  }, 300000, workbookTimeoutMessage);
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(String(payload.detail || payload.error || response.statusText));
@@ -327,9 +318,11 @@ export async function createVietmaxFastImportPackage(purchaseSavedName: string, 
   return response.blob();
 }
 
+const salesMatchTimeoutMessage = 'Khớp mua/bán quá 5 phút chưa xong nên đã dừng lần chạy này. Vui lòng kiểm tra cấu hình cột bán ra, file mua vào đã xử lý, hoặc bấm Khớp lại sau khi sửa.';
+
 export async function createSalesMatches(salesSavedName: string, purchaseSavedName: string, comparisonScope: string, operationId = '', columns: VietmaxColumnPayload = {}) {
   return parseJsonResponse<{ sales_products: unknown[]; purchase_products: unknown[]; exact_matches: MatchRow[]; matches: MatchRow[]; match_rules?: MatchRow[] }>(
-    await fetch('/api/vietmax/sales-match', {
+    await fetchWithTimeout('/api/vietmax/sales-match', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -347,7 +340,7 @@ export async function createSalesMatches(salesSavedName: string, purchaseSavedNa
         require_existing_purchase_code: true,
         operation_id: operationId,
       }),
-    }),
+    }, 300000, salesMatchTimeoutMessage),
   );
 }
 

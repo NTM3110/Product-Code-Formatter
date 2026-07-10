@@ -132,6 +132,13 @@ def keep_existing_when_empty(payload: dict, profile_cfg: dict, key: str, default
     return profile_cfg.get(key, default)
 
 
+def keep_form_mapping_presets(payload: dict, profile_cfg: dict):
+    if "form_mapping_presets" not in payload:
+        return profile_cfg.get("form_mapping_presets", [])
+    value = payload.get("form_mapping_presets")
+    return value if isinstance(value, list) else []
+
+
 def has_company_selection_payload(payload: dict) -> bool:
     if has_config_value(payload.get("all_mst")) or has_config_value(payload.get("mst_safe_id")):
         return True
@@ -146,6 +153,89 @@ def keep_company_config_when_unloaded(payload: dict, profile_cfg: dict, payload_
     return profile_cfg.get(profile_key_name, default)
 
 
+def has_meaningful_profile_config(profile_cfg: dict) -> bool:
+    if not isinstance(profile_cfg, dict):
+        return False
+    collection_keys = (
+        "prefixes",
+        "selected_products",
+        "removed_companies",
+        "first_word_rules",
+        "repeated_phrase_removals",
+        "price_group_rules",
+        "price_range_rules",
+        "manual_code_overrides",
+        "product_code_replacements",
+        "product_review_merges",
+        "vietmax_mua_vao_internal_merges",
+        "vietmax_ban_ra_sales_internal_merges",
+        "vietmax_ban_ra_purchase_match_rules",
+        "inventory_pairs",
+        "inventory_pair_rules",
+        "inventory_allocation_config",
+        "prefix_strategy_values",
+        "processing_groups",
+        "company_group_assignments",
+        "form_mapping_presets",
+        "columns",
+    )
+    if any(has_config_value(profile_cfg.get(key)) for key in collection_keys):
+        return True
+    if profile_cfg.get("include_company_prefix") is False:
+        return True
+    if profile_cfg.get("use_default_inventory_pair") is True:
+        return True
+    if raw_text(profile_cfg.get("default_inventory_pair_id")):
+        return True
+    if raw_text(profile_cfg.get("prefix_strategy") or "last_2_words") != "last_2_words":
+        return True
+    for key, default in (
+        ("prefix_mst_digits", 3),
+        ("prefix_name_words", 2),
+        ("prefix_name_chars", 1),
+    ):
+        try:
+            if int(profile_cfg.get(key, default)) != default:
+                return True
+        except Exception:
+            return True
+    if raw_text(profile_cfg.get("prefix_missing_mst_strategy") or "all_name_words") != "all_name_words":
+        return True
+    return False
+
+
+def is_default_word_rules(value) -> bool:
+    if not isinstance(value, dict) or len(value) != 2:
+        return False
+    normalized = {raw_text(key).casefold(): raw_text(val).upper() for key, val in value.items()}
+    return normalized.get("đen") == "DEN" and normalized.get("tôn") == "TON"
+
+
+def should_use_merged_profile_value(key: str, value, existing) -> bool:
+    if isinstance(value, list):
+        return bool(value) or not has_config_value(existing)
+    if isinstance(value, dict):
+        if key == "word_rules" and is_default_word_rules(value) and has_config_value(existing) and not is_default_word_rules(existing):
+            return False
+        return bool(value) or not has_config_value(existing)
+    if isinstance(value, str):
+        return bool(value.strip()) or not has_config_value(existing)
+    return value is not None
+
+
+def merge_profile_configs(*configs):
+    result = {}
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        for key, value in config.items():
+            if key == "scopes":
+                continue
+            if should_use_merged_profile_value(key, value, result.get(key)):
+                result[key] = value
+    return result
+
+
 def scoped_profile_config_from_profiles(profiles: dict, profile: str, phase: str):
     profile = profile_key(profile)
     phase = normalize_vietmax_phase(phase)
@@ -153,13 +243,14 @@ def scoped_profile_config_from_profiles(profiles: dict, profile: str, phase: str
     profile_cfg = profile_cfg if isinstance(profile_cfg, dict) else {}
     scopes = profile_cfg.get("scopes") if isinstance(profile_cfg.get("scopes"), dict) else {}
     scoped = scopes.get(phase)
-    if isinstance(scoped, dict) and scoped:
-        return scoped
+    scoped_cfg = scoped if has_meaningful_profile_config(scoped) else None
     if profile == VIETMAX_PROFILE:
         legacy_key = effective_processing_profile(profile, phase)
         legacy_cfg = profiles.get(legacy_key) if isinstance(profiles, dict) else {}
-        if isinstance(legacy_cfg, dict) and legacy_cfg:
-            return legacy_cfg
+        legacy_cfg = legacy_cfg if has_meaningful_profile_config(legacy_cfg) else None
+        return merge_profile_configs(profile_cfg, legacy_cfg, scoped_cfg) or empty_profile_config(profile)
+    if scoped_cfg:
+        return merge_profile_configs(profile_cfg, scoped_cfg)
     return profile_cfg or empty_profile_config(profile)
 
 
@@ -179,6 +270,17 @@ def ensure_profile_scope(cfg: dict, profile: str, phase: str):
     root["scopes"].setdefault(phase, empty_profile_config(profile, include_scopes=False))
     cfg["profiles"][profile] = root
     return root, root["scopes"][phase]
+
+
+def sync_vietmax_legacy_profile(cfg: dict, profile: str, phase: str, profile_cfg: dict):
+    if profile_key(profile) != VIETMAX_PROFILE:
+        return
+    legacy_key = effective_processing_profile(VIETMAX_PROFILE, phase)
+    legacy_cfg = cfg.setdefault("profiles", {}).get(legacy_key)
+    if not isinstance(legacy_cfg, dict):
+        legacy_cfg = empty_profile_config(legacy_key)
+    legacy_cfg.update(profile_cfg)
+    cfg["profiles"][legacy_key] = legacy_cfg
 
 
 def normalize_prefix_strategy_values(raw):
@@ -214,6 +316,7 @@ VIETMAX_CONFIG_PROFILE_KEYS = {
     "use_default_inventory_pair",
     "default_inventory_pair_id",
     "inventory_pair_rules",
+    "inventory_allocation_config",
     "include_company_prefix",
     "prefix_strategy",
     "prefix_mst_digits",
@@ -269,6 +372,7 @@ def vietmax_profile_from_process_payload(payload: dict, phase: str) -> dict:
         "use_default_inventory_pair",
         "default_inventory_pair_id",
         "inventory_pair_rules",
+        "inventory_allocation_config",
     ]
     for key in direct_keys:
         if key in payload:
@@ -803,6 +907,7 @@ def create_app() -> FastAPI:
             "use_default_inventory_pair": bool(profile_cfg.get("use_default_inventory_pair")),
             "default_inventory_pair_id": profile_cfg.get("default_inventory_pair_id") or "",
             "inventory_pair_rules": profile_cfg.get("inventory_pair_rules") or [],
+            "inventory_allocation_config": profile_cfg.get("inventory_allocation_config") or {},
             "include_company_prefix": profile_cfg.get("include_company_prefix") is not False,
             "prefix_strategy": profile_cfg.get("prefix_strategy") or "last_2_words",
             "prefix_mst_digits": profile_cfg.get("prefix_mst_digits") or 3,
@@ -925,6 +1030,7 @@ def create_app() -> FastAPI:
             result["use_default_inventory_pair"] = bool(profile_cfg.get("use_default_inventory_pair"))
             result["default_inventory_pair_id"] = profile_cfg.get("default_inventory_pair_id") or ""
             result["inventory_pair_rules"] = profile_cfg.get("inventory_pair_rules") or []
+            result["inventory_allocation_config"] = profile_cfg.get("inventory_allocation_config") or {}
             result["sales_match_rules"] = profile_cfg.get("vietmax_ban_ra_purchase_match_rules") or []
             result["vietmax_mua_vao_internal_merges"] = profile_cfg.get("vietmax_mua_vao_internal_merges") or []
             result["vietmax_ban_ra_sales_internal_merges"] = profile_cfg.get("vietmax_ban_ra_sales_internal_merges") or []
@@ -967,6 +1073,8 @@ def create_app() -> FastAPI:
         operation_id = raw_text(process_payload.get("operation_id"))
         cache_only = bool(process_payload.get("cache_only"))
         started_at = time.perf_counter()
+        profile_for_log = profile_key(process_payload.get("profile", "son_phuong"))
+        phase_for_log = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
         update_progress_job(operation_id, 0, 5, "Đang chuẩn bị tạo file", status="running")
 
         def progress(done: int, total: int, label: str) -> None:
@@ -974,7 +1082,18 @@ def create_app() -> FastAPI:
 
         try:
             out = resolve_output_path(original_name, "")
+            diagnostic_log(
+                "generic/process start "
+                f"operation={operation_id or '-'} profile={profile_for_log} phase={phase_for_log} "
+                f"cache_only={cache_only} export_form_mappings={bool(process_payload.get('export_form_mappings'))} "
+                f"input={path} output={out}"
+            )
             processed_df = process_workbook(path, out, process_payload, progress_callback=progress)
+            diagnostic_log(
+                "generic/process workbook_done "
+                f"operation={operation_id or '-'} profile={profile_for_log} phase={phase_for_log} "
+                f"elapsed={time.perf_counter() - started_at:.2f}s rows={len(processed_df.index)} cols={len(processed_df.columns)}"
+            )
             cfg = load_config()
             profile = profile_key(process_payload.get("profile", cfg.get("selected_profile", "son_phuong")))
             phase = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
@@ -1010,10 +1129,12 @@ def create_app() -> FastAPI:
                 "product_review_merges": process_payload.get("product_review_merges", old_profile.get("product_review_merges", [])),
                 "vietmax_mua_vao_internal_merges": process_payload.get("vietmax_mua_vao_internal_merges", old_profile.get("vietmax_mua_vao_internal_merges", [])),
                 "vietmax_ban_ra_sales_internal_merges": process_payload.get("vietmax_ban_ra_sales_internal_merges", old_profile.get("vietmax_ban_ra_sales_internal_merges", [])),
+                "vietmax_ban_ra_purchase_match_rules": process_payload.get("vietmax_ban_ra_purchase_match_rules", old_profile.get("vietmax_ban_ra_purchase_match_rules", [])),
                 "inventory_pairs": normalize_inventory_pairs(keep_existing_when_empty(process_payload, old_profile, "inventory_pairs", [])),
                 "use_default_inventory_pair": bool(process_payload.get("use_default_inventory_pair", old_profile.get("use_default_inventory_pair", False))),
                 "default_inventory_pair_id": str(process_payload.get("default_inventory_pair_id", old_profile.get("default_inventory_pair_id", "")) or "").strip(),
                 "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(process_payload, old_profile, "inventory_pair_rules", [])),
+                "inventory_allocation_config": keep_existing_when_empty(process_payload, old_profile, "inventory_allocation_config", {}),
                 "include_company_prefix": process_payload.get("include_company_prefix") is not False,
                 "prefix_strategy": process_payload.get("prefix_strategy", old_profile.get("prefix_strategy", "last_2_words")),
                 "prefix_mst_digits": process_payload.get("prefix_mst_digits", old_profile.get("prefix_mst_digits", 3)),
@@ -1023,18 +1144,19 @@ def create_app() -> FastAPI:
                 "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(process_payload, old_profile, "prefix_strategy_values", "prefix_strategy_values", {})),
                 "processing_groups": keep_existing_when_empty(process_payload, old_profile, "processing_groups", []),
                 "company_group_assignments": keep_company_config_when_unloaded(process_payload, old_profile, "company_group_assignments", "company_group_assignments", {}),
-                "form_mapping_presets": keep_existing_when_empty(process_payload, old_profile, "form_mapping_presets", []),
+                "form_mapping_presets": keep_form_mapping_presets(process_payload, old_profile),
                 "columns": columns,
             })
+            sync_vietmax_legacy_profile(cfg, profile, phase, profile_cfg)
             save_config(cfg)
             if process_payload.get("export_form_mappings"):
                 progress(3, 5, "Đang dựng workbook form mapping từ FDI đã xử lý")
                 input_phase = generic_profile_form_input_phase(profile)
-                form_mapping_presets = (
-                    process_payload.get("form_mapping_presets")
-                    or profile_cfg.get("form_mapping_presets")
-                    or default_vietmax_form_mapping_presets(input_phase)
-                )
+                if "form_mapping_presets" in process_payload:
+                    form_mapping_presets = process_payload.get("form_mapping_presets") if isinstance(process_payload.get("form_mapping_presets"), list) else []
+                else:
+                    saved_form_mapping_presets = profile_cfg.get("form_mapping_presets")
+                    form_mapping_presets = saved_form_mapping_presets if isinstance(saved_form_mapping_presets, list) else default_vietmax_form_mapping_presets(input_phase)
                 final_stream = generic_form_mapping_export_workbook_stream(
                     processed_df,
                     form_mapping_presets=form_mapping_presets,
@@ -1062,6 +1184,11 @@ def create_app() -> FastAPI:
                 return {"processedSavedName": cached_saved_name}
         except Exception as exc:
             update_progress_job(operation_id, 1, 1, str(exc), status="error")
+            diagnostic_log(
+                "generic/process error "
+                f"operation={operation_id or '-'} profile={profile_for_log} phase={phase_for_log} "
+                f"elapsed={time.perf_counter() - started_at:.2f}s error={exc}"
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         update_progress_job(operation_id, 5, 5, "Đã tạo file kết quả", status="complete")
         return Response(
@@ -1204,8 +1331,14 @@ def create_app() -> FastAPI:
     def create_vietmax_fast_import_package(payload: VietmaxFastImportPackageRequest) -> Response:
         operation_id = raw_text(payload.operation_id)
         started_at = time.perf_counter()
+        profile_for_log = profile_key(payload.profile)
         update_progress_job(operation_id, 0, 1, "Đang chuẩn bị tạo workbook FAST 4 sheet", status="running")
         try:
+            diagnostic_log(
+                "fast-import-package start "
+                f"operation={operation_id or '-'} profile={profile_for_log} "
+                f"purchase={raw_text(payload.purchase_saved_name) or '-'} sales={raw_text(payload.sales_saved_name) or '-'}"
+            )
             purchase_df = None
             sales_df = None
             if raw_text(payload.purchase_saved_name):
@@ -1237,10 +1370,14 @@ def create_app() -> FastAPI:
                 purchase_company_group_assignments=purchase_assignments,
                 sales_company_group_assignments=sales_assignments,
             )
+            diagnostic_log(
+                "fast-import-package workbook_done "
+                f"operation={operation_id or '-'} profile={profile_for_log} elapsed={time.perf_counter() - started_at:.2f}s"
+            )
         except Exception as exc:
             diagnostic_log(
-                "vietmax/process error "
-                f"operation={operation_id or '-'} elapsed={time.perf_counter() - started_at:.2f}s error={exc}"
+                "fast-import-package error "
+                f"operation={operation_id or '-'} profile={profile_for_log} elapsed={time.perf_counter() - started_at:.2f}s error={exc}"
             )
             update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1299,7 +1436,7 @@ def create_app() -> FastAPI:
             "prefix_strategy_values": normalize_prefix_strategy_values(keep_company_config_when_unloaded(payload, profile_cfg, "prefix_strategy_values", "prefix_strategy_values", {})),
             "processing_groups": keep_existing_when_empty(payload, profile_cfg, "processing_groups", []),
             "company_group_assignments": keep_company_config_when_unloaded(payload, profile_cfg, "company_group_assignments", "company_group_assignments", {}),
-            "form_mapping_presets": keep_existing_when_empty(payload, profile_cfg, "form_mapping_presets", []),
+            "form_mapping_presets": keep_form_mapping_presets(payload, profile_cfg),
             "columns": payload.get("columns", {}),
             "word_rules": keep_existing_when_empty(payload, profile_cfg, "word_rules", {}),
             "first_word_rules": keep_existing_when_empty(payload, profile_cfg, "first_word_rules", {}),
@@ -1316,7 +1453,9 @@ def create_app() -> FastAPI:
             "use_default_inventory_pair": bool(payload.get("use_default_inventory_pair", profile_cfg.get("use_default_inventory_pair", False))),
             "default_inventory_pair_id": str(payload.get("default_inventory_pair_id", profile_cfg.get("default_inventory_pair_id", "")) or "").strip(),
             "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(payload, profile_cfg, "inventory_pair_rules", [])),
+            "inventory_allocation_config": keep_existing_when_empty(payload, profile_cfg, "inventory_allocation_config", {}),
         })
+        sync_vietmax_legacy_profile(cfg, profile, phase, profile_cfg)
         return save_config(cfg)
 
     @api.post("/api/vietmax/import-config/{phase}")
@@ -1629,7 +1768,7 @@ def form_scope_matches_available_phase(form, available_phase):
 
 
 def single_phase_form_presets(forms, available_phase):
-    source_forms = forms or default_vietmax_form_mapping_presets(available_phase)
+    source_forms = forms if isinstance(forms, list) else default_vietmax_form_mapping_presets(available_phase)
     result = []
     for form in source_forms:
         if not isinstance(form, dict) or form.get("enabled") is False:

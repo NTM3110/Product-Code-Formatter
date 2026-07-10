@@ -1,6 +1,6 @@
 ﻿import type { StageDefinition, StageId } from './workflowStages';
 
-export function StageNavigation({ stages, stage, busy, canEnterStage, goToStage }: { stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void }) {
+export function StageNavigation({ stages, stage, busy, canEnterStage, goToStage }: { stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void | Promise<void> }) {
   const formatStages = stages.filter((item) => item.phase === 'format');
   const purchaseStages = stages.filter((item) => item.phase === 'purchase');
   const salesStages = stages.filter((item) => item.phase === 'sales');
@@ -30,7 +30,7 @@ export function StageNavigation({ stages, stage, busy, canEnterStage, goToStage 
   );
 }
 
-function StageGroup({ title, stages, stage, busy, canEnterStage, goToStage }: { title: string; stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void }) {
+function StageGroup({ title, stages, stage, busy, canEnterStage, goToStage }: { title: string; stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void | Promise<void> }) {
   if (!stages.length) return null;
   return (
     <div className="stage-group">
@@ -41,7 +41,7 @@ function StageGroup({ title, stages, stage, busy, canEnterStage, goToStage }: { 
             key={item.id}
             className={'step-pill ' + (item.id === stage ? 'active ' : '') + (item.disabled ? 'unavailable ' : '') + item.phase}
             disabled={item.disabled || !canEnterStage(item.id) || busy}
-            onClick={() => goToStage(item.id)}
+            onClick={() => void goToStage(item.id)}
             type="button"
             title={String(item.id) + '. ' + (item.disabledReason || item.label)}
           >

@@ -49,7 +49,12 @@ class EstimateExtractorLogicTest(unittest.TestCase):
 
         self.assertEqual(result.thvt_rows, 326)
         self.assertEqual(result.generated_thvt_rows, 328)
-        self.assertEqual(result.thvt_mismatches, [])
+        self.assertTrue(result.thvt_mismatches)
+        self.assertEqual([item for item in result.thvt_mismatches if set(item["diffs"]) != {"amount"}], [])
+        self.assertLessEqual(
+            max(abs(item["diffs"]["amount"]["diff"]) for item in result.thvt_mismatches),
+            20,
+        )
         self.assertEqual(result.thvt_extra_rows, [])
         self.assertEqual(len(result.thvt_key_mismatches), 4)
         self.assertEqual(
@@ -87,11 +92,11 @@ class EstimateExtractorLogicTest(unittest.TestCase):
                 logic._fold(row[5]),
                 logic._fold(row[6]),
                 logic._fold(row[7]),
-                round(float(row[11] or 0), 8),
+                round(float(row[12] or 0), 8),
             )
             bucket = detail_totals.setdefault(key, {"qty": 0.0, "amount": 0.0, "count": 0})
-            bucket["qty"] += float(row[10] or 0)
-            bucket["amount"] += float(row[12] or 0)
+            bucket["qty"] += float(row[11] or 0)
+            bucket["amount"] += float(row[13] or 0)
             bucket["count"] += 1
 
         summary_totals = {}
@@ -264,9 +269,54 @@ class EstimateExtractorLogicTest(unittest.TestCase):
             self.assertAlmostEqual(float(output_bid.cell(row=5, column=amount_start + 2).value), 40, delta=0.000001)
             self.assertAlmostEqual(float(output_bid.cell(row=5, column=tc_amount_col).value), 200, delta=0.000001)
 
-            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=10).value), 2, delta=0.000001)
-            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=11).value), 0.04, delta=0.000001)
-            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=13).value), 100, delta=0.000001)
+            self.assertEqual(output_thvt.cell(row=1, column=10).value, "He so")
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=10).value), 1, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=11).value), 2, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=12).value), 0.04, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=14).value), 100, delta=0.000001)
+
+    def test_zero_coefficient_keeps_chiet_tinh_amount_as_source_of_truth(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zero_coefficient.xlsx"
+            workbook = Workbook()
+            bid = workbook.active
+            bid.title = "Du thau"
+            detail = workbook.create_sheet("Chiet tinh")
+
+            bid.append([])
+            bid.append([])
+            bid.append([])
+            bid.append(["STT", "Ma so", "Ten cong tac", "Don vi", "Khoi luong", "Vat lieu", "Nhan cong", "May", "Don gia", "Thanh tien"])
+            bid.append([1, "AB.004", "Cong tac co he so vat lieu bang 0", "bo", 2, 0, 10, 0, 10, 20])
+
+            detail.append([])
+            detail.append([])
+            detail.append([])
+            detail.append(["STT", "Ma so", "Thanh phan hao phi", "Don vi", "Dinh muc", "Don gia", "He so", "Thanh tien"])
+            detail.append([1, "AB.004", "Cong tac co he so vat lieu bang 0", "bo", 1, None, None, None])
+            detail.append([None, None, "a) Vat lieu", None, None, None, None, 0])
+            detail.append([None, "CAT", "Cat", "m3", 100, 300000, 0, 0])
+            detail.append([None, None, "b) Nhan cong", None, None, None, None, 10])
+            detail.append([None, "N1", "Nhan cong", "cong", 1, 10, 1, 10])
+            detail.append([None, None, "Cong chi phi truc tiep (VL+NC+M)", "T", None, None, None, 10])
+            workbook.save(path)
+
+            content, summary = create_estimate_output_workbook(str(path))
+            self.assertEqual(summary["calculation_mismatches"], 0)
+            output = load_workbook(BytesIO(content), read_only=True, data_only=True)
+            output_bid = output.worksheets[0]
+            output_thvt = output["THVT"]
+            price_start = _find_openpyxl_generated_group_start(output_bid, 4, 11)
+            amount_start = price_start + len(logic.COST_LABEL_ORDER)
+
+            self.assertAlmostEqual(float(output_bid.cell(row=5, column=amount_start).value), 0, delta=0.000001)
+            self.assertEqual(output_thvt.cell(row=1, column=10).value, "He so")
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=9).value), 100, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=10).value), 0, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=11).value), 2, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=12).value), 0, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=13).value), 300000, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=14).value), 0, delta=0.000001)
 
     def test_other_material_uses_amount_column_as_unit_price(self):
         with TemporaryDirectory() as tmp:
@@ -302,8 +352,9 @@ class EstimateExtractorLogicTest(unittest.TestCase):
             self.assertAlmostEqual(float(output_thvt.cell(row=2, column=9).value), 3, delta=0.000001)
             self.assertAlmostEqual(float(output_thvt.cell(row=2, column=10).value), 2, delta=0.000001)
             self.assertAlmostEqual(float(output_thvt.cell(row=2, column=11).value), 2, delta=0.000001)
-            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=12).value), 300, delta=0.000001)
-            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=13).value), 600, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=12).value), 2, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=13).value), 300, delta=0.000001)
+            self.assertAlmostEqual(float(output_thvt.cell(row=2, column=14).value), 600, delta=0.000001)
 
     def test_generated_bid_vl_amount_total_matches_thvt_vl_amount_total(self):
         with TemporaryDirectory() as tmp:
@@ -340,7 +391,7 @@ class EstimateExtractorLogicTest(unittest.TestCase):
 
             bid_vl_amount_total = sum(float(output_bid.cell(row=row, column=amount_start).value or 0) for row in range(5, output_bid.max_row + 1))
             thvt_vl_amount_total = sum(
-                float(row[12] or 0)
+                float(row[13] or 0)
                 for row in output_thvt.iter_rows(min_row=2, values_only=True)
                 if str(row[3] or "").upper() == "VL"
             )

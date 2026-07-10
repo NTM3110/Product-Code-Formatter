@@ -200,6 +200,7 @@ def empty_profile_config(profile_key_name=None, include_scopes=True):
         "use_default_inventory_pair": False,
         "default_inventory_pair_id": "",
         "inventory_pair_rules": [],
+        "inventory_allocation_config": {},
         "include_company_prefix": True,
         "prefix_strategy": "last_2_words",
         "prefix_mst_digits": 3,
@@ -1087,6 +1088,7 @@ def normalize_profile_config(profile_key_name, profile, include_scopes=True):
         "use_default_inventory_pair": bool(profile.get("use_default_inventory_pair")),
         "default_inventory_pair_id": str(profile.get("default_inventory_pair_id") or "").strip(),
         "inventory_pair_rules": normalize_inventory_pair_rules(profile.get("inventory_pair_rules") or []),
+        "inventory_allocation_config": dict(profile.get("inventory_allocation_config") or {}) if isinstance(profile.get("inventory_allocation_config"), dict) else {},
         "include_company_prefix": profile.get("include_company_prefix") is not False,
         "prefix_strategy": normalize_prefix_strategy(profile.get("prefix_strategy") or defaults["prefix_strategy"]),
         "prefix_mst_digits": normalize_prefix_mst_digits(profile.get("prefix_mst_digits", defaults["prefix_mst_digits"])),
@@ -6086,6 +6088,7 @@ def process():
             "use_default_inventory_pair": bool(data.get("use_default_inventory_pair", old_profile.get("use_default_inventory_pair", False))),
             "default_inventory_pair_id": str(data.get("default_inventory_pair_id", old_profile.get("default_inventory_pair_id", "")) or "").strip(),
             "inventory_pair_rules": normalize_inventory_pair_rules(data.get("inventory_pair_rules") or old_profile.get("inventory_pair_rules") or []),
+            "inventory_allocation_config": data.get("inventory_allocation_config") if isinstance(data.get("inventory_allocation_config"), dict) else old_profile.get("inventory_allocation_config", {}),
             "include_company_prefix": data.get("include_company_prefix") is not False,
         })
         save_config(cfg)

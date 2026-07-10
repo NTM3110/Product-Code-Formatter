@@ -16,6 +16,7 @@ APP_TITLE = "Product Code Formatter"
 DESKTOP_SHORTCUT_NAME = "Product Code Formatter.lnk"
 DESKTOP_SHORTCUT_ALIASES = [
     "Product Code Formatter.lnk",
+    "Product Code Formatter Web.lnk",
     "ProductCodeFormatter.lnk",
     "ProductCodeFormatterWeb.lnk",
 ]
@@ -92,12 +93,7 @@ foreach ($desktop in $desktopPaths) {{
     $shortcutPath = Join-Path $desktop $name
     if (Test-Path $shortcutPath) {{
       try {{
-        $link = $Shell.CreateShortcut($shortcutPath)
-        $link.TargetPath = $ExePath
-        $link.WorkingDirectory = Split-Path -Parent $ExePath
-        $link.IconLocation = $ExePath + ',0'
-        $link.Description = 'Product Code Formatter'
-        $link.Save()
+        Remove-Item -LiteralPath $shortcutPath -Force
       }} catch {{}}
     }}
   }}
