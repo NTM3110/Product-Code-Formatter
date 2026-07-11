@@ -10,7 +10,7 @@ from pathlib import Path
 import uvicorn
 
 from app import ICON_PATH
-from web_api import app as fastapi_app, find_free_port
+from web_api import app as fastapi_app, close_workflow_runtime, find_free_port
 
 APP_TITLE = "Product Code Formatter"
 DESKTOP_SHORTCUT_NAME = "Product Code Formatter.lnk"
@@ -170,7 +170,10 @@ def main() -> None:
     if ICON_PATH.exists():
         window_options["background_color"] = "#eef4f8"
     webview.create_window(**window_options, js_api=DesktopApi())
-    webview.start(debug=False)
+    try:
+        webview.start(debug=False)
+    finally:
+        close_workflow_runtime()
     os._exit(0)
 
 

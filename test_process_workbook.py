@@ -1,5 +1,6 @@
 import json
 import re
+import os
 import unittest
 from collections import Counter
 from io import BytesIO
@@ -11,6 +12,8 @@ from openpyxl import Workbook, load_workbook
 import xlrd
 
 import app
+from product_code.workflow_runtime import process_is_running
+from workflows.estimate_extractor.logic import analyze_estimate_workbook, list_estimate_workbook_sheets
 from app import build_vietmax_ban_ra_purchase_matches, create_up_ban_ra_workbook, create_up_mua_vao_workbook, default_config, excel_col_to_index, license_allows_company, license_allows_profile, license_has_local_activation, make_product_part, normalize_config, process_workbook, profile_key, resolve_output_path, suggest_prefix, up_ban_ra_output_path, up_mua_vao_output_path, vietmax_ban_ra_sales_products_from_workbook, vietmax_product_review_rows, vietmax_purchase_match_export_rows, vietmax_purchase_products_from_workbook
 
 
@@ -42,6 +45,45 @@ class XlsWorkbookAdapter:
 
 
 class ProcessWorkbookTests(unittest.TestCase):
+    def test_estimate_detector_supports_raw_layout_and_excel_control_markers(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "raw_estimate.xlsx"
+            workbook = Workbook()
+            bid = workbook.active
+            bid.title = "D\u1ef1 th\u1ea7u"
+            detail = workbook.create_sheet("\u0110\u01a1n gi\u00e1 chi ti\u1ebft")
+            bid.append([])
+            bid.append([])
+            bid.append([])
+            bid.append([])
+            bid.append(["STT", "M\u00e3 hi\u1ec7u", "C\u1ed9t \u1ea9n", "T\u00ean c\u00f4ng t\u00e1c", "\u0110\u01a1n v\u1ecb", "Kh\u1ed1i l\u01b0\u1ee3ng", "\u0110\u01a1n gi\u00e1_x000D_\n(\u0111)", "Th\u00e0nh ti\u1ec1n_x000D_\n(\u0111)"])
+            bid.append([1, "AA.100", None, "C\u00f4ng t\u00e1c A", "m", 2, 10, 20])
+            detail.append([])
+            detail.append([])
+            detail.append([])
+            detail.append([])
+            detail.append(["STT", "M\u00e3 hi\u1ec7u \u0111\u01a1n gi\u00e1", "T\u00ean c\u00f4ng t\u00e1c", "\u0110\u01a1n v\u1ecb", "\u0110\u1ecbnh m\u1ee9c", "\u0110\u01a1n gi\u00e1_x000D_\n(\u0111)", "H\u1ec7 s\u1ed1", "Th\u00e0nh ti\u1ec1n_x000D_\n(\u0111)"])
+            detail.append([1, "AA.100", "C\u00f4ng t\u00e1c A", "m", 1, None, None, None])
+            detail.append([None, None, "V\u1eadt li\u1ec7u", None, None, None, None, 10])
+            detail.append([None, "VL.1", "V\u1eadt li\u1ec7u A", "kg", 1, 10, 1, 10])
+            workbook.save(path)
+
+            info = list_estimate_workbook_sheets(str(path))
+            suggested = info["suggested_sheets"]
+            self.assertEqual(suggested["bid_header_row"], 5)
+            self.assertEqual(suggested["detail_header_row"], 5)
+            self.assertEqual(suggested["bid_columns"]["name"], "D")
+            self.assertEqual(suggested["bid_columns"]["unit_total"], "G")
+            self.assertEqual(suggested["detail_columns"]["name"], "C")
+            result = analyze_estimate_workbook(str(path))
+            self.assertTrue(result.ok)
+            self.assertEqual((result.bid_rows, result.detail_blocks), (1, 1))
+
+    def test_workflow_runtime_detects_current_process(self):
+        self.assertTrue(process_is_running(os.getpid()))
+        self.assertFalse(process_is_running(-1))
+        self.assertFalse(process_is_running("invalid"))
+
     def test_product_code_replacement_ignores_company_prefix(self):
         replacements = app.normalize_product_code_replacements({"TU100": "TU100.001"})
         self.assertEqual(app.apply_product_code_replacement("TU100", replacements), "TU100.001")
@@ -234,6 +276,8 @@ class ProcessWorkbookTests(unittest.TestCase):
 
     def test_load_config_recovers_local_license_from_backup(self):
         original_config_path = app.CONFIG_PATH
+        original_license_path = app.LICENSE_PATH
+        original_default_mappings_path = app.DEFAULT_FORM_MAPPINGS_PATH
         original_fingerprint = app.local_machine_fingerprint
         original_legacy_fingerprint = app.legacy_machine_fingerprint
         try:
@@ -254,6 +298,8 @@ class ProcessWorkbookTests(unittest.TestCase):
                 config_path.write_text(json.dumps(current), encoding="utf-8")
                 backup_path.write_text(json.dumps(backup), encoding="utf-8")
                 app.CONFIG_PATH = config_path
+                app.LICENSE_PATH = Path(tmp) / "license.json"
+                app.DEFAULT_FORM_MAPPINGS_PATH = Path(tmp) / "default_form_mappings.json"
                 app.local_machine_fingerprint = lambda: "TEST-FINGERPRINT"
                 app.legacy_machine_fingerprint = lambda: "LEGACY-FINGERPRINT"
 
@@ -263,9 +309,37 @@ class ProcessWorkbookTests(unittest.TestCase):
                 self.assertTrue(loaded["license"]["activated"])
                 self.assertEqual(loaded["license"]["license_key"], "KEY")
                 self.assertEqual(loaded["license"]["allowed_profiles"], ["vietmax"])
-                self.assertTrue(persisted["license"]["activated"])
+                self.assertNotIn("license", persisted)
+                persisted_license = json.loads(app.LICENSE_PATH.read_text(encoding="utf-8"))
+                self.assertTrue(persisted_license["activated"])
+                self.assertEqual(len(loaded["profiles"]["son_phuong"]["form_mapping_presets"]), 5)
+                self.assertTrue(app.DEFAULT_FORM_MAPPINGS_PATH.exists())
+
+                loaded["profiles"]["son_phuong"]["form_mapping_presets"][0]["enabled"] = False
+                loaded["profiles"]["son_phuong"]["form_mapping_initialized"] = True
+                app.save_config(loaded)
+                reloaded = app.load_config()["profiles"]["son_phuong"]["form_mapping_presets"]
+                self.assertFalse(reloaded[0]["enabled"])
+                self.assertEqual(len(reloaded), 5)
+
+                restored_forms = app.load_system_default_form_mappings()
+                restored_forms[0].update({
+                    "type": "template_mapping",
+                    "template_saved_name": "missing-cache.xls",
+                    "output_columns": [],
+                })
+                loaded = app.load_config()
+                loaded["profiles"]["son_phuong"]["form_mapping_presets"] = restored_forms
+                app.save_config(loaded)
+                hydrated = app.load_config()["profiles"]["son_phuong"]["form_mapping_presets"]
+                self.assertEqual(len(hydrated), 5)
+                self.assertEqual(hydrated[0]["type"], "builtin")
+                self.assertNotIn("template_saved_name", hydrated[0])
+                self.assertTrue(hydrated[0]["output_columns"])
         finally:
             app.CONFIG_PATH = original_config_path
+            app.LICENSE_PATH = original_license_path
+            app.DEFAULT_FORM_MAPPINGS_PATH = original_default_mappings_path
             app.local_machine_fingerprint = original_fingerprint
             app.legacy_machine_fingerprint = original_legacy_fingerprint
 

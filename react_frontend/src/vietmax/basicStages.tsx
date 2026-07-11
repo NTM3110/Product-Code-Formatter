@@ -273,7 +273,7 @@ export function FastImportExportStage({
       <section className="inventory-allocation-card inventory-export-card">
         <div className="report-stage-heading">
           <span>Xuất FAST</span>
-          <h3>Xuất workbook FAST 4 sheet</h3>
+          <h3>Xuất workbook FAST 5 sheet</h3>
           <p>Workbook sẽ gồm Hoadonmuahang, Hoadonbanhang, DMvat_tu và DMkhachhang. Chỉ các cột có dữ liệu trong file mẫu FAST mới được điền.</p>
         </div>
         <div className="inventory-file-grid">

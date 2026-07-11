@@ -178,6 +178,10 @@ th { position: sticky; top: 0; z-index: 1; background: var(--color-table-head); 
 .status-strip.status-warning strong,
 .status-strip.status-warning span { color: #8a5a00; }
 .status-strip.status-warning > span:last-child { white-space: normal; }
+.status-strip.status-error { gap: 7px; min-height: 30px; padding: 4px 10px; border: 1px solid #e98f8f; border-radius: 10px; background: #fff0f0; color: #9d1c1c; }
+.status-strip.status-error strong,
+.status-strip.status-error span { color: #9d1c1c; }
+.status-strip.status-error > span:last-child { white-space: normal; }
 .status-icon { flex: 0 0 auto; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 999px; background: #f4a62a; color: white; font-size: .8rem; font-weight: 900; }
 .license-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--color-line); border-radius: 12px; background: var(--color-surface-soft); }
 .license-bar > div:first-child { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }

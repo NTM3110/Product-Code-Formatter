@@ -6,6 +6,55 @@ export type UploadSummary = {
   columns: Array<{ letter: string; label: string }>;
   preview: Array<Record<string, string>>;
   invoice_statuses: InvoiceStatusOption[];
+  artifact_id?: string;
+  session_id?: string;
+};
+
+export type WorkflowArtifact = {
+  artifact_id: string;
+  saved_name: string;
+  original_name: string;
+  kind: string;
+  signature: string;
+  sha256: string;
+  size: number;
+  valid: boolean;
+  created_at: number;
+  metadata: Record<string, unknown>;
+};
+
+export type WorkflowSession = {
+  session_id: string;
+  created_at: number;
+  updated_at: number;
+  artifacts: Record<string, WorkflowArtifact>;
+};
+
+export type JobFailure = {
+  code: string;
+  message: string;
+  stage: string;
+  field: string;
+  details: Record<string, unknown>;
+  retryable: boolean;
+  operation_id: string;
+};
+
+export type WorkflowJob = {
+  job_id: string;
+  operation_id: string;
+  kind: string;
+  signature: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  progress: Omit<OperationProgress, 'operation_id' | 'status'>;
+  context: Record<string, unknown>;
+  result: null | {
+    artifact?: WorkflowArtifact;
+    processed_saved_name?: string;
+    reused?: boolean;
+    stats?: Record<string, unknown>;
+  };
+  error: JobFailure | null;
 };
 
 export type EstimateAnalysisSummary = {
@@ -334,6 +383,7 @@ export type ProcessingForm = {
   output_columns?: FormColumn[];
   input_columns?: FormColumn[];
   output_preview?: Array<Record<string, string>>;
+  system_generated?: boolean;
   mappings?: FormMappingRule[];
 };
 

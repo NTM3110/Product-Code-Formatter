@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { forwardRef, useImperativeHandle, useMemo, useState } from 'react';
 import { analyzeEstimateWorkbook, exportEstimateWorkbook, uploadEstimateWorkbook } from '../api';
 import type { EstimateAnalysis, EstimateColumnConfig, EstimateSheetInfo, EstimateSheetSelection, EstimateUploadSummary } from '../types';
 import type { StageId } from '../vietmax/workflowStages';
@@ -8,6 +8,10 @@ type Props = {
   onStatus: (message: string) => void;
   stage: StageId;
   onStageChange: (stage: StageId) => void | Promise<void>;
+};
+
+export type EstimateExtractorWorkflowHandle = {
+  prepareAnalysis: () => Promise<boolean>;
 };
 
 type WarningSection = {
@@ -100,8 +104,31 @@ function buildInitialSelection(summary: EstimateUploadSummary): EstimateSheetSel
     detail_sheet_index: isSheetIndex(suggested.detail_sheet_index) ? suggested.detail_sheet_index : second,
     bid_header_row: suggestedHeaderRow(suggested.bid_header_row) || 4,
     detail_header_row: suggestedHeaderRow(suggested.detail_header_row) || 4,
-    bid_columns: cleanColumnConfig(suggested.bid_columns),
-    detail_columns: cleanColumnConfig(suggested.detail_columns),
+    bid_columns: {
+      stt: 'A',
+      code: 'B',
+      name: 'C',
+      unit: 'D',
+      qty: 'E',
+      vl: 'F',
+      nc: 'G',
+      mtc: 'H',
+      unit_total: 'I',
+      amount_total: 'J',
+      ...cleanColumnConfig(suggested.bid_columns),
+    },
+    detail_columns: {
+      stt: 'A',
+      code: 'B',
+      name: 'C',
+      unit: 'D',
+      norm: 'E',
+      price: 'F',
+      coef: 'G',
+      amount: 'H',
+      helper: 'A',
+      ...cleanColumnConfig(suggested.detail_columns),
+    },
   };
 }
 
@@ -305,7 +332,10 @@ function ColumnConfigPanel({
   );
 }
 
-export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onStageChange }: Props) {
+export const EstimateExtractorWorkflow = forwardRef<EstimateExtractorWorkflowHandle, Props>(function EstimateExtractorWorkflow(
+  { licenseReady, onStatus, stage, onStageChange },
+  ref,
+) {
   const [summary, setSummary] = useState<EstimateUploadSummary | null>(null);
   const [analysis, setAnalysis] = useState<EstimateAnalysis | null>(null);
   const [sheetSelection, setSheetSelection] = useState<EstimateSheetSelection>({});
@@ -365,12 +395,12 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
   }
 
   async function refreshAnalysis() {
-    if (!summary) return;
+    if (!summary) return false;
     if (!selectionReady) {
       const message = 'Cần chọn 2 sheet khác nhau cho Dự thầu và Chiết tính.';
       setError(message);
       onStatus(message);
-      return;
+      return false;
     }
     setBusy(true);
     setError('');
@@ -378,17 +408,22 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
     try {
       const nextAnalysis = await analyzeEstimateWorkbook(summary.saved_name, sheetSelection);
       setAnalysis(nextAnalysis);
-      void onStageChange(3);
       const count = warningCount(nextAnalysis);
       onStatus(count ? `Đã phân tích. Có ${count.toLocaleString('en-US')} cảnh báo cần xem trước khi xuất.` : 'Đã phân tích. Không có cảnh báo lớn.');
+      return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
       onStatus(message);
+      return false;
     } finally {
       setBusy(false);
     }
   }
+
+  useImperativeHandle(ref, () => ({
+    prepareAnalysis: refreshAnalysis,
+  }));
 
   async function exportWorkbook() {
     if (!summary) return;
@@ -442,15 +477,11 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
                 Chiết tính: <b>{selectedSheetName(sheets, sheetSelection.detail_sheet_index) || 'chưa chọn'}</b>
               </p>
             </div>
+            {stage === 3 && (
             <div className="estimate-actions">
-              <label className="btn-secondary estimate-reupload">
-                Đổi file
-                <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy || !licenseReady} onChange={(event) => void handleUpload(event.currentTarget.files?.[0] || null)} />
-              </label>
-              {stage !== 2 && <button type="button" className="btn-secondary" disabled={busy || !licenseReady} onClick={() => void onStageChange(2)}>Chọn lại sheet</button>}
-              {stage === 3 && <button type="button" className="btn-secondary" disabled={busy || !licenseReady} onClick={() => void refreshAnalysis()}>Phân tích lại</button>}
               {stage === 3 && <button type="button" disabled={!canExport} onClick={() => void exportWorkbook()}>{busy ? 'Đang xử lý...' : 'Xuất file bóc tách'}</button>}
             </div>
+            )}
           </section>
 
           {error && <p className="estimate-error">{error}</p>}
@@ -492,9 +523,6 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
                 <strong>{sheets.length.toLocaleString('en-US')} sheet trong file</strong>
                 <span>{selectionReady ? 'Đã đủ lựa chọn để phân tích.' : 'Cần chọn 2 sheet khác nhau.'}</span>
               </div>
-              <div className="estimate-actions">
-                <button type="button" disabled={!selectionReady || busy || !licenseReady} onClick={() => void refreshAnalysis()}>{busy ? 'Đang phân tích...' : 'Phân tích file'}</button>
-              </div>
             </section>
           )}
 
@@ -535,4 +563,4 @@ export function EstimateExtractorWorkflow({ licenseReady, onStatus, stage, onSta
       )}
     </section>
   );
-}
+});

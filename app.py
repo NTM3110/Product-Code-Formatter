@@ -3,6 +3,7 @@ import base64
 import ipaddress
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,8 @@ from product_code import code_normalization, config_store
 from product_code import license_client as product_license_client
 
 APP_VERSION = "0.1"
+CONFIG_SCHEMA_VERSION = 2
+LEGACY_VIETMAX_STORAGE_PROFILES = {"vietmax_mua_vao", "vietmax_ban_ra"}
 LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 XLS_MAX_ROWS = 65536
 XLS_MAX_COLUMNS = 256
@@ -65,11 +68,16 @@ else:
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 CONFIG_PATH = APP_DATA_DIR / "product_code_config.json"
+LICENSE_PATH = APP_DATA_DIR / "license.json"
+DEFAULT_FORM_MAPPINGS_PATH = APP_DATA_DIR / "default_form_mappings.json"
+CONFIG_BACKUP_DIR = APP_DATA_DIR / "config_backups"
+TEMPLATE_DIR = APP_DATA_DIR / "templates"
 ICON_PATH = RESOURCE_DIR / "app_icon.ico"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder=None)
 app.json_provider_class = CustomJSONProvider
@@ -211,6 +219,7 @@ def empty_profile_config(profile_key_name=None, include_scopes=True):
         "processing_groups": [],
         "company_group_assignments": {},
         "form_mapping_presets": [],
+        "form_mapping_initialized": False,
         "columns": {},
     }
     if include_scopes:
@@ -224,6 +233,7 @@ def empty_profile_config(profile_key_name=None, include_scopes=True):
 def default_config():
     return {
         "app_version": APP_VERSION,
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
         "selected_profile": "son_phuong",
         "license": empty_license_config(),
         "profiles": {key: empty_profile_config(key) for key in PROFILE_LABELS},
@@ -1099,6 +1109,7 @@ def normalize_profile_config(profile_key_name, profile, include_scopes=True):
         "processing_groups": normalize_processing_groups_for_config(profile.get("processing_groups") or []),
         "company_group_assignments": dict(profile.get("company_group_assignments") or {}),
         "form_mapping_presets": list(profile.get("form_mapping_presets") or []),
+        "form_mapping_initialized": bool(profile.get("form_mapping_initialized")) or bool(profile.get("form_mapping_presets")),
         "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
     }
     if include_scopes:
@@ -1121,6 +1132,7 @@ def normalize_profile_config(profile_key_name, profile, include_scopes=True):
 def normalize_config(data):
     cfg = default_config()
     cfg["app_version"] = APP_VERSION
+    cfg["config_schema_version"] = CONFIG_SCHEMA_VERSION
     if isinstance(data, dict):
         selected = data.get("selected_profile") or data.get("active_profile") or data.get("format_rule")
         cfg["selected_profile"] = profile_key(selected) if selected else cfg["selected_profile"]
@@ -1139,11 +1151,95 @@ def normalize_config(data):
                 profiles[target] = profiles[alias]
         for key in PROFILE_LABELS:
             cfg["profiles"][key].update(normalize_profile_config(key, profiles.get(key) or {}))
+        vietmax_profile = cfg["profiles"].get(VIETMAX_PROFILE) or empty_profile_config(VIETMAX_PROFILE)
+        raw_vietmax = profiles.get(VIETMAX_PROFILE) if isinstance(profiles.get(VIETMAX_PROFILE), dict) else {}
+        raw_scopes = raw_vietmax.get("scopes") if isinstance(raw_vietmax.get("scopes"), dict) else {}
+        for phase, legacy_key in (
+            (VIETMAX_PHASE_PURCHASE, "vietmax_mua_vao"),
+            (VIETMAX_PHASE_SALES, "vietmax_ban_ra"),
+        ):
+            raw_scope = raw_scopes.get(phase) if isinstance(raw_scopes.get(phase), dict) else {}
+            legacy_profile = profiles.get(legacy_key) if isinstance(profiles.get(legacy_key), dict) else {}
+            if not profile_config_has_user_data(raw_scope) and profile_config_has_user_data(legacy_profile):
+                vietmax_profile["scopes"][phase] = normalize_profile_config(
+                    VIETMAX_PROFILE,
+                    legacy_profile,
+                    include_scopes=False,
+                )
+        cfg["profiles"][VIETMAX_PROFILE] = vietmax_profile
     if cfg["selected_profile"] not in PROFILE_LABELS:
         cfg["selected_profile"] = "son_phuong"
     cfg["columns"].setdefault("invoice_status_col", DEFAULT_INVOICE_STATUS_COL)
     if not isinstance(cfg["columns"].get("invoice_status_skip_values"), list):
         cfg["columns"]["invoice_status_skip_values"] = DEFAULT_INVOICE_STATUS_SKIP_VALUES[:]
+    return cfg
+
+
+def profile_config_has_user_data(profile):
+    if not isinstance(profile, dict):
+        return False
+    ignored = {
+        "scopes",
+        "prefix_strategy",
+        "prefix_mst_digits",
+        "prefix_name_words",
+        "prefix_name_chars",
+        "prefix_missing_mst_strategy",
+        "include_company_prefix",
+        "price_adjust_all_percent",
+        "use_default_inventory_pair",
+        "default_inventory_pair_id",
+    }
+    for key, value in profile.items():
+        if key in ignored:
+            continue
+        if isinstance(value, (dict, list, tuple, set)) and value:
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (int, float)) and value:
+            return True
+    return False
+
+
+def canonical_config_for_storage(cfg):
+    stored = json.loads(json.dumps(cfg, ensure_ascii=False, default=raw_text))
+    stored["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    stored.pop("license", None)
+    strip_system_default_forms_from_profiles(stored)
+    profiles = stored.get("profiles") if isinstance(stored.get("profiles"), dict) else {}
+    for key in LEGACY_VIETMAX_STORAGE_PROFILES:
+        profiles.pop(key, None)
+    stored["profiles"] = profiles
+    return stored
+
+
+def persist_configured_form_templates(cfg):
+    profiles = cfg.get("profiles") if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict) else {}
+
+    def persist_profile(profile):
+        if not isinstance(profile, dict):
+            return
+        forms = profile.get("form_mapping_presets") if isinstance(profile.get("form_mapping_presets"), list) else []
+        for form in forms:
+            if not isinstance(form, dict):
+                continue
+            saved_name = Path(str(form.get("template_saved_name") or "")).name
+            if not saved_name:
+                continue
+            persistent_path = TEMPLATE_DIR / saved_name
+            legacy_path = UPLOAD_DIR / saved_name
+            if not persistent_path.exists() and legacy_path.exists() and legacy_path.is_file():
+                try:
+                    shutil.copy2(legacy_path, persistent_path)
+                except OSError:
+                    pass
+        scopes = profile.get("scopes") if isinstance(profile.get("scopes"), dict) else {}
+        for scoped in scopes.values():
+            persist_profile(scoped)
+
+    for profile in profiles.values():
+        persist_profile(profile)
     return cfg
 
 
@@ -1200,22 +1296,87 @@ def recover_license_from_backup_configs(cfg):
     return cfg, False
 
 
+def migrate_config_file_if_needed():
+    if not CONFIG_PATH.exists() or not CONFIG_PATH.is_file():
+        return None
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    try:
+        schema_version = int(raw.get("config_schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    if schema_version >= CONFIG_SCHEMA_VERSION:
+        return None
+    backup_path = config_store.backup_config_file(CONFIG_PATH, CONFIG_BACKUP_DIR)
+    persist_configured_form_templates(raw)
+    if not LICENSE_PATH.exists() and isinstance(raw.get("license"), dict):
+        save_license_config(raw.get("license"))
+    config_store.save_config_file(
+        CONFIG_PATH,
+        raw,
+        normalize_config,
+        serializer=canonical_config_for_storage,
+    )
+    return backup_path
+
+
 def load_config():
     if not CONFIG_PATH.exists() and LEGACY_REPO_CONFIG_PATH.exists():
         try:
             legacy = json.loads(LEGACY_REPO_CONFIG_PATH.read_text(encoding="utf-8"))
-            return config_store.save_config_file(CONFIG_PATH, legacy, normalize_config)
+            config_store.backup_config_file(LEGACY_REPO_CONFIG_PATH, CONFIG_BACKUP_DIR)
+            persist_configured_form_templates(legacy)
+            if not LICENSE_PATH.exists() and isinstance(legacy.get("license"), dict):
+                save_license_config(legacy.get("license"))
+            config_store.save_config_file(
+                CONFIG_PATH,
+                legacy,
+                normalize_config,
+                serializer=canonical_config_for_storage,
+            )
         except Exception:
             pass
+    migrate_config_file_if_needed()
     cfg = config_store.load_config_file(CONFIG_PATH, default_config, normalize_config)
-    cfg, recovered = recover_license_from_backup_configs(cfg)
-    if recovered:
-        return config_store.save_config_file(CONFIG_PATH, cfg, normalize_config)
-    return cfg
+    if LICENSE_PATH.exists():
+        license_cfg = load_license_config()
+    else:
+        cfg, _ = recover_license_from_backup_configs(cfg)
+        license_cfg = save_license_config(cfg.get("license") or {})
+
+    embedded_license = False
+    if CONFIG_PATH.exists():
+        try:
+            embedded_license = "license" in json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            embedded_license = False
+    if embedded_license:
+        config_store.backup_config_file(CONFIG_PATH, CONFIG_BACKUP_DIR)
+        config_store.save_config_file(
+            CONFIG_PATH,
+            cfg,
+            normalize_config,
+            serializer=canonical_config_for_storage,
+        )
+    cfg["license"] = license_cfg
+    return apply_system_default_forms_to_config(cfg)
 
 
 def save_config(cfg):
-    return config_store.save_config_file(CONFIG_PATH, cfg, normalize_config)
+    cfg = apply_system_default_forms_to_config(cfg)
+    persist_configured_form_templates(cfg)
+    if isinstance(cfg, dict) and "license" in cfg:
+        save_license_config(cfg.get("license") or {})
+    saved = config_store.save_config_file(
+        CONFIG_PATH,
+        cfg,
+        normalize_config,
+        serializer=canonical_config_for_storage,
+    )
+    saved["license"] = load_license_config()
+    return apply_system_default_forms_to_config(saved)
 
 
 def normalize_word_rules(value):
@@ -5007,13 +5168,212 @@ def default_vietmax_form_mapping_presets(phase=None):
             fast_mapping_rule("E", "K", "sales"),
         ],
     }
-    forms = [purchase_form, sales_form, material_form, customer_form]
+    duplicate_report_form = {
+        "id": "fast_duplicate_invoice_report",
+        "label": "B\u00e1o c\u00e1o tr\u00f9ng s\u1ed1 ch\u1ee9ng t\u1eeb",
+        "scope": "both",
+        "type": "builtin",
+        "enabled": True,
+        "builtin_exporter": "fast_duplicate_report",
+        "group_id": "materials",
+        "input_phase": "both",
+        "sheet": "Bao_cao_trung_so_ct",
+        "system_generated": True,
+        "output_columns": fast_output_columns(FAST_DUPLICATE_PURCHASE_REPORT_HEADERS),
+        "mappings": [],
+    }
+    forms = [purchase_form, duplicate_report_form, sales_form, material_form, customer_form]
     normalized_phase = raw_text(phase)
     if normalized_phase == VIETMAX_PHASE_PURCHASE:
         return [form for form in forms if form.get("scope") in {"purchase", "both"}]
     if normalized_phase == VIETMAX_PHASE_SALES:
         return [form for form in forms if form.get("scope") in {"sales", "both"}]
     return forms
+
+
+SYSTEM_DEFAULT_FORM_MAPPING_VERSION = 2
+
+
+def default_form_mapping_document():
+    return {
+        "schema_version": SYSTEM_DEFAULT_FORM_MAPPING_VERSION,
+        "product": "ProductCodeFormatter",
+        "forms": default_vietmax_form_mapping_presets(),
+    }
+
+
+def normalize_default_form_mapping_document(value):
+    value = value if isinstance(value, dict) else {}
+    forms = value.get("forms")
+    try:
+        schema_version = int(value.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    return {
+        "schema_version": schema_version,
+        "product": "ProductCodeFormatter",
+        "forms": list(forms) if isinstance(forms, list) and forms else default_vietmax_form_mapping_presets(),
+    }
+
+
+def load_system_default_form_mappings(phase=None):
+    if not DEFAULT_FORM_MAPPINGS_PATH.exists():
+        document = config_store.save_config_file(
+            DEFAULT_FORM_MAPPINGS_PATH,
+            default_form_mapping_document(),
+            normalize_default_form_mapping_document,
+        )
+    else:
+        document = config_store.load_config_file(
+            DEFAULT_FORM_MAPPINGS_PATH,
+            default_form_mapping_document,
+            normalize_default_form_mapping_document,
+        )
+        if (
+            document.get("schema_version") != SYSTEM_DEFAULT_FORM_MAPPING_VERSION
+            or not isinstance(document.get("forms"), list)
+            or len(document.get("forms") or []) < 5
+        ):
+            document = config_store.save_config_file(
+                DEFAULT_FORM_MAPPINGS_PATH,
+                default_form_mapping_document(),
+                normalize_default_form_mapping_document,
+            )
+    forms = json.loads(json.dumps(document.get("forms") or [], ensure_ascii=False))
+    normalized_phase = raw_text(phase)
+    if normalized_phase == VIETMAX_PHASE_PURCHASE:
+        return [form for form in forms if form.get("scope") in {"purchase", "both"}]
+    if normalized_phase == VIETMAX_PHASE_SALES:
+        return [form for form in forms if form.get("scope") in {"sales", "both"}]
+    return forms
+
+
+def _form_without_runtime_markers(form):
+    clean = json.loads(json.dumps(form, ensure_ascii=False, default=raw_text))
+    clean.pop("_system_default", None)
+    return clean
+
+
+def merge_system_default_form_mappings(forms, phase=None):
+    defaults = load_system_default_form_mappings(phase)
+    configured = [form for form in (forms or []) if isinstance(form, dict)]
+    configured_by_id = {
+        raw_text(form.get("id")): form
+        for form in configured
+        if raw_text(form.get("id"))
+    }
+    result = []
+    default_ids = set()
+    for default in defaults:
+        form_id = raw_text(default.get("id"))
+        default_ids.add(form_id)
+        selected = configured_by_id.get(form_id)
+        if selected is None:
+            selected = dict(default)
+            selected["_system_default"] = True
+        result.append(selected)
+    result.extend(
+        form for form in configured
+        if raw_text(form.get("id")) not in default_ids
+    )
+    return result
+
+
+def hydrate_builtin_default_form_assets(forms, phase=None):
+    defaults = {
+        raw_text(form.get("id")): form
+        for form in load_system_default_form_mappings(phase)
+        if raw_text(form.get("id"))
+    }
+    hydrated = []
+    for form in forms or []:
+        if not isinstance(form, dict):
+            continue
+        default = defaults.get(raw_text(form.get("id")))
+        if default is None:
+            hydrated.append(form)
+            continue
+        current = dict(form)
+        for key in ("type", "builtin_exporter", "output_columns", "sheet", "system_generated"):
+            if key == "output_columns" and isinstance(current.get(key), list) and current.get(key):
+                continue
+            if key in default:
+                current[key] = json.loads(json.dumps(default[key], ensure_ascii=False))
+            else:
+                current.pop(key, None)
+        current.pop("template_saved_name", None)
+        current.pop("template_original_name", None)
+        current.pop("output_preview", None)
+        hydrated.append(current)
+    return hydrated
+
+
+def apply_system_default_forms_to_config(cfg):
+    profiles = cfg.get("profiles") if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict) else {}
+
+    def initialize_profile(profile, phase=None):
+        if not isinstance(profile, dict):
+            return
+        profile["form_mapping_presets"] = merge_system_default_form_mappings(
+            profile.get("form_mapping_presets"), phase
+        )
+        profile["form_mapping_initialized"] = True
+        profile["form_mapping_presets"] = hydrate_builtin_default_form_assets(
+            profile.get("form_mapping_presets"), phase
+        )
+
+    for profile in profiles.values():
+        initialize_profile(profile)
+        scopes = profile.get("scopes") if isinstance(profile, dict) and isinstance(profile.get("scopes"), dict) else {}
+        for phase in (VIETMAX_PHASE_PURCHASE, VIETMAX_PHASE_SALES):
+            initialize_profile(scopes.get(phase), phase)
+    return cfg
+
+
+def strip_system_default_forms_from_profiles(cfg):
+    profiles = cfg.get("profiles") if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict) else {}
+    system_by_phase = {
+        "all": {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings()},
+        VIETMAX_PHASE_PURCHASE: {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings(VIETMAX_PHASE_PURCHASE)},
+        VIETMAX_PHASE_SALES: {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings(VIETMAX_PHASE_SALES)},
+    }
+
+    def strip_profile(profile, phase="all"):
+        if not isinstance(profile, dict):
+            return
+        kept = []
+        for form in profile.get("form_mapping_presets") or []:
+            if not isinstance(form, dict):
+                continue
+            clean = _form_without_runtime_markers(form)
+            system = system_by_phase[phase].get(raw_text(clean.get("id")))
+            if system is not None and clean == system:
+                continue
+            kept.append(clean)
+        profile["form_mapping_presets"] = kept
+        scopes = profile.get("scopes") if isinstance(profile.get("scopes"), dict) else {}
+        for scope_phase in (VIETMAX_PHASE_PURCHASE, VIETMAX_PHASE_SALES):
+            strip_profile(scopes.get(scope_phase), scope_phase)
+
+    for profile in profiles.values():
+        strip_profile(profile)
+    return cfg
+
+
+def load_license_config():
+    return config_store.load_config_file(
+        LICENSE_PATH,
+        empty_license_config,
+        normalize_license_config,
+    )
+
+
+def save_license_config(value):
+    return config_store.save_config_file(
+        LICENSE_PATH,
+        value or {},
+        normalize_license_config,
+    )
 
 
 def processed_vietmax_source_indexes():
@@ -5741,7 +6101,7 @@ def fast_import_sheet_rows(
     sales_raw_rows = sales_rows
     forms = fast_mapping_forms_from_payload(form_mapping_presets)
     if not forms and use_default_forms_when_empty:
-        forms = default_vietmax_form_mapping_presets()
+        forms = load_system_default_form_mappings()
     total_steps = 4
     done_steps = 0
 
@@ -5794,7 +6154,7 @@ def fast_import_sheet_rows(
     if include_duplicate_report:
         result["Bao_cao_trung_so_ct"] = (FAST_DUPLICATE_PURCHASE_REPORT_HEADERS, duplicate_purchase_report_rows + duplicate_sales_report_rows)
 
-    builtin_ids = {"fast_hoadonmuahang", "fast_hoadonbanhang", "fast_dm_vat_tu", "fast_dm_khach_hang"}
+    builtin_ids = {"fast_hoadonmuahang", "fast_hoadonbanhang", "fast_dm_vat_tu", "fast_dm_khach_hang", "fast_duplicate_report"}
     for form in forms:
         if raw_text(form.get("builtin_exporter")) in builtin_ids:
             continue

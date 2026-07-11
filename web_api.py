@@ -1,3 +1,4 @@
+import atexit
 import json
 import mimetypes
 import os
@@ -21,10 +22,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import (
+    APP_DATA_DIR,
     DEFAULT_INVOICE_STATUS_COL,
     DEFAULT_INVOICE_STATUS_SKIP_VALUES,
     ICON_PATH,
     OUTPUT_DIR,
+    TEMPLATE_DIR,
     UPLOAD_DIR,
     XLS_MEDIA_TYPE,
     VIETMAX_COMPARISON_SCOPE_ALL_COMPANIES,
@@ -37,7 +40,7 @@ from app import (
     activate_keygen_license,
     build_vietmax_ban_ra_purchase_matches,
     build_vietmax_khh_exact_purchase_matches,
-    default_vietmax_form_mapping_presets,
+    load_system_default_form_mappings,
     apply_word_rules_to_words,
     cell,
     code_words,
@@ -55,6 +58,7 @@ from app import (
     mixed_xls_workbook,
     apply_product_code_replacement,
     normalize_config,
+    normalize_profile_config,
     normalize_product_code_replacements,
     normalize_vietmax_comparison_scope,
     normalize_inventory_pair_rules,
@@ -101,6 +105,13 @@ from product_code.excel_io import (
     workbook_content_for_openpyxl,
 )
 from product_code.license_client import public_license_status as build_public_license_status
+from product_code.workflow_runtime import (
+    WorkflowFailure,
+    WorkflowJobManager,
+    WorkflowSessionStore,
+    file_sha256,
+    stable_signature,
+)
 from workflows.estimate_extractor.logic import analyze_estimate_workbook, create_estimate_output_workbook, list_estimate_workbook_sheets
 
 APP_DIR = Path(__file__).resolve().parent
@@ -108,6 +119,16 @@ REACT_DIST_DIR = APP_DIR / "react_frontend" / "dist"
 PROGRESS_LOCK = threading.Lock()
 PROGRESS_JOBS: dict[str, dict] = {}
 PROGRESS_TTL_SECONDS = 900
+WORKFLOW_SESSION_STORE = WorkflowSessionStore(APP_DATA_DIR / "sessions", UPLOAD_DIR)
+WORKFLOW_JOB_MANAGER = WorkflowJobManager(max_workers=2)
+
+
+def close_workflow_runtime():
+    WORKFLOW_JOB_MANAGER.shutdown()
+    WORKFLOW_SESSION_STORE.close()
+
+
+atexit.register(close_workflow_runtime)
 
 
 PREFIX_STRATEGIES = ("last_2_words", "last_3_mst", "2_words_mst", "all_name_words")
@@ -136,7 +157,23 @@ def keep_form_mapping_presets(payload: dict, profile_cfg: dict):
     if "form_mapping_presets" not in payload:
         return profile_cfg.get("form_mapping_presets", [])
     value = payload.get("form_mapping_presets")
-    return value if isinstance(value, list) else []
+    if not isinstance(value, list):
+        return profile_cfg.get("form_mapping_presets", [])
+    if payload.get("replace_form_mapping_presets") is True:
+        return value
+
+    existing = profile_cfg.get("form_mapping_presets")
+    existing = existing if isinstance(existing, list) else []
+    incoming_ids = {
+        str(item.get("id") or "").strip()
+        for item in value
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    preserved = [
+        item for item in existing
+        if isinstance(item, dict) and str(item.get("id") or "").strip() not in incoming_ids
+    ]
+    return value + preserved
 
 
 def has_company_selection_payload(payload: dict) -> bool:
@@ -632,6 +669,20 @@ class VietmaxProcessRequest(BaseModel):
     cache_only: bool = False
 
 
+class WorkflowProcessJobRequest(BaseModel):
+    saved_name: str
+    original_name: str = "output.xlsx"
+    payload: dict
+    processor: str = "vietmax"
+    retry: bool = False
+
+
+class WorkflowJsonJobRequest(BaseModel):
+    kind: str
+    payload: dict
+    retry: bool = False
+
+
 class LicenseActivationRequest(BaseModel):
     server_url: str = ""
     account_id: str = ""
@@ -690,6 +741,140 @@ def create_app() -> FastAPI:
     @api.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "profile": "vietmax"}
+
+    @api.get("/api/session/current")
+    def current_workflow_session() -> dict:
+        return WORKFLOW_SESSION_STORE.snapshot()
+
+    @api.post("/api/session/close")
+    def close_workflow_session() -> dict:
+        WORKFLOW_SESSION_STORE.close()
+        return {"status": "closed", "session_id": WORKFLOW_SESSION_STORE.session_id}
+
+    @api.get("/api/jobs/{job_id}")
+    def workflow_job(job_id: str) -> dict:
+        job = WORKFLOW_JOB_MANAGER.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Không tìm thấy tiến trình xử lý.")
+        return job
+
+    @api.get("/api/artifacts/{artifact_id}")
+    def workflow_artifact(artifact_id: str) -> FileResponse:
+        artifact = WORKFLOW_SESSION_STORE.artifact(artifact_id)
+        if not artifact or not artifact.get("valid"):
+            raise HTTPException(status_code=404, detail="File cache không còn hợp lệ trong phiên làm việc này.")
+        path = uploaded_path(artifact.get("saved_name"))
+        filename = artifact.get("original_name") or path.name
+        return FileResponse(path, filename=filename, media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+    @api.post("/api/workflow/process-jobs")
+    def start_workflow_process_job(payload: WorkflowProcessJobRequest) -> dict:
+        path = uploaded_path(payload.saved_name)
+        process_payload = dict(payload.payload or {})
+        phase = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
+        profile = profile_key(process_payload.get("profile") or VIETMAX_PROFILE)
+        signature = stable_signature({
+            "processor_version": 2,
+            "processor": payload.processor,
+            "profile": profile,
+            "phase": phase,
+            "source_sha256": file_sha256(path),
+            "payload": process_payload,
+        })
+        kind = f"processed:{profile}:{phase}"
+
+        def runner(progress):
+            cached = WORKFLOW_SESSION_STORE.artifact_by_signature(kind, signature)
+            if cached:
+                return {"artifact": cached, "processed_saved_name": cached["saved_name"], "reused": True}
+            return run_workflow_process_job(
+                path,
+                payload.original_name,
+                process_payload,
+                payload.processor,
+                kind,
+                signature,
+                progress,
+            )
+
+        return WORKFLOW_JOB_MANAGER.start(
+            kind,
+            signature,
+            runner,
+            retry=payload.retry,
+            context={"profile": profile, "phase": phase, "source": payload.original_name},
+        )
+
+    @api.post("/api/workflow/json-jobs")
+    def start_workflow_json_job(payload: WorkflowJsonJobRequest) -> dict:
+        kind = raw_text(payload.kind)
+        request_payload = dict(payload.payload or {})
+        request_payload.pop("operation_id", None)
+        source_hashes = {}
+        for key in ("saved_name", "purchase_saved_name", "sales_saved_name"):
+            saved_name = raw_text(request_payload.get(key))
+            if not saved_name:
+                continue
+            source_hashes[key] = file_sha256(uploaded_path(saved_name))
+        signature = stable_signature({
+            "operation_version": 2,
+            "kind": kind,
+            "payload": request_payload,
+            "source_hashes": source_hashes,
+        })
+
+        def runner(progress):
+            progress(0, 1, "Đang xử lý")
+            try:
+                if kind == "vietmax-review":
+                    result = vietmax_review(VietmaxReviewRequest(**request_payload))
+                elif kind == "generic-review":
+                    result = generic_review(GenericReviewRequest(**request_payload))
+                elif kind == "sales-match":
+                    result = vietmax_sales_match(VietmaxSalesMatchRequest(**request_payload))
+                elif kind == "fast-export":
+                    response = create_vietmax_fast_import_package(VietmaxFastImportPackageRequest(**request_payload))
+                    saved_name = f"fast_{uuid.uuid4().hex}.xls"
+                    target = UPLOAD_DIR / saved_name
+                    target.write_bytes(bytes(response.body))
+                    artifact_kind = f"export:fast:{profile_key(request_payload.get('profile') or VIETMAX_PROFILE)}"
+                    artifact = WORKFLOW_SESSION_STORE.register_file(
+                        saved_name,
+                        kind=artifact_kind,
+                        original_name="vietmax_fast_import.xls",
+                        signature=signature,
+                        supersede_kind=True,
+                    )
+                    result = {"artifact": artifact}
+                else:
+                    raise WorkflowFailure(
+                        "UNKNOWN_JOB_KIND",
+                        f"Không hỗ trợ loại tiến trình: {kind}",
+                        field="kind",
+                        retryable=False,
+                    )
+            except HTTPException as exc:
+                detail = exc.detail
+                if isinstance(detail, dict):
+                    raise WorkflowFailure(
+                        detail.get("code") or "WORKFLOW_REQUEST_FAILED",
+                        detail.get("message") or str(detail),
+                        stage=detail.get("stage") or "",
+                        field=detail.get("field") or "",
+                        details=detail.get("details") or {},
+                        retryable=detail.get("retryable", True),
+                    ) from exc
+                raise WorkflowFailure("WORKFLOW_REQUEST_FAILED", str(detail), retryable=True) from exc
+            progress(1, 1, "Đã hoàn tất")
+            return json_safe(result)
+
+        return WORKFLOW_JOB_MANAGER.start(
+            kind,
+            signature,
+            runner,
+            retry=payload.retry,
+            context={"kind": kind},
+        )
 
     @api.get("/api/progress/{operation_id}")
     def operation_progress(operation_id: str) -> dict:
@@ -754,7 +939,7 @@ def create_app() -> FastAPI:
         return public_license_status(save_config(current))
 
     @api.post("/api/files/upload")
-    async def upload_excel(file: UploadFile = File(...)) -> dict:
+    async def upload_excel(file: UploadFile = File(...), purpose: str = Form("source")) -> dict:
         original = file.filename or ""
         ext = Path(original).suffix.lower()
         if ext not in {".xls", ".xlsx", ".xlsm"}:
@@ -767,7 +952,35 @@ def create_app() -> FastAPI:
         except Exception as exc:
             path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return workbook_summary(df, original, saved_name)
+        summary = workbook_summary(df, original, saved_name)
+        safe_purpose = re.sub(r"[^a-z0-9_-]+", "-", raw_text(purpose).lower()).strip("-") or "source"
+        artifact = WORKFLOW_SESSION_STORE.register_file(
+            saved_name,
+            kind=f"source:{safe_purpose}",
+            original_name=original,
+            metadata={"summary": summary},
+        )
+        return {
+            **summary,
+            "artifact_id": artifact["artifact_id"],
+            "session_id": WORKFLOW_SESSION_STORE.session_id,
+        }
+
+    @api.post("/api/templates/upload")
+    async def upload_form_template(file: UploadFile = File(...)) -> dict:
+        original = file.filename or ""
+        ext = Path(original).suffix.lower()
+        if ext not in {".xls", ".xlsx", ".xlsm"}:
+            raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file mẫu Excel .xls, .xlsx hoặc .xlsm.")
+        saved_name = f"template_{uuid.uuid4().hex}{ext}"
+        path = TEMPLATE_DIR / saved_name
+        path.write_bytes(await file.read())
+        try:
+            _, df = read_workbook(path)
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {**workbook_summary(df, original, saved_name), "persistent_template": True}
 
     @api.post("/api/estimate/upload")
     async def upload_estimate_workbook(file: UploadFile = File(...)) -> dict:
@@ -783,9 +996,12 @@ def create_app() -> FastAPI:
         except Exception as exc:
             path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        artifact = WORKFLOW_SESSION_STORE.register_file(saved_name, kind="estimate-source", original_name=original)
         return json_safe({
             "original_name": original,
             "saved_name": saved_name,
+            "artifact_id": artifact["artifact_id"],
+            "session_id": WORKFLOW_SESSION_STORE.session_id,
             "size": path.stat().st_size,
             **sheet_info,
         })
@@ -849,7 +1065,7 @@ def create_app() -> FastAPI:
                 "purchase": vietmax_default_source_columns(VIETMAX_PHASE_PURCHASE),
                 "sales": vietmax_default_source_columns(VIETMAX_PHASE_SALES),
             },
-            "form_mapping_presets": default_vietmax_form_mapping_presets(),
+            "form_mapping_presets": load_system_default_form_mappings(),
         })
 
     @api.post("/api/invoice_statuses")
@@ -1156,7 +1372,7 @@ def create_app() -> FastAPI:
                     form_mapping_presets = process_payload.get("form_mapping_presets") if isinstance(process_payload.get("form_mapping_presets"), list) else []
                 else:
                     saved_form_mapping_presets = profile_cfg.get("form_mapping_presets")
-                    form_mapping_presets = saved_form_mapping_presets if isinstance(saved_form_mapping_presets, list) else default_vietmax_form_mapping_presets(input_phase)
+                    form_mapping_presets = saved_form_mapping_presets if isinstance(saved_form_mapping_presets, list) else load_system_default_form_mappings(input_phase)
                 final_stream = generic_form_mapping_export_workbook_stream(
                     processed_df,
                     form_mapping_presets=form_mapping_presets,
@@ -1332,7 +1548,7 @@ def create_app() -> FastAPI:
         operation_id = raw_text(payload.operation_id)
         started_at = time.perf_counter()
         profile_for_log = profile_key(payload.profile)
-        update_progress_job(operation_id, 0, 1, "Đang chuẩn bị tạo workbook FAST 4 sheet", status="running")
+        update_progress_job(operation_id, 0, 1, "Đang chuẩn bị tạo workbook FAST 5 sheet", status="running")
         try:
             diagnostic_log(
                 "fast-import-package start "
@@ -1356,6 +1572,7 @@ def create_app() -> FastAPI:
             purchase_forms = payload.purchase_form_mapping_presets if payload.purchase_form_mapping_presets is not None else purchase_profile.get("form_mapping_presets")
             sales_forms = payload.sales_form_mapping_presets if payload.sales_form_mapping_presets is not None else sales_profile.get("form_mapping_presets")
             form_mapping_presets = fast_merge_mapping_forms(purchase_forms, sales_forms)
+            validate_form_mapping_columns(form_mapping_presets)
             purchase_assignments = payload.purchase_company_group_assignments if payload.purchase_company_group_assignments is not None else purchase_profile.get("company_group_assignments")
             sales_assignments = payload.sales_company_group_assignments if payload.sales_company_group_assignments is not None else sales_profile.get("company_group_assignments")
 
@@ -1374,6 +1591,14 @@ def create_app() -> FastAPI:
                 "fast-import-package workbook_done "
                 f"operation={operation_id or '-'} profile={profile_for_log} elapsed={time.perf_counter() - started_at:.2f}s"
             )
+        except WorkflowFailure as exc:
+            exc.operation_id = exc.operation_id or operation_id
+            diagnostic_log(
+                "fast-import-package validation_error "
+                f"operation={operation_id or '-'} profile={profile_for_log} elapsed={time.perf_counter() - started_at:.2f}s error={exc}"
+            )
+            update_progress_job(operation_id, 1, 1, exc.message, status="error")
+            raise HTTPException(status_code=400, detail=exc.as_dict()) from exc
         except Exception as exc:
             diagnostic_log(
                 "fast-import-package error "
@@ -1381,7 +1606,7 @@ def create_app() -> FastAPI:
             )
             update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        update_progress_job(operation_id, 1, 1, "Đã tạo xong workbook FAST 4 sheet", status="complete")
+        update_progress_job(operation_id, 1, 1, "Đã tạo xong workbook FAST 5 sheet", status="complete")
         return Response(
             stream.getvalue(),
             media_type=XLS_MEDIA_TYPE,
@@ -1423,6 +1648,7 @@ def create_app() -> FastAPI:
         cfg["selected_profile"] = profile
         cfg.setdefault("columns", {}).update(payload.get("columns") or {})
         _, profile_cfg = ensure_profile_scope(cfg, profile, phase)
+        previous_profile_signature = stable_signature(profile_cfg)
         profile_cfg.update({
             "prefixes": keep_company_config_when_unloaded(payload, profile_cfg, "prefixes", "prefixes", {}),
             "selected_products": keep_company_config_when_unloaded(payload, profile_cfg, "skipped_products_map", "selected_products", {}),
@@ -1455,6 +1681,11 @@ def create_app() -> FastAPI:
             "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(payload, profile_cfg, "inventory_pair_rules", [])),
             "inventory_allocation_config": keep_existing_when_empty(payload, profile_cfg, "inventory_allocation_config", {}),
         })
+        if stable_signature(profile_cfg) != previous_profile_signature:
+            invalidation_kinds = [f"processed:{profile}:{phase}"]
+            if phase == VIETMAX_PHASE_PURCHASE:
+                invalidation_kinds.append(f"processed:{profile}:{VIETMAX_PHASE_SALES}")
+            WORKFLOW_SESSION_STORE.invalidate(kinds=invalidation_kinds)
         sync_vietmax_legacy_profile(cfg, profile, phase, profile_cfg)
         return save_config(cfg)
 
@@ -1463,12 +1694,14 @@ def create_app() -> FastAPI:
         storage_profile, imported_profile = extract_vietmax_import_profile(payload or {}, phase)
         cfg = load_config()
         cfg["selected_profile"] = VIETMAX_PROFILE
-        cfg.setdefault("profiles", {})[storage_profile] = imported_profile
+        normalized_phase = normalize_vietmax_phase(phase)
+        _, scoped_profile = ensure_profile_scope(cfg, VIETMAX_PROFILE, normalized_phase)
+        scoped_profile.update(normalize_profile_config(VIETMAX_PROFILE, imported_profile, include_scopes=False))
 
         snapshot = dict_value((payload or {}).get("saved_config_file_snapshot"))
         snapshot_columns = dict_value(snapshot.get("columns"))
         payload_columns = dict_value((payload or {}).get("columns"))
-        profile_columns = dict_value(imported_profile.get("columns"))
+        profile_columns = dict_value(scoped_profile.get("columns"))
         if snapshot_columns or payload_columns or profile_columns:
             cfg.setdefault("columns", {}).update(snapshot_columns)
             cfg.setdefault("columns", {}).update(payload_columns)
@@ -1477,7 +1710,8 @@ def create_app() -> FastAPI:
         saved = save_config(cfg)
         return {
             "status": "ok",
-            "storage_profile": storage_profile,
+            "storage_profile": f"vietmax.scopes.{normalized_phase}",
+            "legacy_source_profile": storage_profile,
             "imported_keys": sorted(imported_profile.keys()),
             "config": saved,
         }
@@ -1723,6 +1957,166 @@ def inspect_vietmax_processed_file(path: Path, phase: str) -> dict:
     }
 
 
+def validate_workflow_process_payload(path: Path, payload: dict, phase: str):
+    pairs = normalize_inventory_pairs(payload.get("inventory_pairs") or [])
+    active_companies = [raw_text(value) for value in (payload.get("process_mst") or []) if raw_text(value)]
+    if active_companies and not pairs:
+        raise WorkflowFailure(
+            "INVENTORY_PAIR_REQUIRED",
+            "Chưa có cặp Mã kho / TK vật tư cho nhóm vật tư. Hãy quay lại cấu hình nâng cao và thêm ít nhất một cặp trước khi tạo file.",
+            stage="11" if phase == VIETMAX_PHASE_SALES else "5",
+            field="inventory_pairs",
+            details={"active_company_count": len(active_companies)},
+            retryable=True,
+        )
+    incomplete_pairs = [
+        pair for pair in pairs
+        if not raw_text(pair.get("ma_kho")) or not raw_text(pair.get("tk_vat_tu"))
+    ]
+    if incomplete_pairs:
+        raise WorkflowFailure(
+            "INVENTORY_PAIR_INCOMPLETE",
+            "Có cặp phân kho chưa nhập đủ Mã kho và TK vật tư.",
+            stage="11" if phase == VIETMAX_PHASE_SALES else "5",
+            field="inventory_pairs",
+            details={"pair_ids": [pair.get("id") for pair in incomplete_pairs]},
+            retryable=True,
+        )
+    try:
+        _, df = read_workbook(path)
+    except Exception as exc:
+        raise WorkflowFailure(
+            "SOURCE_WORKBOOK_UNREADABLE",
+            str(exc),
+            stage="11" if phase == VIETMAX_PHASE_SALES else "5",
+            field="source_file",
+            retryable=True,
+        ) from exc
+    required = {
+        "company_col": payload.get("company_col"),
+        "mst_col": payload.get("mst_col"),
+        "product_col": payload.get("product_col"),
+        "qty_col": payload.get("qty_col"),
+    }
+    invalid = []
+    for field, column in required.items():
+        try:
+            index = excel_col_to_index(raw_text(column))
+        except ValueError:
+            invalid.append({"field": field, "column": raw_text(column), "reason": "invalid"})
+            continue
+        if index >= df.shape[1]:
+            invalid.append({"field": field, "column": raw_text(column), "reason": "outside_sheet"})
+    if invalid:
+        raise WorkflowFailure(
+            "SOURCE_COLUMN_INVALID",
+            "Cấu hình cột không khớp với file nguồn. Hãy quay lại stage chọn cột và kiểm tra các cột được báo lỗi.",
+            stage="7" if phase == VIETMAX_PHASE_SALES else "2",
+            field="columns",
+            details={"invalid_columns": invalid, "sheet_column_count": int(df.shape[1])},
+            retryable=True,
+        )
+
+
+def validate_form_mapping_columns(forms):
+    invalid = []
+    for form in forms or []:
+        if not isinstance(form, dict) or form.get("enabled") is False:
+            continue
+        output_columns = form.get("output_columns")
+        valid_columns = [
+            column for column in (output_columns or [])
+            if isinstance(column, dict) and raw_text(column.get("letter"))
+        ]
+        if not valid_columns:
+            invalid.append({
+                "form_id": raw_text(form.get("id")),
+                "label": raw_text(form.get("label")),
+            })
+    if invalid:
+        raise WorkflowFailure(
+            "FORM_OUTPUT_COLUMNS_MISSING",
+            "Một hoặc nhiều form mapping chưa có danh sách cột output. Hãy mở Form mapping và đọc cột từ file mẫu hoặc khôi phục form mặc định.",
+            stage="0.5",
+            field="form_mapping_presets",
+            details={"forms": invalid},
+            retryable=True,
+        )
+
+def run_workflow_process_job(path, original_name, process_payload, processor, kind, signature, progress):
+    phase = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
+    profile = profile_key(process_payload.get("profile") or VIETMAX_PROFILE)
+    validate_workflow_process_payload(path, process_payload, phase)
+    progress(1, 5, "Đã kiểm tra file nguồn và cấu hình")
+    processed_purchase_saved_name = raw_text(process_payload.get("vietmax_processed_purchase_saved_name"))
+    if phase == VIETMAX_PHASE_SALES and processed_purchase_saved_name:
+        try:
+            process_payload["vietmax_processed_purchase_path"] = str(uploaded_path(processed_purchase_saved_name))
+        except HTTPException as exc:
+            raise WorkflowFailure(
+                "PURCHASE_CACHE_MISSING",
+                "Không tìm thấy cache mua vào đã xử lý. Hãy quay lại stage 5 và tạo lại file mua vào.",
+                stage="5",
+                field="processed_purchase",
+                retryable=True,
+            ) from exc
+    saved_name = f"processed_{uuid.uuid4().hex}.xls"
+    out = UPLOAD_DIR / saved_name
+    started_at = time.perf_counter()
+    try:
+        processed_df = process_workbook(path, out, process_payload, progress_callback=progress)
+        if processor == "generic" and process_payload.get("export_form_mappings"):
+            forms = process_payload.get("form_mapping_presets")
+            if not isinstance(forms, list):
+                forms = scoped_profile_config(load_config(), profile, phase).get("form_mapping_presets") or []
+            validate_form_mapping_columns(forms)
+            stream = generic_form_mapping_export_workbook_stream(
+                processed_df,
+                form_mapping_presets=forms,
+                company_group_assignments=process_payload.get("company_group_assignments") or {},
+                profile=profile,
+                progress_callback=progress,
+            )
+            out.write_bytes(stream.getvalue())
+    except WorkflowFailure:
+        out.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        out.unlink(missing_ok=True)
+        raise WorkflowFailure(
+            "WORKBOOK_PROCESSING_FAILED",
+            str(exc),
+            stage="11" if phase == VIETMAX_PHASE_SALES else "5",
+            field="processing",
+            details={"profile": profile, "phase": phase},
+            retryable=True,
+        ) from exc
+    progress(4, 5, "Đang lưu cache file đã xử lý")
+    output_name = Path(original_name or "output.xls").stem + "_fdi.xls"
+    metadata = {
+        "profile": profile,
+        "phase": phase,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+        "rows": int(len(processed_df.index)),
+        "columns": int(len(processed_df.columns)),
+    }
+    artifact = WORKFLOW_SESSION_STORE.register_file(
+        saved_name,
+        kind=kind,
+        original_name=output_name,
+        signature=signature,
+        metadata=metadata,
+        supersede_kind=True,
+    )
+    progress(5, 5, "Đã tạo cache file đã xử lý")
+    return {
+        "artifact": artifact,
+        "processed_saved_name": saved_name,
+        "reused": False,
+        "stats": metadata,
+    }
+
+
 def uploaded_path(saved_name: str) -> Path:
     path = UPLOAD_DIR / Path(saved_name).name
     if not path.exists():
@@ -1768,7 +2162,7 @@ def form_scope_matches_available_phase(form, available_phase):
 
 
 def single_phase_form_presets(forms, available_phase):
-    source_forms = forms if isinstance(forms, list) else default_vietmax_form_mapping_presets(available_phase)
+    source_forms = forms if isinstance(forms, list) else load_system_default_form_mappings(available_phase)
     result = []
     for form in source_forms:
         if not isinstance(form, dict) or form.get("enabled") is False:

@@ -1,11 +1,18 @@
-import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary } from './types';
+import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob, WorkflowSession } from './types';
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
     return response.json() as Promise<T>;
   }
   const payload = await response.json().catch(() => ({}));
-  throw new Error(String(payload.detail || payload.error || response.statusText));
+  const detail = payload.detail || payload.error;
+  if (detail && typeof detail === 'object') {
+    const message = String(detail.message || response.statusText);
+    const code = String(detail.code || 'API_ERROR');
+    const operationId = String(detail.operation_id || '-');
+    throw new Error(`${message} [${code}; ${operationId}]`);
+  }
+  throw new Error(String(detail || response.statusText));
 }
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000, timeoutMessage = 'Yêu cầu xử lý quá lâu và đã được dừng. Vui lòng thử lại hoặc kiểm tra file có đang mở trong Excel không.'): Promise<Response> {
@@ -25,10 +32,74 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
 
 const workbookTimeoutMessage = 'Tạo file quá 5 phút chưa xong. Vui lòng kiểm tra cấu hình cột/form mapping, hoặc đóng file Excel đang mở rồi thử lại.';
 
-export async function uploadExcel(file: File): Promise<UploadSummary> {
+export async function uploadExcel(file: File, purpose = 'source'): Promise<UploadSummary> {
   const form = new FormData();
   form.append('file', file);
+  form.append('purpose', purpose);
   return parseJsonResponse<UploadSummary>(await fetchWithTimeout('/api/files/upload', { method: 'POST', body: form }, 180000));
+}
+
+export async function uploadFormTemplate(file: File): Promise<UploadSummary> {
+  const form = new FormData();
+  form.append('file', file);
+  return parseJsonResponse<UploadSummary>(await fetchWithTimeout('/api/templates/upload', { method: 'POST', body: form }, 180000));
+}
+
+export async function getWorkflowSession(): Promise<WorkflowSession> {
+  return parseJsonResponse<WorkflowSession>(await fetch('/api/session/current'));
+}
+
+export async function closeWorkflowSession(): Promise<void> {
+  await parseJsonResponse(await fetch('/api/session/close', { method: 'POST' }));
+}
+
+export async function startWorkflowProcessJob(payload: {
+  savedName: string;
+  originalName: string;
+  processPayload: Record<string, unknown>;
+  processor: 'vietmax' | 'generic';
+  retry?: boolean;
+}): Promise<WorkflowJob> {
+  return parseJsonResponse<WorkflowJob>(await fetch('/api/workflow/process-jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      saved_name: payload.savedName,
+      original_name: payload.originalName,
+      payload: payload.processPayload,
+      processor: payload.processor,
+      retry: Boolean(payload.retry),
+    }),
+  }));
+}
+
+export async function getWorkflowJob(jobId: string): Promise<WorkflowJob> {
+  return parseJsonResponse<WorkflowJob>(await fetch(`/api/jobs/${encodeURIComponent(jobId)}`));
+}
+
+export async function waitForWorkflowJob(initialJob: WorkflowJob, onProgress?: (job: WorkflowJob) => void): Promise<WorkflowJob> {
+  let job = initialJob;
+  onProgress?.(job);
+  while (job.status === 'queued' || job.status === 'running') {
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+    job = await getWorkflowJob(job.job_id);
+    onProgress?.(job);
+  }
+  return job;
+}
+
+async function runJsonWorkflowJob(kind: string, payload: Record<string, unknown>, retry = false): Promise<WorkflowJob> {
+  const initial = await parseJsonResponse<WorkflowJob>(await fetch('/api/workflow/json-jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, payload, retry }),
+  }));
+  const completed = await waitForWorkflowJob(initial);
+  if (completed.status === 'failed') {
+    const failure = completed.error;
+    throw new Error(`${failure?.message || 'Không thể hoàn tất xử lý.'} [${failure?.code || 'WORKFLOW_ERROR'}; ${completed.operation_id}]`);
+  }
+  return completed;
 }
 
 export async function uploadEstimateWorkbook(file: File): Promise<EstimateUploadSummary> {
@@ -188,23 +259,13 @@ export async function getOperationProgress(operationId: string): Promise<Operati
 }
 
 export async function createPurchaseReview(savedName: string, comparisonScope: string, wordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[], operationId = '', phase: 'purchase' | 'sales' = 'purchase', allowSameCodeSplit = false) {
-  return parseJsonResponse<{ products: unknown[]; review_rows: unknown[] }>(
-    await fetch('/api/vietmax/review', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ saved_name: savedName, phase, comparison_scope: comparisonScope, price_col: 'P', word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId, allow_same_code_split: allowSameCodeSplit }),
-    }),
-  );
+  const job = await runJsonWorkflowJob('vietmax-review', { saved_name: savedName, phase, comparison_scope: comparisonScope, price_col: 'P', word_rules: wordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId, allow_same_code_split: allowSameCodeSplit });
+  return job.result as unknown as { products: unknown[]; review_rows: unknown[] };
 }
 
 export async function createGenericReview(savedName: string, profile: string, comparisonScope: string, wordRules: Record<string, string>, firstWordRules: Record<string, string>, repeatedPhraseRemovals: string[], products: ReviewProduct[], operationId = '', phase: 'purchase' | 'sales' = 'purchase') {
-  return parseJsonResponse<{ products: unknown[]; review_rows: unknown[] }>(
-    await fetch('/api/review', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ saved_name: savedName, profile, vietmax_phase: phase, comparison_scope: comparisonScope, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId }),
-    }),
-  );
+  const job = await runJsonWorkflowJob('generic-review', { saved_name: savedName, profile, vietmax_phase: phase, comparison_scope: comparisonScope, word_rules: wordRules, first_word_rules: firstWordRules, repeated_phrase_removals: repeatedPhraseRemovals, products, operation_id: operationId });
+  return job.result as unknown as { products: unknown[]; review_rows: unknown[] };
 }
 
 const vietmaxInvoiceStatusSkipValues = ['Hóa đơn đã bị hủy'];
@@ -295,22 +356,21 @@ export type VietmaxFastImportMappingPayload = {
 };
 
 export async function createVietmaxFastImportPackage(purchaseSavedName: string, salesSavedName: string, operationId = '', mappingPayload: VietmaxFastImportMappingPayload = {}): Promise<Blob> {
-  const response = await fetchWithTimeout('/api/vietmax/fast-import-package', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      profile: mappingPayload.profile || 'vietmax',
-      purchase_saved_name: purchaseSavedName,
-      sales_saved_name: salesSavedName,
-      purchase_original_saved_name: mappingPayload.purchaseOriginalSavedName || '',
-      sales_original_saved_name: mappingPayload.salesOriginalSavedName || '',
-      purchase_form_mapping_presets: mappingPayload.purchaseFormMappingPresets,
-      sales_form_mapping_presets: mappingPayload.salesFormMappingPresets,
-      purchase_company_group_assignments: mappingPayload.purchaseCompanyGroupAssignments,
-      sales_company_group_assignments: mappingPayload.salesCompanyGroupAssignments,
-      operation_id: operationId,
-    }),
-  }, 300000, workbookTimeoutMessage);
+  const job = await runJsonWorkflowJob('fast-export', {
+    profile: mappingPayload.profile || 'vietmax',
+    purchase_saved_name: purchaseSavedName,
+    sales_saved_name: salesSavedName,
+    purchase_original_saved_name: mappingPayload.purchaseOriginalSavedName || '',
+    sales_original_saved_name: mappingPayload.salesOriginalSavedName || '',
+    purchase_form_mapping_presets: mappingPayload.purchaseFormMappingPresets,
+    sales_form_mapping_presets: mappingPayload.salesFormMappingPresets,
+    purchase_company_group_assignments: mappingPayload.purchaseCompanyGroupAssignments,
+    sales_company_group_assignments: mappingPayload.salesCompanyGroupAssignments,
+    operation_id: operationId,
+  }, true);
+  const artifactId = job.result?.artifact?.artifact_id || '';
+  if (!artifactId) throw new Error(`Job ${job.operation_id} không trả về workbook FAST.`);
+  const response = await fetch(`/api/artifacts/${encodeURIComponent(artifactId)}`);
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(String(payload.detail || payload.error || response.statusText));
@@ -321,27 +381,22 @@ export async function createVietmaxFastImportPackage(purchaseSavedName: string, 
 const salesMatchTimeoutMessage = 'Khớp mua/bán quá 5 phút chưa xong nên đã dừng lần chạy này. Vui lòng kiểm tra cấu hình cột bán ra, file mua vào đã xử lý, hoặc bấm Khớp lại sau khi sửa.';
 
 export async function createSalesMatches(salesSavedName: string, purchaseSavedName: string, comparisonScope: string, operationId = '', columns: VietmaxColumnPayload = {}) {
-  return parseJsonResponse<{ sales_products: unknown[]; purchase_products: unknown[]; exact_matches: MatchRow[]; matches: MatchRow[]; match_rules?: MatchRow[] }>(
-    await fetchWithTimeout('/api/vietmax/sales-match', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sales_saved_name: salesSavedName,
-        purchase_saved_name: purchaseSavedName,
-        comparison_scope: comparisonScope,
-        sales_price_col: columns.price_col || 'P',
-        purchase_price_col: columns.purchase_price_col || 'P',
-        sales_company_col: columns.company_col || 'I',
-        sales_mst_col: columns.mst_col || 'J',
-        product_col: columns.product_col || 'M',
-        qty_col: columns.qty_col || 'O',
-        invoice_status_col: columns.invoice_status_col || 'AJ',
-        invoice_status_skip_values: columns.invoice_status_skip_values || vietmaxInvoiceStatusSkipValues,
-        require_existing_purchase_code: true,
-        operation_id: operationId,
-      }),
-    }, 300000, salesMatchTimeoutMessage),
-  );
+  const job = await runJsonWorkflowJob('sales-match', {
+    sales_saved_name: salesSavedName,
+    purchase_saved_name: purchaseSavedName,
+    comparison_scope: comparisonScope,
+    sales_price_col: columns.price_col || 'P',
+    purchase_price_col: columns.purchase_price_col || 'P',
+    sales_company_col: columns.company_col || 'I',
+    sales_mst_col: columns.mst_col || 'J',
+    product_col: columns.product_col || 'M',
+    qty_col: columns.qty_col || 'O',
+    invoice_status_col: columns.invoice_status_col || 'AJ',
+    invoice_status_skip_values: columns.invoice_status_skip_values || vietmaxInvoiceStatusSkipValues,
+    require_existing_purchase_code: true,
+    operation_id: operationId,
+  }, true);
+  return job.result as unknown as { sales_products: unknown[]; purchase_products: unknown[]; exact_matches: MatchRow[]; matches: MatchRow[]; match_rules?: MatchRow[] };
 }
 
 export async function exportMatches(matches: MatchRow[]): Promise<Blob> {

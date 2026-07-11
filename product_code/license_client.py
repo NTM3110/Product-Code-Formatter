@@ -104,7 +104,7 @@ def normalize_keygen_server_url(server_url):
 
 
 def normalize_keygen_account_id(account_id):
-    return str(account_id or DEFAULT_KEYGEN_ACCOUNT_ID).strip().strip("/")
+    return DEFAULT_KEYGEN_ACCOUNT_ID
 
 
 def keygen_allows_http_host(hostname):

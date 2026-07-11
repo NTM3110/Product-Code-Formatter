@@ -1,7 +1,8 @@
-﻿import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, getVietmaxFormatMappingDefaults, importProductCodeReplacements, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, processGenericWorkbookCache, processVietmaxPurchase, saveVietmaxConfig, reloadLicense, startInventoryAllocation, uploadExcel, validateFastImportProcessedFile } from '../api';
-import type { CompanyRow, FormatMappingDefaults, FormColumn, FormMappingPreset, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ProcessingForm, ProcessingGroup, ReviewProduct, ReviewRow, UploadSummary } from '../types';
-import { EstimateExtractorWorkflow } from '../estimate/EstimateExtractorWorkflow';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, getVietmaxFormatMappingDefaults, getWorkflowSession, importProductCodeReplacements, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, saveVietmaxConfig, reloadLicense, startInventoryAllocation, startWorkflowProcessJob, uploadExcel, uploadFormTemplate, validateFastImportProcessedFile, waitForWorkflowJob } from '../api';
+import { useRef } from 'react';
+import type { CompanyRow, FormatMappingDefaults, FormColumn, FormMappingPreset, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ProcessingForm, ProcessingGroup, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob } from '../types';
+import { EstimateExtractorWorkflow, type EstimateExtractorWorkflowHandle } from '../estimate/EstimateExtractorWorkflow';
 import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
 import { StageNavigation } from './StageNavigation';
 import { FastImportExportStage, GenericMappingStage, LoadingStage, MappingStage, PlaceholderStage, ProcessStage, SalesEntryStage, UploadStage, type GenericColumns } from './basicStages';
@@ -316,7 +317,21 @@ function fallbackDefaultFormMappingPresets(phase: 'purchase' | 'sales' | 'all' =
       mappingRule('E', 'K', 'sales'),
     ],
   };
-  const forms = [purchase, sales, material, customer];
+  const duplicateReport: FormMappingPreset = {
+    id: 'fast_duplicate_invoice_report',
+    label: 'Báo cáo trùng số chứng từ',
+    scope: 'both',
+    type: 'builtin',
+    enabled: true,
+    builtin_exporter: 'fast_duplicate_report',
+    group_id: MATERIALS_GROUP_ID,
+    input_phase: 'both',
+    sheet: 'Bao_cao_trung_so_ct',
+    system_generated: true,
+    output_columns: outputColumns(['Số chứng từ', 'Mã khách hàng', 'Tên công ty', 'Mã VT', 'Cảnh báo']),
+    mappings: [],
+  };
+  const forms = [purchase, duplicateReport, sales, material, customer];
   if (phase === 'purchase') return forms.filter((form) => form.scope === 'purchase' || form.scope === 'both');
   if (phase === 'sales') return forms.filter((form) => form.scope === 'sales' || form.scope === 'both');
   return forms;
@@ -580,10 +595,6 @@ function activeFormsRequirePhase(forms: FormMappingPreset[], phase: 'purchase' |
   });
 }
 
-function autoCacheSignature(file: UploadSummary | null, payload: Record<string, unknown>) {
-  return JSON.stringify({ file: file?.saved_name || '', payload });
-}
-
 function columnsFromUploadSummary(summary: UploadSummary): FormColumn[] {
   return summary.columns.map((column) => ({
     letter: column.letter,
@@ -672,6 +683,7 @@ type WorkflowState = {
   defaultInventoryPairId: string;
   inventoryPairRules: InventoryRule[];
   includeCompanyPrefix: boolean;
+  salesIncludeCompanyPrefix: boolean;
   purchasePrefixStrategy: PrefixPresetStrategy;
   salesPrefixStrategy: PrefixPresetStrategy;
   prefixMstDigits: number;
@@ -829,6 +841,7 @@ function initialWorkflowState(): WorkflowState {
     defaultInventoryPairId: '',
     inventoryPairRules: [],
     includeCompanyPrefix: false,
+    salesIncludeCompanyPrefix: false,
     purchasePrefixStrategy: 'last_2_words',
     salesPrefixStrategy: 'last_2_words',
     prefixMstDigits: 3,
@@ -961,6 +974,9 @@ function purchaseOutputInvalidation(): Partial<WorkflowState> {
 export function VietmaxApp() {
   const [profile, setProfile] = useState<ProfileKey>('vietmax');
   const [workflows, setWorkflows] = useState<Record<ProfileKey, WorkflowState>>(initialWorkflowStates);
+  const workflowsRef = useRef(workflows);
+  const configSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const estimateWorkflowRef = useRef<EstimateExtractorWorkflowHandle>(null);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [licenseForm, setLicenseForm] = useState(initialLicenseForm);
   const [status, setStatus] = useState('Chọn profile và bắt đầu theo từng stage. Dữ liệu được giữ khi chuyển stage, chỉ xóa khi bấm Làm lại.');
@@ -968,12 +984,9 @@ export function VietmaxApp() {
   const [autoSavingConfig, setAutoSavingConfig] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState<OperationProgress | null>(null);
   const [hoGuomMode, setHoGuomMode] = useState<HoGuomMode>('estimate');
-  const autoPurchaseCacheSignatureRef = useRef('');
-  const autoSalesCacheSignatureRef = useRef('');
-  const autoSalesMatchSignatureRef = useRef('');
-
   const workflow = workflows[profile];
-  const { stage, purchaseFile, genericColumns, purchaseColumns, salesColumns, processedPurchaseSavedName, processedPurchaseStats, salesFile, processedSalesSavedName, processedSalesStats, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, purchaseMissingMstCompanies, purchaseInvoiceStatuses, salesCompanyRows, selectedSalesCompanyIndex, salesMissingMstCompanies, salesInvoiceStatuses, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, productCodeReplacements, salesProductCodeReplacements, purchaseWordRules, salesWordRules, firstWordRules, purchaseRepeatedPhraseRemovals, salesRepeatedPhraseRemovals, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewRules, salesReviewRules, purchaseReviewGenerated, salesReviewGenerated, priceRangeRules, priceGroups, priceFilterAllPercent, priceAdjustAllPercent, matches, salesMatchGenerated, salesMatchRules, purchaseInventoryPairs, purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId, purchaseInventoryPairRules, salesInventoryPairs, salesUseDefaultInventoryPair, salesDefaultInventoryPairId, salesInventoryPairRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix, purchasePrefixStrategy, salesPrefixStrategy, prefixMstDigits, prefixNameWords, prefixNameChars, prefixMissingMstStrategy, purchasePrefixStrategyValues, salesPrefixStrategyValues, purchaseProcessingGroups, salesProcessingGroups, purchaseFormMappingPresets, salesFormMappingPresets, purchaseReviewScope, salesReviewScope } = workflow;
+  const { stage, purchaseFile, genericColumns, purchaseColumns, salesColumns, processedPurchaseSavedName, processedPurchaseStats, salesFile, processedSalesSavedName, processedSalesStats, openingStockFile, inventoryAllocationConfig, inventoryAllocationJob, inventoryAllocationResult, comparisonScope, companyRows, selectedCompanyIndex, purchaseMissingMstCompanies, purchaseInvoiceStatuses, salesCompanyRows, selectedSalesCompanyIndex, salesMissingMstCompanies, salesInvoiceStatuses, productPreviewCodes, salesProductPreviewCodes, productCodeOverrides, salesProductCodeOverrides, productCodeReplacements, salesProductCodeReplacements, purchaseWordRules, salesWordRules, firstWordRules, purchaseRepeatedPhraseRemovals, salesRepeatedPhraseRemovals, wordRules, repeatedPhraseRemovals, purchaseReviewRows, salesReviewRows, purchaseReviewRules, salesReviewRules, purchaseReviewGenerated, salesReviewGenerated, priceRangeRules, priceGroups, priceFilterAllPercent, priceAdjustAllPercent, matches, salesMatchGenerated, salesMatchRules, purchaseInventoryPairs, purchaseUseDefaultInventoryPair, purchaseDefaultInventoryPairId, purchaseInventoryPairRules, salesInventoryPairs, salesUseDefaultInventoryPair, salesDefaultInventoryPairId, salesInventoryPairRules, inventoryPairs, useDefaultInventoryPair, defaultInventoryPairId, inventoryPairRules, includeCompanyPrefix: purchaseIncludeCompanyPrefix, salesIncludeCompanyPrefix, purchasePrefixStrategy, salesPrefixStrategy, prefixMstDigits, prefixNameWords, prefixNameChars, prefixMissingMstStrategy, purchasePrefixStrategyValues, salesPrefixStrategyValues, purchaseProcessingGroups, salesProcessingGroups, purchaseFormMappingPresets, salesFormMappingPresets, purchaseReviewScope, salesReviewScope } = workflow;
+  const includeCompanyPrefix = stage >= 6 ? salesIncludeCompanyPrefix : purchaseIncludeCompanyPrefix;
   const selectedProfile = profiles.find((item) => item.key === profile) ?? profiles[0];
   const visibleProfiles = useMemo(
     () => profiles.filter((item) => licenseAllowsDropdownProfile(item.key, item.label, license)),
@@ -1008,7 +1021,62 @@ export function VietmaxApp() {
   }, [purchaseFormMappingPresets, salesFormMappingPresets]);
 
   function updateWorkflow(targetProfile: ProfileKey, update: Partial<WorkflowState>) {
-    setWorkflows((current) => ({ ...current, [targetProfile]: { ...current[targetProfile], ...update } }));
+    const current = workflowsRef.current;
+    const next = { ...current, [targetProfile]: { ...current[targetProfile], ...update } };
+    workflowsRef.current = next;
+    setWorkflows(next);
+  }
+
+  function persistWorkflowConfig(
+    targetWorkflow: WorkflowState,
+    phase: 'purchase' | 'sales' | 'all',
+    targetProfile: ProfileKey,
+    replaceFormMappings = false,
+  ) {
+    const payloads = buildConfigPayloads(targetWorkflow, phase, targetProfile).map((payload) => (
+      replaceFormMappings ? { ...payload, replace_form_mapping_presets: true } : payload
+    ));
+    const queuedSave = configSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        for (const payload of payloads) await saveVietmaxConfig(payload);
+      });
+    configSaveQueueRef.current = queuedSave;
+    return queuedSave;
+  }
+
+  async function waitForPendingConfigSave() {
+    await configSaveQueueRef.current;
+  }
+
+  async function restoreProcessedCachesFromSession(targetProfile: ProfileKey = profile) {
+    const currentWorkflow = workflows[targetProfile];
+    let purchaseSavedName = currentWorkflow.processedPurchaseSavedName;
+    let salesSavedName = currentWorkflow.processedSalesSavedName;
+    try {
+      const session = await getWorkflowSession();
+      const artifacts = Object.values(session.artifacts || {})
+        .filter((artifact) => artifact.valid)
+        .sort((left, right) => right.created_at - left.created_at);
+      const latestSavedName = (kinds: string[]) => artifacts.find((artifact) => kinds.includes(artifact.kind))?.saved_name || '';
+      purchaseSavedName = latestSavedName([
+        `processed:${targetProfile}:purchase`,
+        `source:${targetProfile}-processed-purchase`,
+        `source:${targetProfile}-fast-purchase`,
+      ]) || purchaseSavedName;
+      salesSavedName = latestSavedName([
+        `processed:${targetProfile}:sales`,
+        `source:${targetProfile}-processed-sales`,
+        `source:${targetProfile}-fast-sales`,
+      ]) || salesSavedName;
+      updateWorkflow(targetProfile, {
+        ...(purchaseSavedName ? { processedPurchaseSavedName: purchaseSavedName } : {}),
+        ...(salesSavedName ? { processedSalesSavedName: salesSavedName } : {}),
+      });
+    } catch {
+      // Keep the current in-memory cache references when session recovery is unavailable.
+    }
+    return { purchaseSavedName, salesSavedName };
   }
 
   useEffect(() => {
@@ -1018,6 +1086,42 @@ export function VietmaxApp() {
         setLicenseForm((current) => ({ ...current, server_url: nextLicense.server_url, account_id: nextLicense.account_id }));
       })
       .catch((error) => setStatus(error instanceof Error ? error.message : String(error)));
+  }, []);
+
+  useEffect(() => {
+    getWorkflowSession()
+      .then((session) => {
+        const artifacts = Object.values(session.artifacts || {})
+          .filter((artifact) => artifact.valid)
+          .sort((left, right) => left.created_at - right.created_at);
+        setWorkflows((current) => {
+          const next = { ...current };
+          const latest = (kind: string) => [...artifacts].reverse().find((artifact) => artifact.kind === kind);
+          for (const profileItem of profiles) {
+            const target = { ...next[profileItem.key] };
+            const purchaseSource = latest(`source:${profileItem.key}-purchase`);
+            const salesSource = latest(`source:${profileItem.key}-sales`);
+            const purchaseProcessed = latest(`processed:${profileItem.key}:purchase`)
+              || latest(`source:${profileItem.key}-processed-purchase`)
+              || latest(`source:${profileItem.key}-fast-purchase`);
+            const salesProcessed = latest(`processed:${profileItem.key}:sales`)
+              || latest(`source:${profileItem.key}-processed-sales`)
+              || latest(`source:${profileItem.key}-fast-sales`);
+            const purchaseSummary = purchaseSource?.metadata?.summary as UploadSummary | undefined;
+            const salesSummary = salesSource?.metadata?.summary as UploadSummary | undefined;
+            if (purchaseSummary) target.purchaseFile = purchaseSummary;
+            if (salesSummary) target.salesFile = salesSummary;
+            if (purchaseProcessed) target.processedPurchaseSavedName = purchaseProcessed.saved_name;
+            if (salesProcessed) target.processedSalesSavedName = salesProcessed.saved_name;
+            next[profileItem.key] = target;
+          }
+          workflowsRef.current = next;
+          return next;
+        });
+      })
+      .catch(() => {
+        // Session recovery is best-effort; normal upload stages remain available.
+      });
   }, []);
 
   useEffect(() => {
@@ -1057,101 +1161,10 @@ export function VietmaxApp() {
   }, [profile, stage, salesFile, salesCompanyRows.length, busy]);
 
   useEffect(() => {
-    if (profile === 'vietmax' && stage === 4 && purchaseFile && companyRows.length && !purchaseReviewGenerated && !busy) {
-      if (companyRows.some(hasCompanyDraftChanges)) {
-        applyCompanyAndProductChoices(4);
-        return;
-      }
-      void runPurchaseReview();
-    }
-  }, [profile, stage, purchaseFile, companyRows.length, purchaseReviewGenerated, busy]);
-
-  useEffect(() => {
-    if (profile === 'vietmax' && stage === 10 && salesFile && salesCompanyRows.length && !salesReviewGenerated && !busy) {
-      if (salesCompanyRows.some(hasCompanyDraftChanges)) {
-        applySalesCompanyAndProductChoices(10);
-        return;
-      }
-      void runSalesReview();
-    }
-  }, [profile, stage, salesFile, salesCompanyRows.length, salesReviewGenerated, busy]);
-
-  useEffect(() => {
-    if (isGenericWorkflowProfile && stage === 4 && purchaseFile && companyRows.length && !purchaseReviewGenerated && !busy) {
-      if (companyRows.some(hasCompanyDraftChanges)) {
-        applyCompanyAndProductChoices(4);
-        return;
-      }
-      void runGenericReview();
-    }
-  }, [isGenericWorkflowProfile, stage, purchaseFile, companyRows.length, purchaseReviewGenerated, busy]);
-
-  useEffect(() => {
-    if (isTwoPhaseGenericProfile(profile) && stage === 10 && salesFile && salesCompanyRows.length && !salesReviewGenerated && !busy) {
-      if (salesCompanyRows.some(hasCompanyDraftChanges)) {
-        applySalesCompanyAndProductChoices(9);
-        return;
-      }
-      void runGenericSalesReview();
-    }
-  }, [profile, stage, salesFile, salesCompanyRows.length, salesReviewGenerated, busy]);
-
-  useEffect(() => {
     if (profile === 'cao_thanh' && stage === 5 && companyRows.length && !priceGroups.length && !busy) {
       updateCaoThanhPriceGroups();
     }
   }, [profile, stage, companyRows.length, priceGroups.length, busy]);
-
-  useEffect(() => {
-    if (profile === 'vietmax' && stage === 5 && purchaseFile && !processedPurchaseSavedName && !busy) {
-      if (companyRows.some(hasCompanyDraftChanges)) return;
-      const signature = autoCacheSignature(purchaseFile, buildPurchaseProcessPayload(workflow));
-      if (autoPurchaseCacheSignatureRef.current === signature) return;
-      autoPurchaseCacheSignatureRef.current = signature;
-      void prepareProcessedPurchaseCache();
-    }
-  }, [profile, stage, purchaseFile, processedPurchaseSavedName, busy, companyRows, workflow]);
-
-  useEffect(() => {
-    const genericExportStage = isGenericWorkflowProfile && !isTwoPhaseGenericProfile(profile) && ((Number(stage) === 5 && profile !== 'cao_thanh') || Number(stage) === 6);
-    if (genericExportStage && purchaseFile && companyRows.length && !processedPurchaseSavedName && !busy) {
-      if (companyRows.some(hasCompanyDraftChanges)) return;
-      const signature = autoCacheSignature(purchaseFile, buildGenericProcessPayload(workflow, profile));
-      if (autoPurchaseCacheSignatureRef.current === signature) return;
-      autoPurchaseCacheSignatureRef.current = signature;
-      void prepareGenericProcessedCache();
-    }
-  }, [isGenericWorkflowProfile, profile, stage, purchaseFile, companyRows, processedPurchaseSavedName, busy, workflow]);
-
-  useEffect(() => {
-    if (isTwoPhaseGenericProfile(profile) && stage === 5 && purchaseFile && companyRows.length && !processedPurchaseSavedName && !busy) {
-      if (companyRows.some(hasCompanyDraftChanges)) return;
-      const signature = autoCacheSignature(purchaseFile, buildGenericProcessPayload(workflow, profile));
-      if (autoPurchaseCacheSignatureRef.current === signature) return;
-      autoPurchaseCacheSignatureRef.current = signature;
-      void prepareGenericProcessedCache();
-    }
-  }, [profile, stage, purchaseFile, companyRows, processedPurchaseSavedName, busy, workflow]);
-
-  useEffect(() => {
-    if (isTwoPhaseGenericProfile(profile) && stage === 11 && salesFile && salesCompanyRows.length && !processedSalesSavedName && !busy) {
-      if (salesCompanyRows.some(hasCompanyDraftChanges)) return;
-      const signature = autoCacheSignature(salesFile, buildGenericSalesProcessPayload(workflow, profile));
-      if (autoSalesCacheSignatureRef.current === signature) return;
-      autoSalesCacheSignatureRef.current = signature;
-      void prepareGenericSalesProcessedCache();
-    }
-  }, [profile, stage, salesFile, salesCompanyRows, processedSalesSavedName, busy, workflow]);
-
-  useEffect(() => {
-    if (profile === 'vietmax' && stage === 11 && salesFile && !processedSalesSavedName && !busy) {
-      if (salesCompanyRows.some(hasCompanyDraftChanges)) return;
-      const signature = autoCacheSignature(salesFile, buildSalesProcessPayload(workflow));
-      if (autoSalesCacheSignatureRef.current === signature) return;
-      autoSalesCacheSignatureRef.current = signature;
-      void prepareProcessedSalesCache();
-    }
-  }, [profile, stage, salesFile, processedSalesSavedName, busy, salesCompanyRows, workflow]);
 
   useEffect(() => {
     if (profile === 'vietmax' && processedPurchaseSavedName && !processedPurchaseStats && !busy) {
@@ -1166,19 +1179,22 @@ export function VietmaxApp() {
   }, [profile, processedSalesSavedName, processedSalesStats, busy]);
 
   async function resetWorkflow() {
-    const resetState: Partial<WorkflowState> = profile === 'vietmax' || isGenericWorkflowProfile ? { ...initialWorkflowState(), stage: 0.5 } : initialWorkflowState();
-    updateWorkflow(profile, resetState);
-    setStatus('Dang lam lai va nap cau hinh da luu...');
     setBusy(true);
+    setStatus('Đang hoàn tất lưu cấu hình trước khi làm lại...');
     try {
+      await waitForPendingConfigSave();
+      const resetState: Partial<WorkflowState> = profile === 'vietmax' || isGenericWorkflowProfile ? { ...initialWorkflowState(), stage: 0.5 } : initialWorkflowState();
+      updateWorkflow(profile, resetState);
+      setStatus('Đang làm lại và nạp toàn bộ cấu hình đã lưu...');
       if (profile === 'vietmax') {
         await loadVietmaxProfileConfig();
       } else if (isGenericWorkflowProfile) {
         await loadGenericProfileConfig(profile);
       }
-      setStatus(profile === 'vietmax' ? 'Da lam lai va nap lai cau hinh Vietmax da luu.' : `Da lam lai va nap lai cau hinh ${selectedProfile.label} da luu.`);
+      setStatus(profile === 'vietmax' ? 'Đã làm lại và nạp toàn bộ cấu hình Vietmax từ file config.' : `Đã làm lại và nạp toàn bộ cấu hình ${selectedProfile.label} từ file config.`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Không thể làm lại vì cấu hình chưa lưu thành công: ${message}`);
     } finally {
       setBusy(false);
     }
@@ -1210,14 +1226,10 @@ export function VietmaxApp() {
     if (!licenseReady) return target === 0.5 || target === 1;
     if (target === 0.5 || target <= 2) return true;
     if (target === 6) return true;
-    if (target === 12) return Boolean(processedPurchaseSavedName && processedSalesSavedName);
+    if (target === 12 || target === 15) return true;
     if (target <= 5) return Boolean(purchaseFile);
     if (target <= 11) return Boolean(salesFile && (purchaseFile || processedPurchaseSavedName));
     if (target === 13 || target === 14) return Boolean(inventoryAllocationResult?.job_id || inventoryAllocationJob?.result?.job_id);
-    if (target === 15) {
-      if (!fastImportRequirements.needsPurchase && !fastImportRequirements.needsSales) return true;
-      return Boolean((!fastImportRequirements.needsPurchase || processedPurchaseSavedName) && (!fastImportRequirements.needsSales || processedSalesSavedName));
-    }
     return true;
   }
 
@@ -1240,9 +1252,7 @@ export function VietmaxApp() {
     setAutoSavingConfig(true);
     setStatus('Đang tự lưu cấu hình trước khi chuyển stage...');
     try {
-      for (const payload of buildConfigPayloads(workflow, phase, profile)) {
-        await saveVietmaxConfig(payload);
-      }
+      await persistWorkflowConfig(workflowsRef.current[profile], phase, profile);
       setStatus('Đã tự lưu cấu hình. Đang chuyển stage...');
       return true;
     } catch (error) {
@@ -1264,7 +1274,22 @@ export function VietmaxApp() {
       return;
     }
     if (target === stage) return;
+    if (isHoGuomEstimate && target === 3) {
+      const ready = await estimateWorkflowRef.current?.prepareAnalysis();
+      if (!ready) return;
+    }
+    if (stage === 3 && companyRows.some(hasCompanyDraftChanges)) {
+      await applyCompanyAndProductChoices(target);
+      return;
+    }
+    if (stage === 9 && salesCompanyRows.some(hasCompanyDraftChanges)) {
+      await applySalesCompanyAndProductChoices(target);
+      return;
+    }
     if (options.autosave !== false && !(await autoSaveCurrentConfigBeforeNavigation())) return;
+    if (target === 12 || target === 15) {
+      await restoreProcessedCachesFromSession();
+    }
     updateWorkflow(profile, { stage: target });
   }
 
@@ -1284,20 +1309,29 @@ export function VietmaxApp() {
   }
 
   async function goNext() {
+    const pendingNext = adjacentEnterableStage(1);
+    if (stage === 3 && companyRows.some(hasCompanyDraftChanges)) {
+      await applyCompanyAndProductChoices(pendingNext?.id);
+      return;
+    }
+    if (stage === 9 && salesCompanyRows.some(hasCompanyDraftChanges)) {
+      await applySalesCompanyAndProductChoices(pendingNext?.id);
+      return;
+    }
     if (!(await autoSaveCurrentConfigBeforeNavigation())) return;
     if (profile === 'vietmax' && stage === 11 && salesFile && !processedSalesSavedName) {
       if (!processedPurchaseSavedName) {
         setStatus(cacheDebugMessage('Cần có cache mua vào trước khi tạo cache bán ra.', true, false));
         return;
       }
-      void prepareProcessedSalesCache(12);
+      setStatus('Hãy bấm Xuất file bán ra để tạo cache thành công trước khi tiếp tục.');
       return;
     }
     if (profile === 'vietmax' && stage === 12 && !inventoryAllocationResult?.job_id && !inventoryAllocationJob?.result?.job_id) {
       void runInventoryAllocation(13);
       return;
     }
-    const next = adjacentEnterableStage(1);
+    const next = pendingNext || adjacentEnterableStage(1);
     if (!next) {
       if (profile === 'vietmax' && stage >= 11) setStatus(cacheDebugMessage('Chưa có stage tiếp theo sẵn sàng.', true, true));
       return;
@@ -1313,11 +1347,11 @@ export function VietmaxApp() {
           return;
         }
         if (stage === 4 && purchaseFile && !purchaseReviewGenerated) {
-          void runGenericReview();
+          setStatus('Hãy bấm Tạo danh sách review trước khi tiếp tục.');
           return;
         }
         if (stage === 5 && purchaseFile && !processedPurchaseSavedName) {
-          void prepareGenericProcessedCache(next.id);
+          setStatus('Hãy bấm Xuất file mua vào để tạo cache thành công trước khi tiếp tục.');
           return;
         }
         if (stage === 7 && salesFile && !salesCompanyRows.length) {
@@ -1329,11 +1363,11 @@ export function VietmaxApp() {
           return;
         }
         if (stage === 10 && salesFile && !salesReviewGenerated) {
-          void runGenericSalesReview();
+          setStatus('Hãy bấm Tạo danh sách review bán ra trước khi tiếp tục.');
           return;
         }
         if (stage === 11 && salesFile && !processedSalesSavedName) {
-          void prepareGenericSalesProcessedCache(next.id);
+          setStatus('Hãy bấm Xuất file bán ra để tạo cache thành công trước khi tiếp tục.');
           return;
         }
         void goToStage(next.id, { autosave: false });
@@ -1348,7 +1382,7 @@ export function VietmaxApp() {
         return;
       }
       if (stage === 4 && purchaseFile && !purchaseReviewGenerated) {
-        void runGenericReview();
+        setStatus('Hãy bấm Tạo danh sách review trước khi tiếp tục.');
         return;
       }
       if (profile === 'cao_thanh' && stage === 5 && !priceGroups.length) {
@@ -1362,11 +1396,11 @@ export function VietmaxApp() {
       return;
     }
     if (stage === 4 && purchaseFile && !purchaseReviewGenerated) {
-      void runPurchaseReview();
+      setStatus('Hãy bấm Tạo danh sách review mua vào trước khi tiếp tục.');
       return;
     }
     if (stage === 5 && purchaseFile && !processedPurchaseSavedName) {
-      void prepareProcessedPurchaseCache(next.id);
+      setStatus('Hãy bấm Xuất file mua vào để tạo cache thành công trước khi tiếp tục.');
       return;
     }
     if (stage === 6 && salesFile && !purchaseFile && !processedPurchaseSavedName) {
@@ -1378,7 +1412,7 @@ export function VietmaxApp() {
       return;
     }
     if (stage === 10 && salesFile && !salesReviewGenerated) {
-      void runSalesReview();
+      setStatus('Hãy bấm Tạo danh sách review bán ra trước khi tiếp tục.');
       return;
     }
     void goToStage(next.id, { autosave: false });
@@ -1424,7 +1458,7 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus(`Đang tải ${kind === 'purchase' ? 'HD mua vào' : 'HD bán ra'}...`);
     try {
-      const summary = await uploadExcel(file);
+      const summary = await uploadExcel(file, `${profile}-${kind}`);
       if (kind === 'purchase') {
         const nextColumns = normalizeVietmaxColumns(purchaseColumns, 'purchase');
         const statuses = nextColumns.invoice_status_col
@@ -1489,7 +1523,7 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus(`Đang tải file ${kind === 'purchase' ? 'mua vào' : 'bán ra'} đã xử lý...`);
     try {
-      const summary = await uploadExcel(file);
+      const summary = await uploadExcel(file, `${profile}-processed-${kind}`);
       const stats = await inspectProcessedVietmaxFile(summary.saved_name, kind);
       if (kind === 'purchase') {
         updateWorkflow(targetProfile, {
@@ -1532,7 +1566,7 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus(`Đang tải FDI ${label} đã xử lý cho Xuất FAST...`);
     try {
-      const summary = await uploadExcel(file);
+      const summary = await uploadExcel(file, `${profile}-fast-${kind}`);
       setStatus(`Đã tải file lên. Đang đọc thống kê FDI ${label}...`);
       const stats = await inspectProcessedVietmaxFile(summary.saved_name, kind);
       if (kind === 'purchase') {
@@ -1601,6 +1635,46 @@ export function VietmaxApp() {
     return `${message} Hãy quay lại phần cấu hình ${phaseLabel}, sửa mapping/cột/nhóm hoặc mã kho/TK vật tư rồi bấm xuất lại.`;
   }
 
+  function reflectWorkflowJob(job: WorkflowJob) {
+    const progress: OperationProgress = {
+      operation_id: job.operation_id,
+      status: job.status,
+      done: job.progress.done,
+      total: job.progress.total,
+      percent: job.progress.percent,
+      label: job.progress.label,
+    };
+    setLoadingProgress(progress);
+    if (job.status === 'queued' || job.status === 'running') {
+      setStatus(formatOperationStatus(progress, job.progress.label || 'Đang xử lý'));
+    }
+  }
+
+  async function runExplicitProcessJob(
+    source: UploadSummary,
+    processPayload: Record<string, unknown>,
+    processor: 'vietmax' | 'generic',
+  ) {
+    const initial = await startWorkflowProcessJob({
+      savedName: source.saved_name,
+      originalName: source.original_name,
+      processPayload,
+      processor,
+      retry: true,
+    });
+    const completed = await waitForWorkflowJob(initial, reflectWorkflowJob);
+    if (completed.status === 'failed') {
+      const failure = completed.error;
+      const detail = failure?.details && Object.keys(failure.details).length
+        ? ` Chi tiết: ${JSON.stringify(failure.details)}.`
+        : '';
+      throw new Error(`${failure?.message || 'Không thể tạo file.'} [${failure?.code || 'WORKFLOW_ERROR'}; ${completed.operation_id}].${detail}`);
+    }
+    const savedName = completed.result?.processed_saved_name || completed.result?.artifact?.saved_name || '';
+    if (!savedName) throw new Error(`Job ${completed.operation_id} hoàn tất nhưng không trả về file cache.`);
+    return { savedName, job: completed };
+  }
+
   async function loadGenericProfileConfig(targetProfile: ProfileKey) {
     if (!isGenericProfileKey(targetProfile) && targetProfile !== 'ho_guom') return;
     try {
@@ -1641,6 +1715,7 @@ export function VietmaxApp() {
           salesDefaultInventoryPairId: String(salesCfg.default_inventory_pair_id || ''),
           salesInventoryPairRules: Array.isArray(salesCfg.inventory_pair_rules) ? salesCfg.inventory_pair_rules : [],
           includeCompanyPrefix: purchaseCfg.include_company_prefix !== false,
+          salesIncludeCompanyPrefix: salesCfg.include_company_prefix !== false,
           purchasePrefixStrategy: normalizedPrefixStrategy(purchaseCfg.prefix_strategy || 'last_2_words'),
           salesPrefixStrategy: normalizedPrefixStrategy(salesCfg.prefix_strategy || 'last_2_words'),
           prefixMstDigits: clampPrefixMstDigits(purchaseCfg.prefix_mst_digits ?? 3),
@@ -1720,6 +1795,7 @@ export function VietmaxApp() {
         salesDefaultInventoryPairId: String(salesCfg.default_inventory_pair_id || ''),
         salesInventoryPairRules: Array.isArray(salesCfg.inventory_pair_rules) ? salesCfg.inventory_pair_rules : [],
         includeCompanyPrefix: purchaseCfg.include_company_prefix !== false,
+        salesIncludeCompanyPrefix: salesCfg.include_company_prefix !== false,
         purchasePrefixStrategy: normalizedPrefixStrategy(purchaseCfg.prefix_strategy || 'last_2_words'),
         salesPrefixStrategy: normalizedPrefixStrategy(salesCfg.prefix_strategy || 'last_2_words'),
         prefixMstDigits: clampPrefixMstDigits(purchaseCfg.prefix_mst_digits ?? 3),
@@ -1922,19 +1998,15 @@ export function VietmaxApp() {
     }
     setBusy(true);
     const exportFormMappings = !isTwoPhaseGenericProfile(profile);
-    const progress = processedPurchaseSavedName ? null : beginProgress(`Đang tạo cache file ${selectedProfile.label}`);
     setStatus(processedPurchaseSavedName ? `Đang tải file ${selectedProfile.label} từ cache...` : `Đang tạo cache file ${selectedProfile.label}...`);
     try {
       let savedName = processedPurchaseSavedName;
       if (!savedName) {
-        const result = await processGenericWorkbookCache({
-          saved_name: purchaseFile.saved_name,
-          original_name: purchaseFile.original_name,
+        const result = await runExplicitProcessJob(purchaseFile, {
           export_form_mappings: exportFormMappings,
           ...buildGenericProcessPayload(workflow, profile),
-        }, progress?.operationId);
-        savedName = result.processedSavedName;
-        if (!savedName) throw new Error('Không tạo được cache file kết quả.');
+        }, 'generic');
+        savedName = result.savedName;
         updateWorkflow(profile, { processedPurchaseSavedName: savedName });
       }
       const blob = await downloadCachedFile(savedName);
@@ -1944,63 +2016,6 @@ export function VietmaxApp() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
-      progress?.stop();
-      if (progress) setLoadingProgress(null);
-      setBusy(false);
-    }
-  }
-
-  async function prepareGenericProcessedCache(nextStage?: StageId) {
-    if (!purchaseFile || !isGenericWorkflowProfile || processedPurchaseSavedName) return;
-    const dirtyCompanies = companyRows.filter(hasCompanyDraftChanges);
-    if (dirtyCompanies.length) return;
-    const exportFormMappings = !isTwoPhaseGenericProfile(profile);
-    const targetProfile = profile;
-    const progress = beginProgress(`Đang tạo cache file ${selectedProfile.label}`);
-    setBusy(true);
-    setStatus(`Đang tạo cache file ${selectedProfile.label} để lần xuất sau không xử lý lại...`);
-    try {
-      const result = await processGenericWorkbookCache({
-        saved_name: purchaseFile.saved_name,
-        original_name: purchaseFile.original_name,
-        export_form_mappings: exportFormMappings,
-        ...buildGenericProcessPayload(workflow, profile),
-      }, progress.operationId);
-      if (!result.processedSavedName) throw new Error('Không tạo được cache file kết quả.');
-      updateWorkflow(targetProfile, { processedPurchaseSavedName: result.processedSavedName, ...(nextStage ? { stage: nextStage } : {}) });
-      setStatus(`Đã tạo cache file ${selectedProfile.label}. Bấm Xuất file kết quả để lưu file.`);
-    } catch (error) {
-      setStatus(exportSetupErrorMessage(error, 'mua vào'));
-    } finally {
-      progress.stop();
-      setLoadingProgress(null);
-      setBusy(false);
-    }
-  }
-
-  async function prepareGenericSalesProcessedCache(nextStage?: StageId) {
-    if (!salesFile || !isTwoPhaseGenericProfile(profile) || processedSalesSavedName) return;
-    const dirtyCompanies = salesCompanyRows.filter(hasCompanyDraftChanges);
-    if (dirtyCompanies.length) return;
-    const targetProfile = profile;
-    const progress = beginProgress(`Đang tạo cache file bán ra ${selectedProfile.label}`);
-    setBusy(true);
-    setStatus(`Đang tạo cache file bán ra ${selectedProfile.label} để xuất FAST...`);
-    try {
-      const result = await processGenericWorkbookCache({
-        saved_name: salesFile.saved_name,
-        original_name: salesFile.original_name,
-        export_form_mappings: false,
-        ...buildGenericSalesProcessPayload(workflow, profile),
-      }, progress.operationId);
-      if (!result.processedSavedName) throw new Error('Không tạo được cache file bán ra.');
-      const stats = await inspectProcessedVietmaxFile(result.processedSavedName, 'sales');
-      updateWorkflow(targetProfile, { processedSalesSavedName: result.processedSavedName, processedSalesStats: stats, ...(nextStage ? { stage: nextStage } : {}) });
-      setStatus(`Đã tạo cache file bán ra ${selectedProfile.label}. ${processedStatsSentence(stats)}`);
-    } catch (error) {
-      setStatus(exportSetupErrorMessage(error, 'bán ra'));
-    } finally {
-      progress.stop();
       setLoadingProgress(null);
       setBusy(false);
     }
@@ -2013,18 +2028,14 @@ export function VietmaxApp() {
       return;
     }
     setBusy(true);
-    const progress = processedSalesSavedName ? null : beginProgress(`Đang tạo cache file bán ra ${selectedProfile.label}`);
     try {
       let savedName = processedSalesSavedName;
       if (!savedName) {
-        const result = await processGenericWorkbookCache({
-          saved_name: salesFile.saved_name,
-          original_name: salesFile.original_name,
+        const result = await runExplicitProcessJob(salesFile, {
           export_form_mappings: false,
           ...buildGenericSalesProcessPayload(workflow, profile),
-        }, progress?.operationId);
-        savedName = result.processedSavedName;
-        if (!savedName) throw new Error('Không tạo được cache file bán ra.');
+        }, 'generic');
+        savedName = result.savedName;
         updateWorkflow(profile, { processedSalesSavedName: savedName });
       }
       const blob = await downloadCachedFile(savedName);
@@ -2034,8 +2045,7 @@ export function VietmaxApp() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
-      progress?.stop();
-      if (progress) setLoadingProgress(null);
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
@@ -2204,84 +2214,21 @@ export function VietmaxApp() {
     return stats;
   }
 
-  async function prepareProcessedPurchaseCache(nextStage?: StageId) {
-    if (!purchaseFile) return;
-    if (processedPurchaseSavedName) {
-      if (nextStage) void goToStage(nextStage, { autosave: false });
-      return;
-    }
-    const targetProfile = profile;
-    const targetPurchaseFile = purchaseFile;
-    const progress = beginProgress('Đang tạo cache file mua vào đã xử lý');
-    setBusy(true);
-    setStatus('Đang tạo cache file mua vào đã xử lý để dùng cho khớp mua/bán...');
-    try {
-      const result = await processVietmaxPurchase(targetPurchaseFile.saved_name, targetPurchaseFile.original_name, buildPurchaseProcessPayload(workflow), { cacheOnly: true, operationId: progress.operationId });
-      if (!result.processedSavedName) throw new Error('Không tạo được cache file mua vào đã xử lý.');
-      const stats = await applyProcessedPurchaseCache(targetProfile, result.processedSavedName);
-      setStatus(`Đã tạo cache file mua vào đã xử lý. ${processedStatsSentence(stats)}`);
-      if (nextStage) updateWorkflow(targetProfile, { stage: nextStage });
-    } catch (error) {
-      setStatus(exportSetupErrorMessage(error, 'mua vào'));
-    } finally {
-      progress.stop();
-      setLoadingProgress(null);
-      setBusy(false);
-    }
-  }
-
-  async function prepareProcessedSalesCache(nextStage?: StageId) {
-    if (!salesFile) return;
-    if (processedSalesSavedName) {
-      if (nextStage) void goToStage(nextStage, { autosave: false });
-      return;
-    }
-    const targetProfile = profile;
-    const targetSalesFile = salesFile;
-    const progress = beginProgress('Đang tạo cache file bán ra đã xử lý');
-    setBusy(true);
-    setStatus('Đang tạo cache file bán ra đã xử lý để xuất nhanh và dùng cho phân bổ tồn kho...');
-    try {
-      const result = await processVietmaxPurchase(targetSalesFile.saved_name, targetSalesFile.original_name, buildSalesProcessPayload(workflow), { cacheOnly: true, operationId: progress.operationId });
-      if (!result.processedSavedName) throw new Error('Không tạo được cache file bán ra đã xử lý.');
-      const stats = await inspectProcessedVietmaxFile(result.processedSavedName, 'sales');
-      updateWorkflow(targetProfile, {
-        processedSalesSavedName: result.processedSavedName,
-        processedSalesStats: stats,
-        inventoryAllocationJob: null,
-        inventoryAllocationResult: null,
-        ...(nextStage ? { stage: nextStage } : {}),
-      });
-      setStatus(`Đã tạo cache file bán ra đã xử lý. ${processedStatsSentence(stats)}`);
-    } catch (error) {
-      setStatus(exportSetupErrorMessage(error, 'bán ra'));
-    } finally {
-      progress.stop();
-      setLoadingProgress(null);
-      setBusy(false);
-    }
-  }
-
   async function runSalesMatch() {
     if (!salesFile) return;
+    if (!processedPurchaseSavedName) {
+      setStatus('Chưa có file mua vào đã xử lý. Hãy quay lại stage 5, bấm Tạo file mua vào thành công rồi mới chạy Khớp mua vào / bán ra.');
+      return;
+    }
     const targetProfile = profile;
     const targetSalesFile = salesFile;
-    const targetPurchaseFile = purchaseFile;
-    let targetProcessedPurchase = processedPurchaseSavedName;
+    const targetProcessedPurchase = processedPurchaseSavedName;
     const startedAt = Date.now();
-    const debugBase = () => `Debug khớp: sales=${targetSalesFile.original_name || targetSalesFile.saved_name}, purchase=${targetProcessedPurchase || targetPurchaseFile?.original_name || targetPurchaseFile?.saved_name || '-'}, scope=${comparisonScope}, salesProduct=${salesColumns.product_col || 'M'}, salesQty=${salesColumns.qty_col || 'O'}, salesStatus=${salesColumns.invoice_status_col || 'AJ'}, purchasePrice=${purchaseColumns.price_col || 'P'}.`;
-    const progress = beginProgress(targetProcessedPurchase ? 'Đang chuẩn bị khớp mua vào / bán ra' : 'Đang chuẩn bị cache file mua vào đã xử lý');
+    const debugBase = () => `Debug khớp: sales=${targetSalesFile.original_name || targetSalesFile.saved_name}, purchase=${targetProcessedPurchase}, scope=${comparisonScope}, salesProduct=${salesColumns.product_col || 'M'}, salesQty=${salesColumns.qty_col || 'O'}, salesStatus=${salesColumns.invoice_status_col || 'AJ'}, purchasePrice=${purchaseColumns.price_col || 'P'}.`;
+    const progress = beginProgress('Đang chuẩn bị khớp mua vào / bán ra');
     setBusy(true);
-    setStatus(targetProcessedPurchase ? 'Đang khớp bán ra với file mua vào đã xử lý KVT/152...' : 'Đang chuẩn bị cache file mua vào đã xử lý trước khi khớp mua/bán...');
+    setStatus('Đang khớp bán ra với file mua vào đã xử lý KVT/152...');
     try {
-      if (!targetProcessedPurchase) {
-        if (!targetPurchaseFile) throw new Error('Chưa có file mua vào để tạo cache xử lý.');
-        const purchaseResult = await processVietmaxPurchase(targetPurchaseFile.saved_name, targetPurchaseFile.original_name, buildPurchaseProcessPayload(workflow), { cacheOnly: true, operationId: progress.operationId });
-        targetProcessedPurchase = purchaseResult.processedSavedName;
-        if (!targetProcessedPurchase) throw new Error('Không tạo được cache file mua vào đã xử lý.');
-        await applyProcessedPurchaseCache(targetProfile, targetProcessedPurchase);
-        setStatus('Đã tạo cache mua vào. Đang khớp bán ra với file mua vào đã xử lý KVT/152...');
-      }
       const result = await createSalesMatches(targetSalesFile.saved_name, targetProcessedPurchase, comparisonScope, progress.operationId, { ...salesColumns, purchase_price_col: purchaseColumns.price_col || 'P' });
       const savedRules = result.match_rules?.length ? result.match_rules : salesMatchRules;
       const nextMatches = applySalesMatchRules(result.matches, savedRules, comparisonScope);
@@ -2293,43 +2240,12 @@ export function VietmaxApp() {
     } catch (error) {
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
       const message = error instanceof Error ? error.message : String(error);
-      setStatus(`${message} ${debugBase()} thời gian ${elapsed}s. Auto-run sẽ không tự chạy lại; bấm Khớp lại nếu muốn thử lại.`);
+      setStatus(`${message} ${debugBase()} thời gian ${elapsed}s. Bấm Khớp lại nếu muốn thử lại.`);
     } finally {
       progress.stop();
       setLoadingProgress(null);
       setBusy(false);
     }
-  }
-
-  function salesMatchAutoRunSignature() {
-    if (!salesFile || (!purchaseFile && !processedPurchaseSavedName)) return '';
-    return autoCacheSignature(salesFile, {
-      profile,
-      processedPurchaseSavedName,
-      purchaseSavedName: purchaseFile?.saved_name || '',
-      comparisonScope,
-      salesColumns: {
-        product_col: salesColumns.product_col || 'M',
-        qty_col: salesColumns.qty_col || 'O',
-        price_col: salesColumns.price_col || 'P',
-        company_col: salesColumns.company_col || 'I',
-        mst_col: salesColumns.mst_col || 'J',
-        invoice_status_col: salesColumns.invoice_status_col || 'AJ',
-        invoice_status_skip_values: salesColumns.invoice_status_skip_values || [],
-      },
-      purchasePriceCol: purchaseColumns.price_col || 'P',
-      purchasePayload: processedPurchaseSavedName ? null : buildPurchaseProcessPayload(workflow),
-    });
-  }
-
-  function runSalesMatchAutoOnce(signature: string) {
-    if (!signature) return;
-    if (autoSalesMatchSignatureRef.current === signature) {
-      setStatus('Đã thử khớp tự động một lần cho dữ liệu hiện tại. Auto-run không chạy lại để tránh vòng lặp; bấm Khớp lại nếu muốn chạy thủ công.');
-      return;
-    }
-    autoSalesMatchSignatureRef.current = signature;
-    void runSalesMatch();
   }
 
   async function downloadMatches() {
@@ -2515,7 +2431,7 @@ export function VietmaxApp() {
       const nextPrefixValues = seedLoadedPrefixValues(loadedPrefixValues, loadedPrefixStrategy, nextCompanies, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, loadedMissingMstPrefixStrategy);
       const displayCompanies = applyPrefixStrategyRows(nextCompanies, loadedPrefixStrategy, loadedPrefixMstDigits, loadedPrefixNameWords, loadedPrefixNameChars, nextPrefixValues, true, loadedMissingMstPrefixStrategy);
       const previewCodes = await loadProductPreviewCodes(displayCompanies, savedWordRules, savedRepeatedPhrases, 'sales', savedProductCodeReplacements);
-      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: displayCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups), salesMissingMstCompanies: result.missing_mst_companies ?? [], salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: result.manual_code_overrides ?? {}, salesProductCodeReplacements: savedProductCodeReplacements, salesWordRules: savedWordRules, salesRepeatedPhraseRemovals: savedRepeatedPhrases, salesMatchRules: result.sales_match_rules ?? salesMatchRules, salesInventoryPairs: savedInventoryPairs, salesUseDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : salesUseDefaultInventoryPair, salesDefaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : salesDefaultInventoryPairId, salesInventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : salesInventoryPairRules, includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix, salesPrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, salesPrefixStrategyValues: nextPrefixValues, salesProcessingGroups: loadedGroups, salesFormMappingPresets: loadedFormPresets, salesReviewRules: result.vietmax_ban_ra_sales_internal_merges ?? salesReviewRules, salesReviewRows: [], salesReviewGenerated: false });
+      updateWorkflow(targetProfile, { ...salesOutputInvalidation(), salesCompanyRows: displayCompanies, selectedSalesCompanyIndex: firstDisplayedCompanyIndex(displayCompanies, loadedGroups), salesMissingMstCompanies: result.missing_mst_companies ?? [], salesProductPreviewCodes: previewCodes, salesProductCodeOverrides: result.manual_code_overrides ?? {}, salesProductCodeReplacements: savedProductCodeReplacements, salesWordRules: savedWordRules, salesRepeatedPhraseRemovals: savedRepeatedPhrases, salesMatchRules: result.sales_match_rules ?? salesMatchRules, salesInventoryPairs: savedInventoryPairs, salesUseDefaultInventoryPair: result.inventory_pairs?.length ? Boolean(result.use_default_inventory_pair) : salesUseDefaultInventoryPair, salesDefaultInventoryPairId: result.inventory_pairs?.length ? (result.default_inventory_pair_id ?? '') : salesDefaultInventoryPairId, salesInventoryPairRules: result.inventory_pair_rules?.length ? result.inventory_pair_rules : salesInventoryPairRules, salesIncludeCompanyPrefix: result.include_company_prefix ?? salesIncludeCompanyPrefix, salesPrefixStrategy: loadedPrefixStrategy, prefixMstDigits: loadedPrefixMstDigits, prefixNameWords: loadedPrefixNameWords, prefixNameChars: loadedPrefixNameChars, prefixMissingMstStrategy: loadedMissingMstPrefixStrategy, salesPrefixStrategyValues: nextPrefixValues, salesProcessingGroups: loadedGroups, salesFormMappingPresets: loadedFormPresets, salesReviewRules: result.vietmax_ban_ra_sales_internal_merges ?? salesReviewRules, salesReviewRows: [], salesReviewGenerated: false });
       setStatus(`Đã tải ${nextCompanies.length} công ty bán ra còn lại sau KVT/152. Chọn công ty/hàng hóa rồi áp dụng trước khi review bán ra.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -2553,7 +2469,7 @@ export function VietmaxApp() {
     });
   }
 
-  function applyCompanyAndProductChoices(nextStage?: unknown) {
+  async function applyCompanyAndProductChoices(nextStage?: unknown) {
     const targetStage = isStageId(nextStage) ? nextStage : undefined;
     const activeStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
     const nextPrefixValues = rememberManualPrefixValues(purchasePrefixStrategyValues, activeStrategy, companyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
@@ -2574,10 +2490,10 @@ export function VietmaxApp() {
     };
     updateWorkflow(profile, nextWorkflow);
     scrollStageBodyToTop();
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa vào cấu hình. Review Mã VT sẽ tạo lại theo lựa chọn mới.', 'purchase');
+    await saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa vào cấu hình. Review Mã VT sẽ tạo lại theo lựa chọn mới.', 'purchase');
   }
 
-  function applySalesCompanyAndProductChoices(nextStage?: unknown) {
+  async function applySalesCompanyAndProductChoices(nextStage?: unknown) {
     const targetStage = isStageId(nextStage) ? nextStage : undefined;
     const activeStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
     const nextPrefixValues = rememberManualPrefixValues(salesPrefixStrategyValues, activeStrategy, salesCompanyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
@@ -2598,7 +2514,7 @@ export function VietmaxApp() {
     };
     updateWorkflow(profile, nextWorkflow);
     scrollStageBodyToTop();
-    void saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa bán ra. Review bán ra sẽ tạo lại theo lựa chọn mới.', 'sales');
+    await saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu lựa chọn công ty, hàng hóa bán ra. Review bán ra sẽ tạo lại theo lựa chọn mới.', 'sales');
   }
 
   function selectCompany(index: number) {
@@ -2719,15 +2635,19 @@ export function VietmaxApp() {
     });
   }
 
-  function updateIncludeCompanyPrefix(include: boolean) {
-    updateWorkflow(profile, {
-      includeCompanyPrefix: include,
+  async function updateIncludeCompanyPrefix(include: boolean) {
+    const editingSales = stage === 9;
+    const nextWorkflow: WorkflowState = {
+      ...workflow,
+      ...(editingSales ? salesOutputInvalidation() : purchaseOutputInvalidation()),
+      ...(editingSales ? { salesIncludeCompanyPrefix: include } : { includeCompanyPrefix: include }),
       purchaseReviewRows: [],
       purchaseReviewGenerated: false,
       salesReviewRows: [],
       salesReviewGenerated: false,
-      ...purchaseOutputInvalidation(),
-    });
+    };
+    updateWorkflow(profile, nextWorkflow);
+    await saveWorkflowConfig(nextWorkflow, `Đã ${include ? 'bật' : 'tắt'} và lưu cấu hình prefix công ty.`, editingSales ? 'sales' : 'purchase');
   }
 
   function updatePrefixMstDigits(digits: number) {
@@ -2780,9 +2700,14 @@ export function VietmaxApp() {
     }
     updateWorkflow(profile, nextWorkflow);
   }
-  function updateMissingMstPrefixStrategy(strategy: PrefixPresetStrategy) {
+  async function updateMissingMstPrefixStrategy(strategy: PrefixPresetStrategy) {
     const nextStrategy = normalizeMissingMstPrefixStrategy(strategy);
-    const nextWorkflow: Partial<WorkflowState> = { prefixMissingMstStrategy: nextStrategy };
+    const editingSales = stage === 9;
+    const nextWorkflow: WorkflowState = {
+      ...workflow,
+      ...(editingSales ? salesOutputInvalidation() : purchaseOutputInvalidation()),
+      prefixMissingMstStrategy: nextStrategy,
+    };
     if (companyRows.length) {
       nextWorkflow.companyRows = applyPrefixStrategyRows(companyRows, normalizedPrefixStrategy(purchasePrefixStrategy), prefixMstDigits, prefixNameWords, prefixNameChars, purchasePrefixStrategyValues, false, nextStrategy);
     }
@@ -2790,26 +2715,35 @@ export function VietmaxApp() {
       nextWorkflow.salesCompanyRows = applyPrefixStrategyRows(salesCompanyRows, normalizedPrefixStrategy(salesPrefixStrategy), prefixMstDigits, prefixNameWords, prefixNameChars, salesPrefixStrategyValues, false, nextStrategy);
     }
     updateWorkflow(profile, nextWorkflow);
+    await saveWorkflowConfig(nextWorkflow, `Đã lưu kiểu prefix cho công ty không MST: ${nextStrategy === 'all_name_words' ? 'Áp tất cả từ đầu' : 'Áp 2 từ'}.`, editingSales ? 'sales' : 'purchase');
   }
 
-  function applyPurchasePrefixPreset(strategy: PrefixPresetStrategy) {
+  async function applyPurchasePrefixPreset(strategy: PrefixPresetStrategy) {
     const currentStrategy = normalizedPrefixStrategy(purchasePrefixStrategy);
     const rememberedValues = rememberManualPrefixValues(purchasePrefixStrategyValues, currentStrategy, companyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
-    updateWorkflow(profile, {
+    const nextWorkflow: WorkflowState = {
+      ...workflow,
+      ...purchaseOutputInvalidation(),
       purchasePrefixStrategy: strategy,
       purchasePrefixStrategyValues: rememberedValues,
       companyRows: applyPrefixStrategyRows(companyRows, strategy, prefixMstDigits, prefixNameWords, prefixNameChars, rememberedValues, false, prefixMissingMstStrategy),
-    });
+    };
+    updateWorkflow(profile, nextWorkflow);
+    await saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu loại prefix mua vào.', 'purchase');
   }
 
-  function applySalesPrefixPreset(strategy: PrefixPresetStrategy) {
+  async function applySalesPrefixPreset(strategy: PrefixPresetStrategy) {
     const currentStrategy = normalizedPrefixStrategy(salesPrefixStrategy);
     const rememberedValues = rememberManualPrefixValues(salesPrefixStrategyValues, currentStrategy, salesCompanyRows, prefixMstDigits, prefixNameWords, prefixNameChars);
-    updateWorkflow(profile, {
+    const nextWorkflow: WorkflowState = {
+      ...workflow,
+      ...salesOutputInvalidation(),
       salesPrefixStrategy: strategy,
       salesPrefixStrategyValues: rememberedValues,
       salesCompanyRows: applyPrefixStrategyRows(salesCompanyRows, strategy, prefixMstDigits, prefixNameWords, prefixNameChars, rememberedValues, false, prefixMissingMstStrategy),
-    });
+    };
+    updateWorkflow(profile, nextWorkflow);
+    await saveWorkflowConfig(nextWorkflow, 'Đã áp dụng và lưu loại prefix bán ra.', 'sales');
   }
 
   async function refreshSalesProductPreviews() {
@@ -2822,9 +2756,7 @@ export function VietmaxApp() {
         : await loadProductPreviewCodes(salesCompanyRows, salesWordRules, salesRepeatedPhraseRemovals, 'sales', salesProductCodeReplacements);
       const nextWorkflow = { ...workflow, ...salesOutputInvalidation(), salesProductPreviewCodes: previewCodes, salesReviewRows: [], salesReviewGenerated: false };
       updateWorkflow(profile, nextWorkflow);
-      for (const payload of buildConfigPayloads(nextWorkflow, 'sales')) {
-        await saveVietmaxConfig(payload);
-      }
+      await persistWorkflowConfig(nextWorkflow, 'sales', profile);
       setStatus('Đã cập nhật Mã VT preview bán ra và lưu cấu hình bán ra.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -2858,13 +2790,11 @@ export function VietmaxApp() {
     }
   }
 
-  async function saveWorkflowConfig(targetWorkflow: WorkflowState, successMessage = 'Đã lưu cấu hình hiện tại.', phase: 'purchase' | 'sales' | 'all' = 'all') {
+  async function saveWorkflowConfig(targetWorkflow: WorkflowState, successMessage = 'Đã lưu cấu hình hiện tại.', phase: 'purchase' | 'sales' | 'all' = 'all', replaceFormMappings = false) {
     setBusy(true);
     setStatus('Đang lưu cấu hình...');
     try {
-      for (const payload of buildConfigPayloads(targetWorkflow, phase, profile)) {
-        await saveVietmaxConfig(payload);
-      }
+      await persistWorkflowConfig(targetWorkflow, phase, profile, replaceFormMappings);
       setStatus(successMessage);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -2874,7 +2804,34 @@ export function VietmaxApp() {
   }
 
   function saveCurrentConfig() {
-    void saveWorkflowConfig(workflow, 'Đã lưu cấu hình hiện tại.', stage === 0.5 ? 'all' : (stage >= 6 ? 'sales' : 'purchase'));
+    const latestWorkflow = workflowsRef.current[profile];
+    if (latestWorkflow.stage === 3 && latestWorkflow.companyRows.some(hasCompanyDraftChanges)) {
+      void applyCompanyAndProductChoices();
+      return;
+    }
+    if (latestWorkflow.stage === 9 && latestWorkflow.salesCompanyRows.some(hasCompanyDraftChanges)) {
+      void applySalesCompanyAndProductChoices();
+      return;
+    }
+    void saveWorkflowConfig(latestWorkflow, 'Đã lưu cấu hình hiện tại.', latestWorkflow.stage === 0.5 ? 'all' : (latestWorkflow.stage >= 6 ? 'sales' : 'purchase'));
+  }
+
+  async function reloadCurrentConfig() {
+    setBusy(true);
+    setStatus(`Đang hoàn tất lưu rồi tải lại toàn bộ cấu hình ${selectedProfile.label} từ file config...`);
+    try {
+      await waitForPendingConfigSave();
+      if (profile === 'vietmax') {
+        await loadVietmaxProfileConfig();
+      } else if (isGenericWorkflowProfile) {
+        await loadGenericProfileConfig(profile);
+      }
+      setStatus(`Đã tải lại cấu hình ${selectedProfile.label}, bao gồm nhóm, form mapping, prefix, review, khớp và phân kho.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runGenericSalesReview() {
@@ -2956,7 +2913,7 @@ export function VietmaxApp() {
         salesUseDefaultInventoryPair: result.use_default_inventory_pair ?? salesUseDefaultInventoryPair,
         salesDefaultInventoryPairId: result.default_inventory_pair_id ?? salesDefaultInventoryPairId,
         salesInventoryPairRules: result.inventory_pair_rules ?? salesInventoryPairRules,
-        includeCompanyPrefix: result.include_company_prefix ?? includeCompanyPrefix,
+        salesIncludeCompanyPrefix: result.include_company_prefix ?? salesIncludeCompanyPrefix,
         salesPrefixStrategy: loadedPrefixStrategy,
         prefixMstDigits: loadedPrefixMstDigits,
         prefixNameWords: loadedPrefixNameWords,
@@ -2987,7 +2944,26 @@ export function VietmaxApp() {
       salesFormMappingPresets: nextSales,
     };
     updateWorkflow(profile, nextWorkflow);
-    void saveWorkflowConfig(nextWorkflow, 'Đã lưu cấu hình form mapping.', 'all');
+    void saveWorkflowConfig(nextWorkflow, 'Đã lưu cấu hình form mapping.', 'all', true);
+  }
+
+  async function restoreDefaultFormMappings() {
+    setBusy(true);
+    setStatus('Đang khôi phục 5 form mapping mặc định...');
+    try {
+      const defaults = await getVietmaxFormatMappingDefaults();
+      const nextWorkflow = {
+        ...workflow,
+        purchaseFormMappingPresets: normalizeFormMappingPresets(defaults.form_mapping_presets, 'purchase', defaults),
+        salesFormMappingPresets: normalizeFormMappingPresets(defaults.form_mapping_presets, 'sales', defaults),
+      };
+      updateWorkflow(profile, nextWorkflow);
+      await saveWorkflowConfig(nextWorkflow, 'Đã khôi phục 5 form mapping mặc định cho profile hiện tại.', 'all', true);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   function updateFormatLists(scope: FormatScope, update: (forms: FormMappingPreset[], phase: 'purchase' | 'sales') => FormMappingPreset[]) {
@@ -3103,7 +3079,7 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus('Đang tải file mẫu output...');
     try {
-      const summary = await uploadExcel(file);
+      const summary = await uploadFormTemplate(file);
       updateFormatForm(scope, formId, {
         type: 'template_mapping',
         template_original_name: summary.original_name,
@@ -3192,9 +3168,7 @@ export function VietmaxApp() {
         : await loadProductPreviewCodes(companyRows, purchaseWordRules, purchaseRepeatedPhraseRemovals, 'purchase', productCodeReplacements);
       const nextWorkflow = { ...workflow, ...purchaseOutputInvalidation(), productPreviewCodes: previewCodes, purchaseReviewRows: [], purchaseReviewGenerated: false, priceGroups: [] };
       updateWorkflow(profile, nextWorkflow);
-      for (const payload of buildConfigPayloads(nextWorkflow, 'purchase', profile)) {
-        await saveVietmaxConfig(payload);
-      }
+      await persistWorkflowConfig(nextWorkflow, 'purchase', profile);
       setStatus('Đã cập nhật Mã VT preview và lưu cấu hình.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -3281,15 +3255,13 @@ export function VietmaxApp() {
   async function downloadProcessedPurchase() {
     if (!purchaseFile) return;
     setBusy(true);
-    const progress = processedPurchaseSavedName ? null : beginProgress('Đang tạo file mua vào đã xử lý');
     setStatus(processedPurchaseSavedName ? 'Đang mở file mua vào đã xử lý từ cache...' : 'Đang tạo file mua vào đã xử lý Mã VT...');
     try {
       let savedName = processedPurchaseSavedName;
       let stats = processedPurchaseStats;
       if (!savedName) {
-        const result = await processVietmaxPurchase(purchaseFile.saved_name, purchaseFile.original_name, buildPurchaseProcessPayload(workflow), { cacheOnly: true, operationId: progress?.operationId });
-        savedName = result.processedSavedName;
-        if (!savedName) throw new Error('Không tạo được cache file mua vào đã xử lý.');
+        const result = await runExplicitProcessJob(purchaseFile, buildPurchaseProcessPayload(workflow), 'vietmax');
+        savedName = result.savedName;
         stats = await applyProcessedPurchaseCache(profile, savedName);
       }
       const blob = await downloadCachedFile(savedName);
@@ -3299,8 +3271,7 @@ export function VietmaxApp() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
-      progress?.stop();
-      if (progress) setLoadingProgress(null);
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
@@ -3308,15 +3279,13 @@ export function VietmaxApp() {
   async function downloadProcessedSales() {
     if (!salesFile) return;
     setBusy(true);
-    const progress = processedSalesSavedName ? null : beginProgress('Đang tạo file bán ra đã xử lý');
     setStatus(processedSalesSavedName ? 'Đang mở file bán ra đã xử lý từ cache...' : 'Đang tạo file bán ra đã xử lý Mã VT...');
     try {
       let savedName = processedSalesSavedName;
       let stats = processedSalesStats;
       if (!savedName) {
-        const result = await processVietmaxPurchase(salesFile.saved_name, salesFile.original_name, buildSalesProcessPayload(workflow), { cacheOnly: true, operationId: progress?.operationId });
-        savedName = result.processedSavedName;
-        if (!savedName) throw new Error('Không tạo được cache file bán ra đã xử lý.');
+        const result = await runExplicitProcessJob(salesFile, buildSalesProcessPayload(workflow), 'vietmax');
+        savedName = result.savedName;
         stats = await inspectProcessedVietmaxFile(savedName, 'sales');
         updateWorkflow(profile, { processedSalesSavedName: savedName, processedSalesStats: stats, inventoryAllocationJob: null, inventoryAllocationResult: null });
       }
@@ -3327,8 +3296,7 @@ export function VietmaxApp() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
-      progress?.stop();
-      if (progress) setLoadingProgress(null);
+      setLoadingProgress(null);
       setBusy(false);
     }
   }
@@ -3383,7 +3351,10 @@ export function VietmaxApp() {
   }
 
   async function runInventoryAllocation(nextStage?: StageId) {
-    if (!processedPurchaseSavedName || !processedSalesSavedName) {
+    const restoredCaches = await restoreProcessedCachesFromSession();
+    const purchaseCache = restoredCaches.purchaseSavedName || processedPurchaseSavedName;
+    const salesCache = restoredCaches.salesSavedName || processedSalesSavedName;
+    if (!purchaseCache || !salesCache) {
       setStatus(cacheDebugMessage('Cần tải hoặc tạo cả file mua vào và bán ra đã xử lý trước khi phân bổ tồn kho.', true, true));
       return;
     }
@@ -3396,7 +3367,7 @@ export function VietmaxApp() {
     });
     try {
       const allocationConfig = { ...inventoryAllocationConfig, policy: { ...inventoryAllocationConfig.policy, company_profile: inventoryAllocationProfileFor(targetProfile) } };
-      const started = await startInventoryAllocation({ purchaseSavedName: processedPurchaseSavedName, salesSavedName: processedSalesSavedName, salesOriginalName: salesFile?.original_name || 'ban_ra_da_xu_ly.xlsx', openingFile: openingStockFile, config: allocationConfig });
+      const started = await startInventoryAllocation({ purchaseSavedName: purchaseCache, salesSavedName: salesCache, salesOriginalName: salesFile?.original_name || 'ban_ra_da_xu_ly.xlsx', openingFile: openingStockFile, config: allocationConfig });
       let nextJob: InventoryAllocationJob = { status: 'queued', progress: 0, done: 0, total: 0, label: 'Đã gửi dữ liệu. Đang chờ backend xử lý...' };
       updateWorkflow(targetProfile, { inventoryAllocationJob: nextJob, inventoryAllocationResult: null });
       while (nextJob.status !== 'complete') {
@@ -3439,7 +3410,7 @@ export function VietmaxApp() {
       setStatus('Cần có cả FDI mua vào và FDI bán ra đã xử lý trước khi tạo workbook FAST.');
       return;
     }
-    const progress = beginProgress('Đang tạo workbook FAST 4 sheet');
+    const progress = beginProgress('Đang tạo workbook FAST 5 sheet');
     setBusy(true);
     setStatus('Đang tạo workbook FAST gồm Hoadonmuahang, Hoadonbanhang, DM vật tư và DM khách hàng từ FDI đã xử lý...');
     try {
@@ -3453,7 +3424,7 @@ export function VietmaxApp() {
         salesCompanyGroupAssignments: groupAssignmentsFromRows(salesCompanyRows),
       });
       const saved = await saveBlob(blob, `${profile}_fast_import.xls`);
-      setStatus(saved ? 'Đã lưu workbook FAST 4 sheet.' : 'Đã hủy lưu workbook FAST; dữ liệu đã xử lý vẫn được giữ.');
+      setStatus(saved ? 'Đã lưu workbook FAST 5 sheet.' : 'Đã hủy lưu workbook FAST; dữ liệu đã xử lý vẫn được giữ.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3469,7 +3440,10 @@ export function VietmaxApp() {
       setStatus('Chua co form mapping nao dang bat de xuat FAST.');
       return;
     }
-    if ((needsPurchase && !processedPurchaseSavedName) || (needsSales && !processedSalesSavedName)) {
+    const restoredCaches = await restoreProcessedCachesFromSession();
+    const purchaseCache = restoredCaches.purchaseSavedName || processedPurchaseSavedName;
+    const salesCache = restoredCaches.salesSavedName || processedSalesSavedName;
+    if ((needsPurchase && !purchaseCache) || (needsSales && !salesCache)) {
       setStatus(cacheDebugMessage('Cần có đủ FDI đã xử lý trước khi tạo workbook FAST theo form mapping.', needsPurchase, needsSales));
       return;
     }
@@ -3477,7 +3451,7 @@ export function VietmaxApp() {
     setBusy(true);
     setStatus('Dang tao workbook FAST theo cac form mapping dang bat...');
     try {
-      const blob = await createVietmaxFastImportPackage(needsPurchase ? processedPurchaseSavedName : '', needsSales ? processedSalesSavedName : '', progress.operationId, {
+      const blob = await createVietmaxFastImportPackage(needsPurchase ? purchaseCache : '', needsSales ? salesCache : '', progress.operationId, {
         profile,
         purchaseOriginalSavedName: needsPurchase ? (purchaseFile?.saved_name || '') : '',
         salesOriginalSavedName: needsSales ? (salesFile?.saved_name || '') : '',
@@ -3717,6 +3691,7 @@ export function VietmaxApp() {
                 </select>
               </label>
             )}
+            <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={() => void reloadCurrentConfig()}>Tải lại cấu hình</button>
             <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={saveCurrentConfig}>Lưu cấu hình</button>
             {profile === 'vietmax' && (
               <div className="config-export-actions" aria-label="Xuất/nhập cấu hình Vietmax">
@@ -3730,7 +3705,7 @@ export function VietmaxApp() {
           {usesNativeStageShell && <StageNavigation stages={visibleStages} stage={stage} busy={busy || autoSavingConfig} canEnterStage={canEnterStage} goToStage={goToStage} />}
         </header>
 
-        <div className={`status-strip ${statusTone === 'warning' ? 'status-warning' : ''}`}><strong>Trạng thái</strong>{statusTone === 'warning' && <span className="status-icon" aria-hidden="true">⚠</span>}<span>{busy ? 'Đang xử lý... ' : ''}{status}</span></div>
+        <div className={`status-strip ${statusTone === 'warning' ? 'status-warning' : ''} ${statusTone === 'error' ? 'status-error' : ''}`}><strong>Trạng thái</strong>{statusTone !== 'normal' && <span className="status-icon" aria-hidden="true">⚠</span>}<span>{busy ? 'Đang xử lý... ' : ''}{status}</span></div>
 
         {showLicenseBar && (
           <section className="license-bar">
@@ -3771,7 +3746,7 @@ export function VietmaxApp() {
   function renderTwoPhaseStage() {
     switch (stage) {
       case 0.5:
-        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
+        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onRestoreDefaults={restoreDefaultFormMappings} onSave={saveFormatMappingConfig} />;
       case 1:
         return <UploadStage title={profile === 'vietmax' ? 'HD mua vào' : `HD mua vào ${selectedProfile.label}`} summary={purchaseFile} disabled={busy || !licenseReady} onUpload={(file) => upload('purchase', file)} />;
       case 2:
@@ -3780,7 +3755,8 @@ export function VietmaxApp() {
         if (busy && !companyRows.length) return <LoadingStage title="Đang tải danh sách công ty" detail="Đang đọc workbook và gom công ty/MST/hàng hóa..." />;
         return <CompanyRulesStage companies={companyRows} selectedCompanyIndex={selectedCompanyIndex} processingGroups={purchaseProcessingGroups} productPreviewCodes={productPreviewCodes} productCodeOverrides={productCodeOverrides} productCodeReplacements={productCodeReplacements} wordRules={purchaseWordRules} repeatedPhrases={purchaseRepeatedPhraseRemovals} inventoryPairs={purchaseInventoryPairs} useDefaultInventoryPair={purchaseUseDefaultInventoryPair} defaultInventoryPairId={purchaseDefaultInventoryPairId} inventoryPairRules={purchaseInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={purchasePrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={purchaseMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applyPurchasePrefixPreset} onCompanySelect={selectCompany} onCompanyChange={updatePendingCompany} onCompanyGroupChange={updateCompanyGroup} onBulkCompanyChange={bulkUpdatePendingCompanies} onProductChange={updateCompanyProduct} onProductCodeChange={updateProductCode} onApplyChoices={applyCompanyAndProductChoices} onRefreshPreviews={refreshProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'purchase')} onAddProductCodeReplacement={() => addProductCodeReplacement('purchase')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'purchase')} onProductCodeReplacementsCommit={(replacements) => commitProductCodeReplacements(replacements, 'purchase')} onApplyRelatedProductCodes={(updates) => applyRelatedProductCodeUpdates(updates, 'purchase')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'purchase')} onAddInventoryPair={() => addInventoryPair('purchase')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'purchase')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'purchase')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'purchase')} onAddInventoryRule={() => addInventoryRule('purchase')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'purchase')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'purchase')} />;
       case 4:
-        if (busy || !purchaseReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." progress={loadingProgress} />;
+        if (busy) return <LoadingStage title="Đang tạo Review Mã VT mua vào" detail="Đang so sánh tên hàng và dựng danh sách mã cần kiểm tra..." progress={loadingProgress} />;
+        if (!purchaseReviewGenerated) return <ProcessStage title="Review Mã VT mua vào" detail="Tạo danh sách các mã cần kiểm tra từ cấu hình công ty và hàng hóa đã áp dụng." buttonLabel="Tạo danh sách review" disabled={!purchaseFile || !companyRows.length} onProcess={profile === 'vietmax' ? runPurchaseReview : runGenericReview} />;
         return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title="Review Mã VT mua vào" empty="Không có dòng Mã VT cần review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
       case 5:
         if (busy) return <LoadingStage title="Đang tạo file mua vào" detail="Đang xử lý workbook và tạo cache file mua vào để dùng cho các stage bán ra..." progress={loadingProgress} />;
@@ -3794,15 +3770,13 @@ export function VietmaxApp() {
       case 8:
         if (!hasVietmaxPurchaseMatch(profile)) return <PlaceholderStage title="Khớp mua vào chưa bật cho profile này" detail="Profile này vẫn dùng cùng frame, nhưng chưa có logic khớp mua vào riêng nên sẽ đi thẳng sang công ty bán ra." />;
         if (busy) return <LoadingStage title="Đang khớp mua vào / bán ra" detail={processedPurchaseSavedName ? 'Đang so sánh hàng bán ra với file mua vào đã xử lý và áp dụng cấu hình khớp đã lưu...' : 'Đang tạo cache mua vào rồi khớp với file bán ra...'} progress={loadingProgress} />;
-        {
-          const autoRunSignature = salesMatchAutoRunSignature();
-          return <MatchStage rows={matches} disabled={!salesFile || busy || (!purchaseFile && !processedPurchaseSavedName)} onRun={runSalesMatch} onAutoRun={() => runSalesMatchAutoOnce(autoRunSignature)} onSave={saveMatchChoices} onToggle={toggleMatch} onBulkToggle={bulkToggleMatches} onConversionChange={updateMatchConversion} autoRun={Boolean(autoRunSignature) && matches.length === 0 && !busy && autoSalesMatchSignatureRef.current !== autoRunSignature} emptyMessage={processedPurchaseSavedName || purchaseFile ? undefined : 'Cần tải file mua vào đã xử lý trước khi khớp mua/bán.'} />;
-        }
+        return <MatchStage rows={matches} disabled={!salesFile || busy || (!purchaseFile && !processedPurchaseSavedName)} onRun={runSalesMatch} onSave={saveMatchChoices} onToggle={toggleMatch} onBulkToggle={bulkToggleMatches} onConversionChange={updateMatchConversion} emptyMessage={processedPurchaseSavedName || purchaseFile ? undefined : 'Cần tải file mua vào đã xử lý trước khi khớp mua/bán.'} />;
       case 9:
         if (busy && !salesCompanyRows.length) return <LoadingStage title="Đang tải danh sách công ty bán ra" detail="Đang lọc các hàng hóa chưa khớp KVT/152 và gom theo công ty..." />;
         return <CompanyRulesStage companies={salesCompanyRows} selectedCompanyIndex={selectedSalesCompanyIndex} processingGroups={salesProcessingGroups} productPreviewCodes={salesProductPreviewCodes} productCodeOverrides={salesProductCodeOverrides} productCodeReplacements={salesProductCodeReplacements} wordRules={salesWordRules} repeatedPhrases={salesRepeatedPhraseRemovals} inventoryPairs={salesInventoryPairs} useDefaultInventoryPair={salesUseDefaultInventoryPair} defaultInventoryPairId={salesDefaultInventoryPairId} inventoryPairRules={salesInventoryPairRules} busy={busy} showCompanyPrefixControls includeCompanyPrefix={includeCompanyPrefix} prefixStrategy={salesPrefixStrategy} prefixMstDigits={prefixMstDigits} prefixNameWords={prefixNameWords} prefixNameChars={prefixNameChars} missingMstPrefixStrategy={prefixMissingMstStrategy} missingMstCompanies={salesMissingMstCompanies} onIncludeCompanyPrefixChange={updateIncludeCompanyPrefix} onCompanyPrefixChange={updateSalesCompanyPrefix} onPrefixMstDigitsChange={updatePrefixMstDigits} onPrefixNameWordsChange={updatePrefixNameWords} onPrefixNameCharsChange={updatePrefixNameChars} onMissingMstPrefixStrategyChange={updateMissingMstPrefixStrategy} onApplyPrefixPresetToAll={applySalesPrefixPreset} onCompanySelect={selectSalesCompany} onCompanyChange={updateSalesPendingCompany} onCompanyGroupChange={updateSalesCompanyGroup} onBulkCompanyChange={bulkUpdateSalesPendingCompanies} onProductChange={updateSalesCompanyProduct} onProductCodeChange={updateSalesProductCode} onApplyChoices={applySalesCompanyAndProductChoices} onRefreshPreviews={refreshSalesProductPreviews} onWordRuleChange={updateWordRule} onAddWordRule={addWordRule} onRepeatedChange={updateRepeatedPhrase} onAddRepeated={addRepeatedPhrase} onRemoveRepeated={removeRepeatedPhrase} onProductCodeReplacementChange={(index, field, value) => updateProductCodeReplacement(index, field, value, 'sales')} onAddProductCodeReplacement={() => addProductCodeReplacement('sales')} onRemoveProductCodeReplacement={(index) => removeProductCodeReplacement(index, 'sales')} onProductCodeReplacementsCommit={(replacements) => commitProductCodeReplacements(replacements, 'sales')} onApplyRelatedProductCodes={(updates) => applyRelatedProductCodeUpdates(updates, 'sales')} onImportProductCodeReplacements={(file) => importProductCodeReplacementFile(file, 'sales')} onAddInventoryPair={() => addInventoryPair('sales')} onInventoryPairChange={(index, field, value) => updateInventoryPair(index, field, value, 'sales')} onRemoveInventoryPair={(index) => removeInventoryPair(index, 'sales')} onInventoryDefaultsChange={(update) => updateInventoryDefaults(update, 'sales')} onAddInventoryRule={() => addInventoryRule('sales')} onInventoryRuleChange={(index, update) => updateInventoryRule(index, update, 'sales')} onRemoveInventoryRule={(index) => removeInventoryRule(index, 'sales')} />;
       case 10:
-        if (busy || !salesReviewGenerated) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." progress={loadingProgress} />;
+        if (busy) return <LoadingStage title="Đang tạo Review Mã VT bán ra" detail="Đang tạo danh sách review theo công ty/hàng hóa bán ra đã áp dụng..." progress={loadingProgress} />;
+        if (!salesReviewGenerated) return <ProcessStage title="Review Mã VT bán ra" detail="Tạo danh sách các mã bán ra cần kiểm tra từ cấu hình đã áp dụng." buttonLabel="Tạo danh sách review" disabled={!salesFile || !salesCompanyRows.length} onProcess={profile === 'vietmax' ? runSalesReview : runGenericSalesReview} />;
         return <ReviewStage rows={salesReviewRows} onApply={applySalesReviewChoices} disabled={!salesFile || busy} onRowChange={updateSalesReviewRow} onBulkChange={bulkUpdateSalesReviewRows} title="Review Mã VT bán ra" empty="Không có dòng Mã VT bán ra cần review." reviewScope={salesReviewScope} onReviewScopeChange={updateSalesReviewScope} />;
       case 11:
         if (busy) return <LoadingStage title="Đang tạo file bán ra" detail="Đang xử lý workbook bán ra, áp dụng khớp mua vào và lưu cache cho phân bổ tồn kho..." progress={loadingProgress} />;
@@ -3828,14 +3802,14 @@ export function VietmaxApp() {
 
   function renderProfileStage() {
     if (isHoGuomEstimate) {
-      return <EstimateExtractorWorkflow licenseReady={licenseReady} onStatus={setStatus} stage={stage} onStageChange={goToStage} />;
+      return <EstimateExtractorWorkflow ref={estimateWorkflowRef} licenseReady={licenseReady} onStatus={setStatus} stage={stage} onStageChange={goToStage} />;
     }
     if (isGenericWorkflowProfile) {
       if (isTwoPhaseGenericProfile(profile)) return renderTwoPhaseStage();
       if (isTwoPhaseGenericProfile(profile)) {
         switch (stage) {
           case 0.5:
-            return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
+            return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase', 'sales', 'both']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onRestoreDefaults={restoreDefaultFormMappings} onSave={saveFormatMappingConfig} />;
           case 1:
             return <UploadStage title={`HD mua vào ${selectedProfile.label}`} summary={purchaseFile} disabled={busy || !licenseReady} onUpload={(file) => upload('purchase', file)} />;
           case 2:
@@ -3874,10 +3848,11 @@ export function VietmaxApp() {
         }
       }
       if (Number(stage) === 0.5) {
-        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onSave={saveFormatMappingConfig} />;
+        return <FormatMappingStage purchaseFile={purchaseFile} salesFile={salesFile} purchaseGroups={purchaseProcessingGroups} salesGroups={salesProcessingGroups} purchasePresets={purchaseFormMappingPresets} salesPresets={salesFormMappingPresets} allowedScopes={['purchase']} busy={busy} onAddGroup={addFormatGroup} onGroupChange={updateFormatGroup} onDeleteGroup={deleteFormatGroup} onAddForm={addFormatForm} onFormChange={updateFormatForm} onFormScopeChange={updateFormatFormScope} onDeleteForm={deleteFormatForm} onAddMapping={addFormatMappingRule} onMappingChange={updateFormatMappingRule} onRemoveMapping={removeFormatMappingRule} onUploadTemplate={uploadFormatTemplate} onRestoreDefaults={restoreDefaultFormMappings} onSave={saveFormatMappingConfig} />;
       }
       if (Number(stage) === 4) {
-        if (busy || (!purchaseReviewGenerated && purchaseFile && companyRows.length)) return <LoadingStage title={`Dang tao Review Ma VT ${selectedProfile.label}`} detail="Dang so sanh cac ten hang gan giong nhau theo danh sach cong ty/hang hoa da ap dung..." progress={loadingProgress} />;
+        if (busy) return <LoadingStage title={`Đang tạo Review Mã VT ${selectedProfile.label}`} detail="Đang so sánh các tên hàng gần giống nhau theo danh sách công ty/hàng hóa đã áp dụng..." progress={loadingProgress} />;
+        if (!purchaseReviewGenerated) return <ProcessStage title={`Review Mã VT ${selectedProfile.label}`} detail="Tạo danh sách các mã cần kiểm tra từ cấu hình đã áp dụng." buttonLabel="Tạo danh sách review" disabled={!purchaseFile || !companyRows.length} onProcess={runGenericReview} />;
         return <ReviewStage rows={purchaseReviewRows} onApply={applyReviewChoices} disabled={!purchaseFile || busy} onRowChange={updateReviewRow} onBulkChange={bulkUpdateReviewRows} title={`Review Ma VT ${selectedProfile.label}`} empty="Khong co dong Ma VT can review." reviewScope={purchaseReviewScope} onReviewScopeChange={updatePurchaseReviewScope} />;
       }
       if (Number(stage) === 5 && profile === 'cao_thanh') {
@@ -3885,7 +3860,7 @@ export function VietmaxApp() {
       }
       if ((Number(stage) === 5 && profile !== 'cao_thanh') || Number(stage) === 6) {
         if (busy) return <LoadingStage title={`Đang tạo cache file ${selectedProfile.label}`} detail="Đang xử lý workbook một lần và lưu cache để các lần xuất sau tải nhanh hơn..." progress={loadingProgress} />;
-        return <ProcessStage title={`Xuất file ${selectedProfile.label}`} detail="Xuất một workbook .xls gồm FDI đã xử lý và các sheet form mapping theo cấu hình hiện tại." buttonLabel="Xuất file kết quả" disabled={busy || !purchaseFile || !companyRows.length || !processedPurchaseSavedName} onProcess={downloadGenericProcessedFile} />;
+        return <ProcessStage title={`Xuất file ${selectedProfile.label}`} detail="Xuất một workbook .xls gồm FDI đã xử lý và các sheet form mapping theo cấu hình hiện tại." buttonLabel="Xuất file kết quả" disabled={busy || !purchaseFile || !companyRows.length} onProcess={downloadGenericProcessedFile} />;
       }
       switch (stage) {
         case 1:
@@ -3916,7 +3891,7 @@ function phaseLabel(phase: StagePhase) {
   return 'Profile';
 }
 
-function statusToneFromMessage(message: string, busy = false): 'normal' | 'warning' {
+function statusToneFromMessage(message: string, busy = false): 'normal' | 'warning' | 'error' {
   if (busy) return 'normal';
   const raw = String(message || '').trim();
   if (!raw) return 'normal';
@@ -3924,6 +3899,7 @@ function statusToneFromMessage(message: string, busy = false): 'normal' | 'warni
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
+  if (/\[[A-Z][A-Z0-9_]+;\s*[a-f0-9]+\]/.test(raw)) return 'error';
   const warningPatterns = [
     'can ',
     'can co',
@@ -4341,6 +4317,7 @@ function FormatMappingStage({
   onMappingChange,
   onRemoveMapping,
   onUploadTemplate,
+  onRestoreDefaults,
   onSave,
 }: {
   purchaseFile: UploadSummary | null;
@@ -4362,6 +4339,7 @@ function FormatMappingStage({
   onMappingChange: (scope: FormatScope, formId: string, index: number, update: Partial<NonNullable<FormMappingPreset['mappings']>[number]>) => void;
   onRemoveMapping: (scope: FormatScope, formId: string, index: number) => void;
   onUploadTemplate: (scope: FormatScope, formId: string, file: File | undefined) => void;
+  onRestoreDefaults: () => void;
   onSave: () => void;
 }) {
   const scopes = allowedScopes.length ? allowedScopes : (Object.keys(FORMAT_SCOPE_LABELS) as FormatScope[]);
@@ -4395,6 +4373,7 @@ function FormatMappingStage({
         </div>
         <div className="format-toolbar-actions">
           <button type="button" className="btn-secondary" disabled={busy} onClick={() => onAddForm(activeScope, activeGroupId)}>Thêm form</button>
+          <button type="button" className="btn-secondary" disabled={busy} onClick={onRestoreDefaults}>Khôi phục 5 form mặc định</button>
           <button type="button" className="btn-secondary" disabled={busy} onClick={onSave}>Lưu cấu hình</button>
           <button type="button" disabled={busy} onClick={onSave}>Lưu form mapping</button>
         </div>
@@ -6666,7 +6645,7 @@ function buildSalesProcessPayload(workflow: WorkflowState) {
     vietmax_phase: 'sales',
     ...columns,
     purchase_price_col: workflow.purchaseColumns.price_col || 'P',
-    include_company_prefix: workflow.includeCompanyPrefix,
+    include_company_prefix: workflow.salesIncludeCompanyPrefix,
     prefix_strategy: activePrefixStrategy,
     prefix_mst_digits: workflow.prefixMstDigits,
     prefix_name_words: workflow.prefixNameWords,
@@ -6776,7 +6755,7 @@ function buildGenericSalesProcessPayload(workflow: WorkflowState, profile: Profi
     profile,
     vietmax_phase: 'sales',
     ...columns,
-    include_company_prefix: workflow.includeCompanyPrefix,
+    include_company_prefix: workflow.salesIncludeCompanyPrefix,
     prefix_strategy: activePrefixStrategy,
     prefix_mst_digits: workflow.prefixMstDigits,
     prefix_name_words: workflow.prefixNameWords,
@@ -7136,7 +7115,7 @@ function buildVietmaxUiConfigSnapshot(workflow: WorkflowState, phase: 'purchase'
     processed_company_count: companies.filter((company) => company.process !== false).length,
     product_count: companies.reduce((total, company) => total + company.all_products.length, 0),
     selected_product_count: companies.reduce((total, company) => total + selectedProductNames(company).length, 0),
-    include_company_prefix: workflow.includeCompanyPrefix,
+    include_company_prefix: isSales ? workflow.salesIncludeCompanyPrefix : workflow.includeCompanyPrefix,
     prefix_strategy: prefixStrategy,
     prefix_mst_digits: workflow.prefixMstDigits,
     prefix_name_words: workflow.prefixNameWords,

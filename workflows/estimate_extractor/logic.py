@@ -20,6 +20,9 @@ DIRECT_LABELS = {"VL", "NC", "MTC"}
 INDIRECT_LABELS = {"CPC", "LT", "CPK", "TNCT", "VAT", "TC"}
 ALL_LABELS = DIRECT_LABELS | INDIRECT_LABELS
 COST_LABEL_ORDER = ["VL", "NC", "MTC", "CPC", "LT", "CPK", "TNCT", "VAT", "TC"]
+BID_HEADER_LABELS = [("ten cong tac",), ("khoi luong",)]
+DETAIL_HEADER_LABELS = [("ma so", "ma hieu", "ma hieu don gia"), ("thanh phan hao phi", "ten cong tac"), ("thanh tien",)]
+DETAIL_SHEET_NAMES = ["chiet tinh", "don gia chi tiet"]
 
 
 @dataclass
@@ -181,8 +184,8 @@ def analyze_estimate_workbook(
     bid_sheet = workbook.sheet_by_index(bid_sheet_index)
     detail_sheet = workbook.sheet_by_index(detail_sheet_index)
 
-    bid_header = _resolve_header_row(bid_header_row, bid_sheet, ["ten cong tac", "khoi luong"])
-    detail_header = _resolve_header_row(detail_header_row, detail_sheet, ["ma so", "thanh phan hao phi", "thanh tien"])
+    bid_header = _resolve_header_row(bid_header_row, bid_sheet, BID_HEADER_LABELS)
+    detail_header = _resolve_header_row(detail_header_row, detail_sheet, DETAIL_HEADER_LABELS)
     bid_cols = _bid_columns(bid_sheet, bid_header, bid_columns)
     detail_cols = _detail_columns(detail_sheet, detail_header, detail_columns)
 
@@ -237,18 +240,18 @@ def list_estimate_workbook_sheets(path: str) -> dict:
         })
     suggested: dict[str, object | None] = {"bid_sheet_index": None, "detail_sheet_index": None}
     try:
-        bid_index = _find_sheet_index(workbook, ["du thau", "du thau (2)"], ["ten cong tac", "khoi luong"])
+        bid_index = _find_sheet_index(workbook, ["du thau", "du thau (2)"], BID_HEADER_LABELS)
         bid_sheet = workbook.sheet_by_index(bid_index)
-        bid_header = _find_header_row(bid_sheet, ["ten cong tac", "khoi luong"])
+        bid_header = _find_header_row(bid_sheet, BID_HEADER_LABELS)
         suggested["bid_sheet_index"] = bid_index
         suggested["bid_header_row"] = bid_header + 1
         suggested["bid_columns"] = _columns_to_letters(_bid_columns(bid_sheet, bid_header))
     except ValueError:
         pass
     try:
-        detail_index = _find_sheet_index(workbook, ["chiet tinh"], ["ma so", "thanh phan hao phi", "thanh tien"])
+        detail_index = _find_sheet_index(workbook, DETAIL_SHEET_NAMES, DETAIL_HEADER_LABELS)
         detail_sheet = workbook.sheet_by_index(detail_index)
-        detail_header = _find_header_row(detail_sheet, ["ma so", "thanh phan hao phi", "thanh tien"])
+        detail_header = _find_header_row(detail_sheet, DETAIL_HEADER_LABELS)
         suggested["detail_sheet_index"] = detail_index
         suggested["detail_header_row"] = detail_header + 1
         suggested["detail_columns"] = _columns_to_letters(_detail_columns(detail_sheet, detail_header))
@@ -287,12 +290,12 @@ def create_estimate_output_workbook(
     bid_sheet = source.sheet_by_index(bid_sheet_index)
     detail_sheet = source.sheet_by_index(detail_sheet_index)
 
-    bid_header = _resolve_header_row(bid_header_row, bid_sheet, ["ten cong tac", "khoi luong"])
-    detail_header = _resolve_header_row(detail_header_row, detail_sheet, ["ma so", "thanh phan hao phi", "thanh tien"])
+    bid_header = _resolve_header_row(bid_header_row, bid_sheet, BID_HEADER_LABELS)
+    detail_header = _resolve_header_row(detail_header_row, detail_sheet, DETAIL_HEADER_LABELS)
     bid_cols = _bid_columns(bid_sheet, bid_header, bid_columns)
     detail_cols = _detail_columns(detail_sheet, detail_header, detail_columns)
     display_bid_sheet = _preferred_display_bid_sheet(source, bid_sheet_index)
-    display_bid_header = _find_header_row(display_bid_sheet, ["ten cong tac", "khoi luong"]) if display_bid_sheet is not None else None
+    display_bid_header = _find_header_row(display_bid_sheet, BID_HEADER_LABELS) if display_bid_sheet is not None else None
     display_bid_cols = _bid_columns(display_bid_sheet, display_bid_header) if display_bid_sheet is not None and display_bid_header is not None else None
     bid_rows = _bid_item_rows(bid_sheet, bid_header + 1, bid_cols)
     detail_blocks = _detail_blocks(detail_sheet, detail_header + 1, detail_cols)
@@ -383,10 +386,12 @@ def _text(value) -> str:
 
 
 def _fold(value) -> str:
-    text = unicodedata.normalize("NFD", _text(value))
+    text = _text(value)
+    text = re.sub(r"_x[0-9a-fA-F]{4}_", " ", text)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    text = text.replace("đ", "d").replace("Đ", "D")
-    text = text.replace("đ", "d").replace("Đ", "D")
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
@@ -493,17 +498,20 @@ def _resolve_header_row(value, sheet, required_labels: list[str]) -> int:
     return row
 
 
-def _find_header_row(sheet, required_labels: list[str]) -> int:
-    folded_required = set(required_labels)
+def _find_header_row(sheet, required_labels) -> int:
+    alias_groups = []
+    for required in required_labels:
+        aliases = required if isinstance(required, (list, tuple, set)) else [required]
+        alias_groups.append({_fold(alias) for alias in aliases})
     best_row = None
     best_score = -1
     for row in range(min(sheet.nrows, 80)):
         labels = {_fold(_cell(sheet, row, col)) for col in range(sheet.ncols)}
-        score = len(labels & folded_required)
+        score = sum(bool(labels & aliases) for aliases in alias_groups)
         if score > best_score:
             best_score = score
             best_row = row
-        if folded_required <= labels:
+        if score == len(alias_groups):
             return row
     if best_row is None or best_score <= 0:
         raise ValueError(f"Cannot find header row for labels: {required_labels}")
@@ -529,11 +537,11 @@ def _find_sheet_index(workbook, preferred_names, required_labels: list[str]) -> 
 
 def _resolve_estimate_sheet_indexes(workbook, bid_sheet_index: int | None, detail_sheet_index: int | None) -> tuple[int, int]:
     if bid_sheet_index is None:
-        bid_sheet_index = _find_sheet_index(workbook, ["du thau", "du thau (2)"], ["ten cong tac", "khoi luong"])
+        bid_sheet_index = _find_sheet_index(workbook, ["du thau", "du thau (2)"], BID_HEADER_LABELS)
     else:
         bid_sheet_index = _validate_sheet_index(workbook, bid_sheet_index, "Dự thầu")
     if detail_sheet_index is None:
-        detail_sheet_index = _find_sheet_index(workbook, ["chiet tinh"], ["ma so", "thanh phan hao phi", "thanh tien"])
+        detail_sheet_index = _find_sheet_index(workbook, DETAIL_SHEET_NAMES, DETAIL_HEADER_LABELS)
     else:
         detail_sheet_index = _validate_sheet_index(workbook, detail_sheet_index, "Chiết tính")
     return bid_sheet_index, detail_sheet_index
@@ -564,7 +572,7 @@ def _validate_sheet_index(workbook, index: int, label: str) -> int:
 
 
 def _first_header_col(sheet, header_row: int, aliases: list[str], start: int = 0) -> int:
-    folded_aliases = set(aliases)
+    folded_aliases = {_fold(alias) for alias in aliases}
     for col in range(start, sheet.ncols):
         if _fold(_cell(sheet, header_row, col)) in folded_aliases:
             return col
@@ -583,7 +591,7 @@ def _bid_columns(sheet, header_row: int, overrides: dict | None = None) -> Sheet
     if manual is not None:
         return manual
     stt = _first_header_col(sheet, header_row, ["stt"])
-    code = _optional_header_col(sheet, header_row, ["ma so"])
+    code = _optional_header_col(sheet, header_row, ["ma so", "ma hieu", "ma hieu don gia"])
     name = _first_header_col(sheet, header_row, ["ten cong tac"])
     unit = _first_header_col(sheet, header_row, ["don vi"])
     qty = _first_header_col(sheet, header_row, ["khoi luong"])
@@ -600,9 +608,9 @@ def _detail_columns(sheet, header_row: int, overrides: dict | None = None) -> Sh
     manual = _columns_from_overrides(overrides, ["stt", "code", "name", "unit", "amount"])
     if manual is not None:
         return manual
-    code = _first_header_col(sheet, header_row, ["ma so"])
+    code = _first_header_col(sheet, header_row, ["ma so", "ma hieu", "ma hieu don gia"])
     stt = _first_header_col(sheet, header_row, ["stt"])
-    name = _first_header_col(sheet, header_row, ["thanh phan hao phi"])
+    name = _first_header_col(sheet, header_row, ["thanh phan hao phi", "ten cong tac"])
     unit = _first_header_col(sheet, header_row, ["don vi"])
     norm = _optional_header_col(sheet, header_row, ["dinh muc"])
     price = _optional_header_col(sheet, header_row, ["don gia (d)", "don gia"])
@@ -768,11 +776,11 @@ def _classify_row(name, unit, current_direct: str | None):
     if not name_key:
         return None, current_direct, "blank"
 
-    if re.match(r"^a\s*[\.\)]*\s*vat\s*lieu\b", name_key):
+    if name_key == "vat lieu" or re.match(r"^a\s*[\.\)]*\s*vat\s*lieu\b", name_key):
         return None, "VL", "direct_header"
-    if re.match(r"^b\s*[\.\)]*\s*nhan\s*cong\b", name_key):
+    if name_key == "nhan cong" or re.match(r"^b\s*[\.\)]*\s*nhan\s*cong\b", name_key):
         return None, "NC", "direct_header"
-    if re.match(r"^c\s*[\.\)]*\s*may\s*thi\s*cong\b", name_key):
+    if name_key in {"may", "may thi cong"} or re.match(r"^c\s*[\.\)]*\s*may\s*thi\s*cong\b", name_key):
         return None, "MTC", "direct_header"
 
     if name_key == "cong" or "cong chi phi truc tiep" in name_key:
