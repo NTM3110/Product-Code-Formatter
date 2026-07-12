@@ -1,23 +1,34 @@
 import base64
 import os
 import socket
-import subprocess
+import shutil
 import sys
 import threading
 import time
 from pathlib import Path
+
+def run_velopack_startup_hooks() -> None:
+    try:
+        import velopack
+    except ImportError:
+        return
+    velopack.App().run()
+
+
+if __name__ == "__main__":
+    run_velopack_startup_hooks()
+
 
 import uvicorn
 
 from app import ICON_PATH
 from web_api import app as fastapi_app, close_workflow_runtime, find_free_port
 
-APP_TITLE = "Product Code Formatter"
-DESKTOP_SHORTCUT_NAME = "Product Code Formatter.lnk"
+APP_TITLE = "ProductCodeFormatter"
+DESKTOP_SHORTCUT_NAME = "ProductCodeFormatter.lnk"
 DESKTOP_SHORTCUT_ALIASES = [
     "Product Code Formatter.lnk",
     "Product Code Formatter Web.lnk",
-    "ProductCodeFormatter.lnk",
     "ProductCodeFormatterWeb.lnk",
 ]
 
@@ -62,77 +73,46 @@ class DesktopApi:
         return {"saved": True, "path": str(target)}
 
 
-def ps_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def current_exe_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
     return Path(__file__).resolve()
 
 
-def ensure_desktop_shortcut() -> None:
+def is_velopack_install() -> bool:
     if os.name != "nt" or not getattr(sys, "frozen", False):
+        return False
+    current_dir = current_exe_path().parent
+    return (current_dir / "sq.version").exists() or (current_dir.parent / "sq.version").exists()
+
+
+def cleanup_legacy_install_artifacts() -> None:
+    if not is_velopack_install():
         return
-    exe_path = current_exe_path()
-    shortcut_names = "@(" + ",".join(ps_quote(name) for name in DESKTOP_SHORTCUT_ALIASES) + ")"
-    script = f"""
-$ErrorActionPreference = 'SilentlyContinue'
-$ExePath = {ps_quote(exe_path)}
-$ShortcutName = {ps_quote(DESKTOP_SHORTCUT_NAME)}
-$ShortcutAliases = {shortcut_names}
-$Shell = New-Object -ComObject WScript.Shell
-$desktopPaths = @(
-  [Environment]::GetFolderPath('Desktop'),
-  [Environment]::GetFolderPath('CommonDesktopDirectory')
-) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
+    local_app_data = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    app_data_dir = local_app_data / "ProductCodeFormatter"
+    legacy_exe = app_data_dir / "ProductCodeFormatter.exe"
+    if legacy_exe.exists() and legacy_exe.resolve() != current_exe_path():
+        try:
+            legacy_exe.unlink()
+        except OSError:
+            pass
+    shutil.rmtree(app_data_dir / "updates", ignore_errors=True)
 
-foreach ($desktop in $desktopPaths) {{
-  foreach ($name in $ShortcutAliases) {{
-    $shortcutPath = Join-Path $desktop $name
-    if (Test-Path $shortcutPath) {{
-      try {{
-        Remove-Item -LiteralPath $shortcutPath -Force
-      }} catch {{}}
-    }}
-  }}
-}}
-
-$userDesktop = [Environment]::GetFolderPath('Desktop')
-if ($userDesktop -and (Test-Path $userDesktop)) {{
-  $shortcutPath = Join-Path $userDesktop $ShortcutName
-  $link = $Shell.CreateShortcut($shortcutPath)
-  $link.TargetPath = $ExePath
-  $link.WorkingDirectory = Split-Path -Parent $ExePath
-  $link.IconLocation = $ExePath + ',0'
-  $link.Description = 'Product Code Formatter'
-  $link.Save()
-}}
-
-$ie4uinit = Join-Path $env:WINDIR 'System32\\ie4uinit.exe'
-if (Test-Path $ie4uinit) {{
-  Start-Process -FilePath $ie4uinit -ArgumentList '-show' -WindowStyle Hidden
-}}
-""".strip()
-    startupinfo = None
-    creationflags = 0
-    if hasattr(subprocess, "STARTUPINFO"):
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            text=True,
-            capture_output=True,
-            timeout=8,
-            startupinfo=startupinfo,
-            creationflags=creationflags,
-        )
-    except Exception:
-        pass
-
+    shortcut_roots = [
+        Path.home() / "Desktop",
+        Path(os.environ.get("PUBLIC") or "C:/Users/Public") / "Desktop",
+        Path(os.environ.get("APPDATA") or "") / "Microsoft/Windows/Start Menu/Programs",
+        Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / "Microsoft/Windows/Start Menu/Programs",
+    ]
+    for root in shortcut_roots:
+        if not root.exists():
+            continue
+        for name in DESKTOP_SHORTCUT_ALIASES:
+            try:
+                (root / name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 def wait_for_server(port: int, timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
@@ -154,14 +134,14 @@ def run_api_server(port: int) -> None:
 def main() -> None:
     import webview
 
-    ensure_desktop_shortcut()
+    cleanup_legacy_install_artifacts()
     port = int(os.environ.get("PRODUCT_CODE_FORMATTER_PORT") or find_free_port())
     thread = threading.Thread(target=run_api_server, args=(port,), daemon=True)
     thread.start()
     wait_for_server(port)
 
     window_options = {
-        "title": "Product Code Formatter - Vietmax",
+        "title": APP_TITLE,
         "url": f"http://127.0.0.1:{port}",
         "width": 1400,
         "height": 900,

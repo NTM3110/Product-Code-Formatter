@@ -1,4 +1,4 @@
-﻿# Python environments and caches
+# Python environments and caches
 .venv/
 venv/
 env/
@@ -65,6 +65,8 @@ product_code_config*.json
 deploy/product_code_config.json
 .env
 .env.*
+!license_server/.env.example
+!license_server/.env.keygen.example
 *.key
 *.pem
 *.crt
@@ -107,3 +109,7 @@ inventory_allocation_app/outputs/
 inventory_allocation_app/uploads/
 .aider*
 
+
+license_server/releases/*
+!license_server/releases/.gitkeep
+Releases/

@@ -533,3 +533,17 @@ export type LicenseStatus = {
   server_url: string;
   account_id: string;
 };
+
+
+export type UpdateManifest = {
+  current_version: string;
+  version: string;
+  available: boolean;
+  server_url: string;
+  filename?: string;
+  download_url?: string;
+  sha256?: string;
+  size?: number;
+  notes?: string;
+  current_notes?: string;
+};

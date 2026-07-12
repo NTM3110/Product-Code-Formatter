@@ -36,6 +36,25 @@ services:
       DATABASE_URL: postgres://keygen:${POSTGRES_PASSWORD}@postgres:5432/keygen
       REDIS_URL: redis://redis:6379/0
 
+  admin:
+    build:
+      context: .
+      dockerfile: admin.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - keygen
+    ports:
+      - "${ADMIN_PORT:-8080}:8080"
+    environment:
+      ADMIN_BIND_HOST: 0.0.0.0
+      ADMIN_PORT: 8080
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      KEYGEN_API_URL: http://keygen:3000
+      KEYGEN_ACCOUNT_ID: ${KEYGEN_ACCOUNT_ID}
+      RELEASE_DIR: /data/releases
+    volumes:
+      - ./releases:/data/releases
+
 volumes:
   keygen_postgres:
   keygen_redis:

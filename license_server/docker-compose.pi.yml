@@ -1,0 +1,20 @@
+services:
+  admin:
+    build:
+      context: .
+      dockerfile: admin.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${ADMIN_PORT:-8080}:8080"
+    environment:
+      LICENSE_SERVER_MODE: ${LICENSE_SERVER_MODE:-local-pi-v1}
+      ADMIN_BIND_HOST: 0.0.0.0
+      ADMIN_PORT: 8080
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      LICENSE_ACCOUNT_ID: ${LICENSE_ACCOUNT_ID:-6f1f56e8-3b6f-4a86-9a31-9e0e7f62c001}
+      LICENSE_DB_PATH: /data/license-data/licenses.sqlite3
+      RELEASE_DIR: /data/releases
+    command: ["python", "/app/local_admin_server.py"]
+    volumes:
+      - ./releases:/data/releases
+      - ./license-data:/data/license-data

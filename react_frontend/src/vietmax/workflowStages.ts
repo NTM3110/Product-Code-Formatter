@@ -1,4 +1,4 @@
-export type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax' | 'ho_guom';
+export type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax' | 'ho_guom' | 'viet_hung';
 export type StageId = 0.5 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
 export type StagePhase = 'format' | 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'fast' | 'estimate';
 
@@ -19,6 +19,7 @@ export const profiles: Array<{ key: ProfileKey; label: string; note: string }> =
   { key: 'quang_thinh', label: 'Quang Thịnh', note: 'Dùng quy trình formatter cơ bản.' },
   { key: 'vietmax', label: 'Vietmax', note: 'Mua vào, bán ra, khớp mua vào, tồn kho và FAST.' },
   { key: 'ho_guom', label: 'Hồ Gươm', note: 'Bóc tách dự toán từ Dự thầu và Chiết tính.' },
+  { key: 'viet_hung', label: 'Việt Hưng', note: 'Dùng khung workflow formatter cơ bản.' },
 ];
 
 export const vietmaxStages: StageDefinition[] = [
@@ -78,6 +79,7 @@ export const profileCapabilities: Record<ProfileKey, ProfileCapabilities> = {
   quang_thinh: {},
   vietmax: { twoPhaseFrame: true, vietmaxPurchaseMatch: true, inventoryAllocation: true },
   ho_guom: { estimateExtractor: true },
+  viet_hung: {},
 };
 
 const baseTwoPhaseStageIds = new Set<StageId>([0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15]);
@@ -98,7 +100,7 @@ export function isStageId(value: unknown): value is StageId {
 }
 
 export function isGenericProfileKey(value: ProfileKey) {
-  return value === 'son_phuong' || value === 'quang_thinh' || value === 'cao_thanh';
+  return value === 'son_phuong' || value === 'quang_thinh' || value === 'cao_thanh' || value === 'viet_hung';
 }
 
 export function usesTwoPhaseFrame(profile: ProfileKey) {

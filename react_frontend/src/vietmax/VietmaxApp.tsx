@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { activateLicense, analyzeGenericWorkbook, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, getVietmaxFormatMappingDefaults, getWorkflowSession, importProductCodeReplacements, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, saveVietmaxConfig, reloadLicense, startInventoryAllocation, startWorkflowProcessJob, uploadExcel, uploadFormTemplate, validateFastImportProcessedFile, waitForWorkflowJob } from '../api';
+import { activateLicense, applyUpdate, analyzeGenericWorkbook, checkForUpdate, analyzeVietmaxCompanies, createGenericReview, createPurchaseReview, createSalesMatches, createVietmaxFastImportPackage, downloadCachedFile, downloadInventoryAllocationReport, exportMatches, exportPriceReportWorkbook, fetchInvoiceStatuses, getAppConfig, getInventoryAllocationJob, getLicenseStatus, getOperationProgress, getVietmaxFormatMappingDefaults, getWorkflowSession, importProductCodeReplacements, importVietmaxConfig, inspectProcessedVietmaxFile, previewGenericProductCodes, previewVietmaxProductCodes, processGenericWorkbook, saveVietmaxConfig, reloadLicense, startInventoryAllocation, startWorkflowProcessJob, uploadExcel, uploadFormTemplate, validateFastImportProcessedFile, waitForWorkflowJob } from '../api';
 import { useRef } from 'react';
-import type { CompanyRow, FormatMappingDefaults, FormColumn, FormMappingPreset, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ProcessingForm, ProcessingGroup, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob } from '../types';
+import type { CompanyRow, FormatMappingDefaults, FormColumn, FormMappingPreset, InventoryAllocationConfig, InventoryAllocationJob, InventoryAllocationResult, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessedFileStats, ProcessingForm, ProcessingGroup, ReviewProduct, ReviewRow, UploadSummary, UpdateManifest, WorkflowJob } from '../types';
 import { EstimateExtractorWorkflow, type EstimateExtractorWorkflowHandle } from '../estimate/EstimateExtractorWorkflow';
 import { InventoryAllocationExportStage, InventoryAllocationReportStage, InventoryAllocationStage } from './InventoryAllocationStage';
 import { StageNavigation } from './StageNavigation';
@@ -866,11 +866,19 @@ function initialWorkflowStates(): Record<ProfileKey, WorkflowState> {
     quang_thinh: { ...initialWorkflowState(), stage: 0.5 },
     vietmax: { ...initialWorkflowState(), stage: 0.5 },
     ho_guom: initialWorkflowState(),
+    viet_hung: { ...initialWorkflowState(), stage: 0.5 },
   };
 }
 
+const FIXED_LICENSE_SERVER_URL = 'http://192.168.1.210:8080';
+const FIXED_LICENSE_SERVER_FALLBACK_URL = 'http://192.168.101.13:8080';
+const FIXED_LICENSE_ACCOUNT_ID = '6f1f56e8-3b6f-4a86-9a31-9e0e7f62c001';
+const CLIENT_RELEASE_VERSION = import.meta.env.VITE_APP_VERSION || '0.4.0';
+
+type ConfigTransferScope = 'purchase' | 'sales' | 'all';
+
 function initialLicenseForm() {
-  return { server_url: '', account_id: '', license_key: '' };
+  return { server_url: FIXED_LICENSE_SERVER_URL, account_id: FIXED_LICENSE_ACCOUNT_ID, license_key: '' };
 }
 
 function normalizeLicenseProfileText(value: unknown) {
@@ -979,6 +987,11 @@ export function VietmaxApp() {
   const estimateWorkflowRef = useRef<EstimateExtractorWorkflowHandle>(null);
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [licenseForm, setLicenseForm] = useState(initialLicenseForm);
+  const [updateManifest, setUpdateManifest] = useState<UpdateManifest | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState('');
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [configTransferScope, setConfigTransferScope] = useState<ConfigTransferScope>('all');
   const [status, setStatus] = useState('Chọn profile và bắt đầu theo từng stage. Dữ liệu được giữ khi chuyển stage, chỉ xóa khi bấm Làm lại.');
   const [busy, setBusy] = useState(false);
   const [autoSavingConfig, setAutoSavingConfig] = useState(false);
@@ -1424,8 +1437,6 @@ export function VietmaxApp() {
     try {
       const nextLicense = await activateLicense({
         license_key: licenseForm.license_key,
-        server_url: licenseForm.server_url || undefined,
-        account_id: licenseForm.account_id || undefined,
       });
       setLicense(nextLicense);
       const nextReady = licenseAllowsSelectedProfile(profile, selectedProfile.label, nextLicense);
@@ -1452,6 +1463,33 @@ export function VietmaxApp() {
     }
   }
 
+  async function checkUpdate() {
+    setUpdateBusy(true);
+    try {
+      const result = await checkForUpdate();
+      setUpdateManifest(result);
+      setStatus(result.available ? `Có bản cập nhật ${result.version} trên server.` : `Đang dùng phiên bản mới nhất ${result.current_version}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateManifest?.available) return;
+    setUpdateBusy(true);
+    setUpdateProgress(`Đang tải bản ${updateManifest.version}...`);
+    try {
+      await applyUpdate(updateManifest);
+      setUpdateProgress('Đã tải và xác minh xong. Velopack sẽ đóng ứng dụng, cài bản mới rồi tự mở lại.');
+      setStatus(`Đã tải bản ${updateManifest.version}; đang chuyển sang trình cập nhật Velopack.`);
+    } catch (error) {
+      setUpdateProgress('Cập nhật thất bại. Ứng dụng vẫn đang chạy để bạn kiểm tra lại.');
+      setStatus(error instanceof Error ? error.message : String(error));
+      setUpdateBusy(false);
+    }
+  }
   async function upload(kind: 'purchase' | 'sales', file: File | undefined) {
     if (!file) return;
     const targetProfile = profile;
@@ -3156,6 +3194,80 @@ export function VietmaxApp() {
     }
   }
 
+  async function exportSelectedVietmaxConfig() {
+    if (configTransferScope === 'purchase' || configTransferScope === 'sales') {
+      await exportCurrentVietmaxConfig(configTransferScope);
+      return;
+    }
+    if (profile !== 'vietmax') {
+      setStatus('Chỉ xuất cấu hình theo scope ở profile Vietmax.');
+      return;
+    }
+    setBusy(true);
+    setStatus('Đang xuất cấu hình Vietmax mua vào và bán ra...');
+    try {
+      const cfg = await getAppConfig();
+      const payload = {
+        export_version: 2,
+        app: 'Product Code Formatter',
+        profile: 'vietmax',
+        scope: 'all',
+        phases: {
+          purchase: buildVietmaxConfigExportSnapshot(workflow, 'purchase', cfg),
+          sales: buildVietmaxConfigExportSnapshot(workflow, 'sales', cfg),
+        },
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+      const saved = await saveBlob(blob, 'vietmax_all_config_' + exportTimestamp() + '.json');
+      setStatus(saved ? 'Đã xuất một file cấu hình gồm cả mua vào và bán ra.' : 'Đã hủy xuất cấu hình Vietmax.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importSelectedVietmaxConfig() {
+    if (configTransferScope === 'purchase' || configTransferScope === 'sales') {
+      await importCurrentVietmaxConfig(configTransferScope);
+      return;
+    }
+    if (profile !== 'vietmax') {
+      setStatus('Chỉ nhập cấu hình theo scope ở profile Vietmax.');
+      return;
+    }
+    if (stage !== 0.5 && stage !== 1) {
+      setStatus('Hãy nhập cấu hình Tất cả ở stage Form mapping hoặc stage 1.');
+      return;
+    }
+    const file = await chooseJsonConfigFile();
+    if (!file) {
+      setStatus('Đã hủy nhập cấu hình Vietmax.');
+      return;
+    }
+    setBusy(true);
+    setStatus('Đang nhập cấu hình Vietmax mua vào và bán ra...');
+    try {
+      const payload = JSON.parse(await file.text()) as Record<string, unknown>;
+      const phases = payload.phases;
+      if (!phases || typeof phases !== 'object') {
+        throw new Error('File cấu hình Tất cả không có phần phases mua vào/bán ra.');
+      }
+      const phasePayloads = phases as Record<string, unknown>;
+      if (!phasePayloads.purchase || !phasePayloads.sales) {
+        throw new Error('File cấu hình Tất cả phải có đủ purchase và sales.');
+      }
+      await importVietmaxConfig('purchase', phasePayloads.purchase as Record<string, unknown>);
+      await importVietmaxConfig('sales', phasePayloads.sales as Record<string, unknown>);
+      if (purchaseFile) await loadCompanies();
+      if (salesFile) await loadSalesCompanies();
+      setStatus('Đã nhập cấu hình Vietmax cho cả mua vào và bán ra.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
   async function refreshProductPreviews() {
     if (!companyRows.length) return;
     setBusy(true);
@@ -3691,16 +3803,21 @@ export function VietmaxApp() {
                 </select>
               </label>
             )}
-            <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={() => void reloadCurrentConfig()}>Tải lại cấu hình</button>
             <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={saveCurrentConfig}>Lưu cấu hình</button>
+            <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig || updateBusy} onClick={() => { setUpdateModalOpen(true); void checkUpdate(); }}>{updateBusy ? 'Đang kiểm tra...' : 'Kiểm tra cập nhật'}</button>
+            <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig || updateBusy || !updateManifest?.available} onClick={() => void installUpdate()}>{updateManifest?.available ? 'Cập nhật ' + updateManifest.version : 'Cập nhật'}</button>
             {profile === 'vietmax' && (
-              <div className="config-export-actions" aria-label="Xuất/nhập cấu hình Vietmax">
-                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={() => void exportCurrentVietmaxConfig('purchase')}>Xuất cấu hình mua vào</button>
-                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={() => void exportCurrentVietmaxConfig('sales')}>Xuất cấu hình bán ra</button>
-                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig || (stage !== 0.5 && stage !== 1)} title="Chỉ nhập ở stage form mapping hoặc stage 1 để tránh conflict dữ liệu đang xử lý" onClick={() => void importCurrentVietmaxConfig('purchase')}>Nhập cấu hình mua vào</button>
-                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig || stage !== 6} title="Chỉ nhập ở stage 6 để tránh conflict dữ liệu đang xử lý" onClick={() => void importCurrentVietmaxConfig('sales')}>Nhập cấu hình bán ra</button>
+              <div className="config-transfer-actions" aria-label="Xuất nhập cấu hình Vietmax">
+                <select className="config-transfer-scope" value={configTransferScope} disabled={busy || autoSavingConfig} onChange={(event) => setConfigTransferScope(event.currentTarget.value as ConfigTransferScope)}>
+                  <option value="purchase">Mua vào</option>
+                  <option value="sales">Bán ra</option>
+                  <option value="all">Tất cả</option>
+                </select>
+                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig} onClick={() => void exportSelectedVietmaxConfig()}>Xuất cấu hình</button>
+                <button type="button" className="btn-secondary" disabled={busy || autoSavingConfig || (configTransferScope === 'purchase' ? (stage !== 0.5 && stage !== 1) : configTransferScope === 'sales' ? stage !== 6 : (stage !== 0.5 && stage !== 1))} onClick={() => void importSelectedVietmaxConfig()}>Nhập cấu hình</button>
               </div>
             )}
+            <span className="app-version-badge" title="Phiên bản ứng dụng">v{updateManifest?.current_version || CLIENT_RELEASE_VERSION}</span>
           </div>
           {usesNativeStageShell && <StageNavigation stages={visibleStages} stage={stage} busy={busy || autoSavingConfig} canEnterStage={canEnterStage} goToStage={goToStage} />}
         </header>
@@ -3716,7 +3833,7 @@ export function VietmaxApp() {
             </div>
             {!licenseReady && (
               <div className="license-form compact-form">
-                <input placeholder="License server/IP, vd 192.168.1.10:3000" value={licenseForm.server_url} onChange={(event) => setLicenseForm({ ...licenseForm, server_url: event.currentTarget.value })} />
+                <span className="license-server-fixed">License server: {FIXED_LICENSE_SERVER_URL} (dự phòng: {FIXED_LICENSE_SERVER_FALLBACK_URL})</span>
                 <input placeholder="LICENSE_KEY" type="password" value={licenseForm.license_key} onChange={(event) => setLicenseForm({ ...licenseForm, license_key: event.currentTarget.value })} />
                 <button type="button" disabled={busy || autoSavingConfig} onClick={submitLicense}>Kích hoạt</button>
               </div>
@@ -3738,6 +3855,30 @@ export function VietmaxApp() {
             <div className="action-spacer" />
             <button type="button" disabled={nextDisabled} onClick={() => void goNext()}>Tiếp tục</button>
           </footer>
+        )}
+        {updateModalOpen && (
+          <div className="modal-overlay" role="presentation" onMouseDown={() => setUpdateModalOpen(false)}>
+            <section className="modal-content update-modal" role="dialog" aria-modal="true" aria-labelledby="update-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+              <div className="modal-header">
+                <h2 id="update-modal-title">Cập nhật ứng dụng</h2>
+                <button type="button" className="modal-close" onClick={() => setUpdateModalOpen(false)}>×</button>
+              </div>
+              <div className="modal-body update-modal-body">
+                <div className="update-summary-grid">
+                  <div><span>Phiên bản hiện tại</span><strong>{updateManifest?.current_version || 'Đang kiểm tra...'}</strong></div>
+                  <div><span>Phiên bản mới</span><strong>{updateManifest?.available ? updateManifest.version : 'Không có bản mới'}</strong></div>
+                </div>                <div className="update-release-notes">
+                  <div className="update-notes"><strong>Bản đang chạy</strong><p>{updateManifest?.current_notes || 'Chưa có mô tả bản đang chạy.'}</p></div>
+                  <div className="update-notes"><strong>Bản mới nhất trên server</strong><p>{updateManifest?.notes || 'Chưa có mô tả bản mới.'}</p></div>
+                </div>
+                <p className="muted">{updateBusy ? (updateProgress || 'Đang xử lý cập nhật...') : updateManifest?.available ? 'Đã có bản mới. Bấm Cập nhật để tải và khởi động lại ứng dụng.' : updateManifest ? 'Đang dùng phiên bản mới nhất.' : 'Bấm Kiểm tra lại để kiểm tra phiên bản trên server.'}</p>
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="btn-secondary" disabled={updateBusy} onClick={() => void checkUpdate()}>Kiểm tra lại</button>
+                <button type="button" disabled={updateBusy || !updateManifest?.available} onClick={() => void installUpdate()}>{updateBusy ? 'Đang tải...' : 'Cập nhật'}</button>
+              </div>
+            </section>
+          </div>
         )}
       </section>
     </main>

@@ -1,3 +1,4 @@
+> **Recommended Raspberry Pi deployment:** use the ARM-native FastAPI + SQLite server and Velopack update feed documented in [RASPBERRY_PI_LOCAL_LICENSE.md](RASPBERRY_PI_LOCAL_LICENSE.md). The Keygen notes below are retained only for legacy deployments.
 # Product Code Formatter License Server
 
 Use this folder on the Windows machine that will host the LAN license server.

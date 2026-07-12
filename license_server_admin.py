@@ -32,6 +32,7 @@ DEFAULT_ADMIN_OPTIONS = {
         {"key": "quang_thinh", "label": "Quang Thịnh"},
         {"key": "vietmax", "label": "Vietmax"},
         {"key": "ho_guom", "label": "Hồ Gươm"},
+        {"key": "viet_hung", "label": "Việt Hưng"},
     ],
     "products": [
         {"code": "product-code-formatter", "name": "Product Code Formatter", "label": "Product Code Formatter", "uses_profiles": True, "application": "ProductCodeFormatter"},
@@ -50,6 +51,15 @@ def load_admin_options():
             loaded = json.load(handle)
         if isinstance(loaded, dict):
             options = {**DEFAULT_ADMIN_OPTIONS, **loaded}
+            profile_options = {}
+            for item in DEFAULT_ADMIN_OPTIONS["profiles"]:
+                profile_options[str(item.get("key") or "").strip()] = item
+            for item in loaded.get("profiles") or []:
+                if isinstance(item, dict):
+                    key = str(item.get("key") or "").strip()
+                    if key:
+                        profile_options[key] = item
+            options["profiles"] = list(profile_options.values())
 
     profiles = []
     for item in options.get("profiles") or []:

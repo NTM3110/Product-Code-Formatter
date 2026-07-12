@@ -22,6 +22,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import (
+    APP_VERSION,
+    APP_RELEASE_NOTES,
+    configured_license_server_url,
+    configured_license_server_urls,
     APP_DATA_DIR,
     DEFAULT_INVOICE_STATUS_COL,
     DEFAULT_INVOICE_STATUS_SKIP_VALUES,
@@ -105,6 +109,7 @@ from product_code.excel_io import (
     workbook_content_for_openpyxl,
 )
 from product_code.license_client import public_license_status as build_public_license_status
+from product_code.update_client import check_for_update, normalize_update_server_url, prepare_velopack_update, schedule_velopack_restart
 from product_code.workflow_runtime import (
     WorkflowFailure,
     WorkflowJobManager,
@@ -126,6 +131,35 @@ WORKFLOW_JOB_MANAGER = WorkflowJobManager(max_workers=2)
 def close_workflow_runtime():
     WORKFLOW_JOB_MANAGER.shutdown()
     WORKFLOW_SESSION_STORE.close()
+
+
+def _license_server_candidates(config=None, preferred=""):
+    candidates = []
+    preferred = str(preferred or "").strip()
+    if preferred:
+        candidates.append(normalize_update_server_url(preferred))
+    candidates.extend(configured_license_server_urls(config))
+    result = []
+    seen = set()
+    for value in candidates:
+        normalized = normalize_update_server_url(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _activate_license_with_fallback(config, account_id, license_key, preferred=""):
+    errors = []
+    last_error = None
+    for server_url in _license_server_candidates(config, preferred):
+        try:
+            return activate_keygen_license(server_url, account_id, license_key)
+        except Exception as exc:
+            last_error = exc
+            errors.append(f"{server_url}: {exc}")
+    detail = " | ".join(errors) or str(last_error or "Không có license server khả dụng.")
+    raise ValueError(f"Không thể kết nối các license server: {detail}") from last_error
 
 
 atexit.register(close_workflow_runtime)
@@ -689,6 +723,11 @@ class LicenseActivationRequest(BaseModel):
     license_key: str
 
 
+class UpdateApplyRequest(BaseModel):
+    manifest: dict = {}
+    server_url: str = ""
+
+
 class EstimateWorkbookRequest(BaseModel):
     saved_name: str
     original_name: str = "du_toan.xlsx"
@@ -913,11 +952,12 @@ def create_app() -> FastAPI:
 
     @api.post("/api/license/activate")
     def activate_license(payload: LicenseActivationRequest) -> dict:
+        cfg = load_config()
+        server_url = str(payload.server_url or "").strip()
         try:
-            license_cfg = activate_keygen_license(payload.server_url, payload.account_id, payload.license_key)
+            license_cfg = _activate_license_with_fallback(cfg, payload.account_id, payload.license_key, server_url)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        cfg = load_config()
         cfg["license"] = license_cfg
         saved = save_config(cfg)
         return public_license_status(saved)
@@ -929,15 +969,89 @@ def create_app() -> FastAPI:
         server_url = str(license_cfg.get("server_url") or "").strip()
         account_id = str(license_cfg.get("account_id") or "").strip()
         license_key = str(license_cfg.get("license_key") or "").strip()
-        if not server_url or not account_id or not license_key:
+        if not account_id or not license_key:
             raise HTTPException(status_code=400, detail="Chưa có đủ License server, Account, hoặc License key để tải lại.")
         try:
-            refreshed = activate_keygen_license(server_url, account_id, license_key)
+            refreshed = _activate_license_with_fallback(current, account_id, license_key, server_url)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = str(exc)
+            invalid_remote = any(token in detail.upper() for token in ("404", "401", "403", "NOT_FOUND", "SUSPENDED", "REVOKED", "INVALID"))
+            if invalid_remote:
+                current["license"] = {**license_cfg, "activated": False, "status": detail[:200], "allowed_profiles": [], "allowed_companies": [], "supported_profiles": []}
+                return public_license_status(save_config(current))
+            raise HTTPException(status_code=400, detail=detail) from exc
         current["license"] = refreshed
         return public_license_status(save_config(current))
 
+    @api.get("/api/update/check")
+    def update_check() -> dict:
+        errors = []
+        for server_url in _license_server_candidates(load_config()):
+            try:
+                return {**check_for_update(APP_VERSION, server_url), "current_notes": APP_RELEASE_NOTES}
+            except Exception as exc:
+                errors.append(f"{server_url}: {exc}")
+        raise HTTPException(status_code=502, detail={
+            "code": "UPDATE_SERVER_UNAVAILABLE",
+            "message": " | ".join(errors) or "Không có update server khả dụng.",
+            "stage": "update",
+            "retryable": True,
+        })
+
+    @api.post("/api/update/apply")
+    def update_apply(payload: UpdateApplyRequest) -> dict:
+        import sys
+        if not getattr(sys, "frozen", False):
+            raise HTTPException(status_code=400, detail={
+                "code": "UPDATE_DEV_MODE",
+                "message": "Updater chỉ hoạt động với bản đã cài bằng ProductCodeFormatter-Setup.exe.",
+                "stage": "update",
+                "retryable": False,
+            })
+        try:
+            errors = []
+            prepared = None
+            latest_progress = {"value": 0}
+
+            def report_download_progress(value):
+                try:
+                    latest_progress["value"] = max(0, min(100, int(value)))
+                except (TypeError, ValueError):
+                    latest_progress["value"] = 0
+
+            for server_url in _license_server_candidates(load_config(), payload.server_url):
+                try:
+                    prepared = prepare_velopack_update(server_url, report_download_progress)
+                    break
+                except Exception as exc:
+                    errors.append(f"{server_url}: {exc}")
+            if prepared is None:
+                raise ValueError(" | ".join(errors) or "Không có update server khả dụng.")
+
+            manager, update_info, release = prepared
+            result = schedule_velopack_restart(manager, update_info)
+
+            def exit_for_update():
+                try:
+                    close_workflow_runtime()
+                finally:
+                    os._exit(0)
+
+            update_exit_timer = threading.Timer(1.5, exit_for_update)
+            update_exit_timer.daemon = True
+            update_exit_timer.start()
+            return {
+                **result,
+                "download_progress": latest_progress["value"],
+                "release": release,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={
+                "code": "UPDATE_FAILED",
+                "message": str(exc),
+                "stage": "update",
+                "retryable": True,
+            }) from exc
     @api.post("/api/files/upload")
     async def upload_excel(file: UploadFile = File(...), purpose: str = Form("source")) -> dict:
         original = file.filename or ""
@@ -1190,7 +1304,7 @@ def create_app() -> FastAPI:
     @api.post("/api/review")
     def generic_review(payload: GenericReviewRequest) -> dict:
         operation_id = raw_text(payload.operation_id)
-        update_progress_job(operation_id, 0, 1, "Dang chuan bi review Ma VT", status="running")
+        update_progress_job(operation_id, 0, 1, "Đang chuẩn bị review Mã VT", status="running")
         try:
             profile = profile_key(payload.profile)
 
@@ -1210,7 +1324,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             update_progress_job(operation_id, 1, 1, str(exc), status="error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        update_progress_job(operation_id, 1, 1, "Da tao xong danh sach review Ma VT", status="complete")
+        update_progress_job(operation_id, 1, 1, "Đã tạo xong danh sách review Mã VT", status="complete")
         return {"products": json_safe(products), "review_rows": json_safe(rows)}
 
     @api.post("/api/vietmax/analyze")

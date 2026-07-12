@@ -1,4 +1,4 @@
-import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob, WorkflowSession } from './types';
+import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob, WorkflowSession, UpdateManifest } from './types';
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
@@ -434,4 +434,17 @@ export async function downloadInventoryAllocationReport(jobId: string): Promise<
     throw new Error(String(payload.detail || payload.error || response.statusText));
   }
   return response.blob();
+}
+
+
+export async function checkForUpdate(): Promise<UpdateManifest> {
+  return parseJsonResponse<UpdateManifest>(await fetch('/api/update/check'));
+}
+
+export async function applyUpdate(manifest: UpdateManifest): Promise<{ scheduled: boolean; version: string }> {
+  return parseJsonResponse<{ scheduled: boolean; version: string }>(await fetch('/api/update/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ manifest, server_url: manifest.server_url }),
+  }));
 }

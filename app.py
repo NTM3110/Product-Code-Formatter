@@ -30,8 +30,10 @@ from flask.json.provider import DefaultJSONProvider
 
 from product_code import code_normalization, config_store
 from product_code import license_client as product_license_client
+from product_code.release_version import NOTES as RELEASE_NOTES, VERSION as RELEASE_VERSION
 
-APP_VERSION = "0.1"
+APP_VERSION = RELEASE_VERSION
+APP_RELEASE_NOTES = RELEASE_NOTES
 CONFIG_SCHEMA_VERSION = 2
 LEGACY_VIETMAX_STORAGE_PROFILES = {"vietmax_mua_vao", "vietmax_ban_ra"}
 LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -98,6 +100,7 @@ PROFILE_LABELS = {
     "quang_thinh": "Quang Thịnh",
     "vietmax": "Vietmax",
     "ho_guom": "Hồ Gươm",
+    "viet_hung": "Việt Hưng",
     "vietmax_mua_vao": "Vietmax mua vào",
     "vietmax_ban_ra": "Vietmax bán ra",
 }
@@ -172,7 +175,14 @@ KEYGEN_ACTIVATION_REQUIRED_CODES = {
     "FINGERPRINT_SCOPE_MISMATCH",
     "MACHINE_SCOPE_MISMATCH",
 }
-DEFAULT_KEYGEN_SERVER_URL = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_SERVER", "http://license-server.local:3000")
+DEFAULT_LICENSE_SERVER_IP = os.environ.get("PRODUCT_CODE_FORMATTER_LICENSE_SERVER_IP", "192.168.1.210")
+DEFAULT_LICENSE_SERVER_IPS = (
+    DEFAULT_LICENSE_SERVER_IP,
+    "192.168.1.210",
+    "192.168.101.13",
+)
+DEFAULT_LICENSE_SERVER_URL = f"http://{DEFAULT_LICENSE_SERVER_IP}:8080"
+DEFAULT_KEYGEN_SERVER_URL = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_SERVER", DEFAULT_LICENSE_SERVER_URL)
 DEFAULT_KEYGEN_ACCOUNT_ID = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_ACCOUNT", "6f1f56e8-3b6f-4a86-9a31-9e0e7f62c001")
 DEFAULT_KEYGEN_PUBLIC_HOST = os.environ.get("PRODUCT_CODE_FORMATTER_KEYGEN_HOST", "license-server.local")
 
@@ -235,6 +245,8 @@ def default_config():
         "app_version": APP_VERSION,
         "config_schema_version": CONFIG_SCHEMA_VERSION,
         "selected_profile": "son_phuong",
+        "license_server_ip": DEFAULT_LICENSE_SERVER_IP,
+        "license_server_ips": list(dict.fromkeys(DEFAULT_LICENSE_SERVER_IPS)),
         "license": empty_license_config(),
         "profiles": {key: empty_profile_config(key) for key in PROFILE_LABELS},
         "columns": {
@@ -270,6 +282,34 @@ def empty_license_config():
     }
 
 
+def configured_license_server_urls(config=None):
+    config = config if isinstance(config, dict) else {}
+    candidates = []
+    configured_ips = config.get("license_server_ips")
+    if isinstance(configured_ips, list):
+        candidates.extend(configured_ips)
+    if not candidates:
+        candidates.extend(DEFAULT_LICENSE_SERVER_IPS)
+    legacy_ip = str(config.get("license_server_ip") or "").strip()
+    if legacy_ip and legacy_ip not in candidates:
+        candidates.append(legacy_ip)
+    candidates.extend(DEFAULT_LICENSE_SERVER_IPS)
+    urls = []
+    seen = set()
+    for candidate in candidates:
+        value = str(candidate or "").strip().rstrip("/")
+        if not value:
+            continue
+        if not value.startswith(("http://", "https://")):
+            value = f"http://{value}:8080"
+        if value not in seen:
+            seen.add(value)
+            urls.append(value)
+    return urls or [DEFAULT_LICENSE_SERVER_URL]
+
+
+def configured_license_server_url(config=None):
+    return configured_license_server_urls(config)[0]
 def profile_key(value):
     key = PROFILE_ALIASES.get(value, value)
     return key if key in PROFILE_LABELS else "son_phuong"
@@ -1136,6 +1176,19 @@ def normalize_config(data):
     if isinstance(data, dict):
         selected = data.get("selected_profile") or data.get("active_profile") or data.get("format_rule")
         cfg["selected_profile"] = profile_key(selected) if selected else cfg["selected_profile"]
+        configured_ips = data.get("license_server_ips")
+        if isinstance(configured_ips, list):
+            configured_ips = [str(item or "").strip() for item in configured_ips if str(item or "").strip()]
+        else:
+            configured_ips = []
+        if not configured_ips:
+            configured_ips.extend(DEFAULT_LICENSE_SERVER_IPS)
+        legacy_ip = str(data.get("license_server_ip") or "").strip()
+        if legacy_ip and legacy_ip not in configured_ips:
+            configured_ips.append(legacy_ip)
+        configured_ips.extend(item for item in DEFAULT_LICENSE_SERVER_IPS if item not in configured_ips)
+        cfg["license_server_ips"] = list(dict.fromkeys(configured_ips))
+        cfg["license_server_ip"] = cfg["license_server_ips"][0] if cfg["license_server_ips"] else DEFAULT_LICENSE_SERVER_IP
         cfg["license"] = normalize_license_config(data.get("license") or {})
         cfg["columns"].update(data.get("columns") or {})
         cfg["columns"].setdefault("invoice_status_col", DEFAULT_INVOICE_STATUS_COL)

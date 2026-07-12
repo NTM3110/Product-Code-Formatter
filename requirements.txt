@@ -1,4 +1,4 @@
-﻿flask
+flask
 pandas
 openpyxl
 xlrd
@@ -13,3 +13,4 @@ fastapi
 uvicorn
 python-multipart
 pywebview
+velopack==1.2.0
