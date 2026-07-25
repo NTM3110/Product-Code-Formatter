@@ -150,7 +150,8 @@ async function saveBlob(blob: Blob, filename: string) {
     if (result.error) throw new Error(result.error);
     return result.saved === true;
   }
-  if (window.showSaveFilePicker) {
+  const userActivation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  if (window.showSaveFilePicker && userActivation?.isActive !== false) {
     try {
       const handle = await window.showSaveFilePicker({
         suggestedName: filename,
@@ -162,6 +163,10 @@ async function saveBlob(blob: Blob, filename: string) {
       return true;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return false;
+      if (error instanceof DOMException && (error.name === 'NotAllowedError' || error.name === 'SecurityError')) {
+        downloadBlob(blob, filename);
+        return true;
+      }
       throw error;
     }
   }
@@ -190,7 +195,7 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function warningCount(analysis: EstimateAnalysis | null) {

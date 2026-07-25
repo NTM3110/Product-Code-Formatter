@@ -24,7 +24,7 @@ import uvicorn
 from app import ICON_PATH
 from web_api import app as fastapi_app, close_workflow_runtime, find_free_port
 
-APP_TITLE = "ProductCodeFormatter"
+APP_TITLE = os.environ.get("PRODUCT_CODE_FORMATTER_APP_TITLE") or "ProductCodeFormatter"
 DESKTOP_SHORTCUT_NAME = "ProductCodeFormatter.lnk"
 DESKTOP_SHORTCUT_ALIASES = [
     "Product Code Formatter.lnk",
@@ -140,9 +140,10 @@ def main() -> None:
     thread.start()
     wait_for_server(port)
 
+    frontend_url = (os.environ.get("PRODUCT_CODE_FORMATTER_FRONTEND_URL") or "").strip()
     window_options = {
         "title": APP_TITLE,
-        "url": f"http://127.0.0.1:{port}",
+        "url": frontend_url or f"http://127.0.0.1:{port}",
         "width": 1400,
         "height": 900,
         "min_size": (1024, 700),

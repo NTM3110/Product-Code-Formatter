@@ -1,6 +1,6 @@
 export type ProfileKey = 'son_phuong' | 'cao_thanh' | 'quang_thinh' | 'vietmax' | 'ho_guom' | 'viet_hung';
 export type StageId = 0.5 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
-export type StagePhase = 'format' | 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'fast' | 'estimate';
+export type StagePhase = 'format' | 'purchase' | 'sales' | 'generic' | 'price' | 'inventory' | 'allocation' | 'fast' | 'estimate';
 
 export type StageDefinition = {
   id: StageId;
@@ -49,6 +49,14 @@ export const commonProfileStages: StageDefinition[] = [
   { id: 4, label: 'Xuất file', phase: 'generic', short: 'Xuất file' },
 ];
 
+export const hoGuomFormatterStages: StageDefinition[] = [
+  { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
+  { id: 1, label: 'Tải FDI mua vào', phase: 'generic', short: 'Tải mua vào' },
+  { id: 2, label: 'Kiểm tra cột FDI', phase: 'generic', short: 'Chọn cột' },
+  { id: 3, label: 'Phân nhóm công ty và prefix', phase: 'generic', short: 'Công ty' },
+  { id: 5, label: 'Tạo FDI và form Hồ Gươm', phase: 'generic', short: 'Xuất file' },
+];
+
 export const caoThanhStages: StageDefinition[] = [
   { id: 0.5, label: 'Cấu hình form mapping', phase: 'format', short: 'Form mapping' },
   { id: 1, label: 'Tải file bán ra', phase: 'generic', short: 'Tải file' },
@@ -74,7 +82,7 @@ export type ProfileCapabilities = {
 };
 
 export const profileCapabilities: Record<ProfileKey, ProfileCapabilities> = {
-  son_phuong: { twoPhaseFrame: true },
+  son_phuong: { twoPhaseFrame: true, inventoryAllocation: true },
   cao_thanh: { priceFilter: true },
   quang_thinh: {},
   vietmax: { twoPhaseFrame: true, vietmaxPurchaseMatch: true, inventoryAllocation: true },
@@ -99,6 +107,25 @@ export function isStageId(value: unknown): value is StageId {
   return typeof value === 'number' && [0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(value);
 }
 
+
+
+export function sonPhuongProfileStages(): StageDefinition[] {
+  return [
+    { id: 0.5, label: 'C\u1ea5u h\u00ecnh form mapping', phase: 'format', short: 'Form mapping' },
+    { id: 1, label: 'T\u1ea3i file mua v\u00e0o', phase: 'purchase', short: 'T\u1ea3i mua v\u00e0o' },
+    { id: 2, label: 'Ch\u1ecdn c\u1ed9t mua v\u00e0o', phase: 'purchase', short: 'Ch\u1ecdn c\u1ed9t' },
+    { id: 3, label: 'C\u00f4ng ty & prefix mua v\u00e0o', phase: 'purchase', short: 'C\u00f4ng ty' },
+    { id: 4, label: 'Review M\u00e3 VT mua v\u00e0o', phase: 'purchase', short: 'Review M\u00e3 VT' },
+    { id: 5, label: 'T\u1ea1o file mua v\u00e0o', phase: 'purchase', short: 'T\u1ea1o mua v\u00e0o' },
+    { id: 6, label: 'T\u1ea3i file b\u00e1n ra', phase: 'allocation', short: 'T\u1ea3i b\u00e1n ra' },
+    { id: 7, label: 'Ch\u1ecdn c\u1ed9t b\u00e1n ra', phase: 'allocation', short: 'C\u1ed9t b\u00e1n ra' },
+    { id: 8, label: 'Ph\u00e2n kho & t\u1ea1o M\u00e3 VT b\u00e1n ra', phase: 'allocation', short: 'Ph\u00e2n kho' },
+    { id: 13, label: 'B\u00e1o c\u00e1o ph\u00e2n kho', phase: 'allocation', short: 'B\u00e1o c\u00e1o' },
+    { id: 14, label: 'Xu\u1ea5t workbook ph\u00e2n kho', phase: 'allocation', short: 'Xu\u1ea5t b\u00e1o c\u00e1o' },
+    { id: 11, label: 'T\u1ea1o file b\u00e1n ra \u0111\u00e3 ph\u00e2n kho', phase: 'allocation', short: 'T\u1ea1o b\u00e1n ra' },
+    { id: 15, label: 'Xu\u1ea5t FAST', phase: 'fast', short: 'Xu\u1ea5t FAST' },
+  ];
+}
 export function isGenericProfileKey(value: ProfileKey) {
   return value === 'son_phuong' || value === 'quang_thinh' || value === 'cao_thanh' || value === 'viet_hung';
 }
@@ -122,6 +149,7 @@ export function hasPriceFilter(profile: ProfileKey) {
 export function stagesForProfile(profile: ProfileKey): StageDefinition[] {
   if (profile === 'vietmax') return vietmaxStages;
   if (profile === 'ho_guom') return estimateStages;
+  if (profile === 'son_phuong') return sonPhuongProfileStages();
   if (usesTwoPhaseFrame(profile)) return baseTwoPhaseProfileStages();
   if (profile === 'cao_thanh') return caoThanhStages;
   return [

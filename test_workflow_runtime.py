@@ -47,12 +47,12 @@ class ConfigMigrationTests(unittest.TestCase):
 
         stored = app.canonical_config_for_storage(normalized)
 
-        self.assertEqual(stored["config_schema_version"], 2)
+        self.assertEqual(stored["config_schema_version"], 3)
         self.assertNotIn("vietmax_mua_vao", stored["profiles"])
         self.assertNotIn("vietmax_ban_ra", stored["profiles"])
         self.assertEqual(stored["profiles"]["vietmax"]["scopes"]["purchase"]["prefixes"], {"0101": "AA"})
         self.assertEqual(stored["profiles"]["son_phuong"]["manual_code_overrides"], {"0101|||Hàng A": "B"})
-        self.assertEqual(stored["license"]["license_key"], "keep-me")
+        self.assertNotIn("license", stored)
 
     def test_atomic_save_writes_canonical_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -64,7 +64,7 @@ class ConfigMigrationTests(unittest.TestCase):
                 serializer=app.canonical_config_for_storage,
             )
             stored = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(stored["config_schema_version"], 2)
+            self.assertEqual(stored["config_schema_version"], 3)
             self.assertNotIn("vietmax_mua_vao", stored["profiles"])
             self.assertEqual(stored["profiles"]["vietmax"]["scopes"]["purchase"]["prefixes"], {"0101": "AA"})
 

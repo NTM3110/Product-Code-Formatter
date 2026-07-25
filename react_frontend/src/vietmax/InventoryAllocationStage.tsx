@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { InventoryAllocationConfig, InventoryAllocationMappingSection, InventoryAllocationReportView, InventoryAllocationResult, InventoryLedgerDetailRow, InventorySalesDetailRow, InventorySalesSummaryRow, InventorySummaryRow, ProcessedFileStats, UploadSummary } from '../types';
 
 type InventoryAllocationStageProps = {
+  profile?: string;
   purchaseFile: UploadSummary | null;
   salesFile: UploadSummary | null;
   processedPurchaseSavedName: string;
@@ -80,8 +81,9 @@ function useProgressiveRows<T>(rows: T[], active = true, batchSize = REPORT_REND
   };
 }
 
-export function InventoryAllocationStage({ purchaseFile, salesFile, processedPurchaseSavedName, processedSalesSavedName, processedPurchaseStats, processedSalesStats, openingStockFile, config, busy, onProcessedPurchaseFileChange, onProcessedSalesFileChange, onOpeningStockFileChange, onConfigChange }: InventoryAllocationStageProps) {
+export function InventoryAllocationStage({ profile = 'vietmax', purchaseFile, salesFile, processedPurchaseSavedName, processedSalesSavedName, processedPurchaseStats, processedSalesStats, openingStockFile, config, busy, onProcessedPurchaseFileChange, onProcessedSalesFileChange, onOpeningStockFileChange, onConfigChange }: InventoryAllocationStageProps) {
   const ready = Boolean(processedPurchaseSavedName && processedSalesSavedName);
+  const isSonPhuong = profile === 'son_phuong';
   const visibleMappingSections = openingStockFile ? mappingSections : mappingSections.filter((section) => section.key !== 'opening');
 
   return (
@@ -89,14 +91,14 @@ export function InventoryAllocationStage({ purchaseFile, salesFile, processedPur
       <section className="inventory-allocation-card inventory-input-card">
         <div className="stage-toolbar">
           <div>
-            <h3>Stage 12: Phân bổ tồn kho</h3>
+            <h3>{isSonPhuong ? 'Stage 8: Phân kho và tạo Mã VT bán ra' : 'Stage 12: Phân bổ tồn kho'}</h3>
             <p>Kiểm tra file đã xử lý và cấu hình trước khi bấm Tiếp tục để chạy phân bổ.</p>
           </div>
         </div>
 
         <div className="inventory-file-grid">
-          <ProcessedFileInput label="Mua vào đã xử lý" originalName={purchaseFile?.original_name} ready={Boolean(processedPurchaseSavedName)} stats={processedPurchaseStats} busy={busy} onFileChange={onProcessedPurchaseFileChange} />
-          <ProcessedFileInput label="Bán ra đã xử lý" originalName={salesFile?.original_name} ready={Boolean(processedSalesSavedName)} stats={processedSalesStats} busy={busy} onFileChange={onProcessedSalesFileChange} />
+          <ProcessedFileInput label="Mua vào đã xử lý" cacheName={processedPurchaseSavedName} sourceName={purchaseFile?.original_name} ready={Boolean(processedPurchaseSavedName)} stats={processedPurchaseStats} busy={busy} onFileChange={onProcessedPurchaseFileChange} />
+          <ProcessedFileInput label={isSonPhuong ? 'Bán ra nguồn đã chọn cột' : 'Bán ra đã xử lý'} cacheName={processedSalesSavedName} sourceName={salesFile?.original_name} ready={Boolean(processedSalesSavedName)} stats={processedSalesStats} busy={busy} onFileChange={onProcessedSalesFileChange} />
           <label className={`inventory-opening-upload ${openingStockFile ? 'has-file' : ''}`}>
             <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy} onChange={(event) => onOpeningStockFileChange(event.currentTarget.files?.[0] ?? null)} />
             <span>Tồn đầu kỳ</span>
@@ -113,11 +115,14 @@ export function InventoryAllocationStage({ purchaseFile, salesFile, processedPur
         <div className="inventory-policy-grid">
           <NullableNumber label="Lỗ tối đa (%)" value={config.policy.max_loss_percent} onChange={(value) => onConfigChange({ ...config, policy: { ...config.policy, max_loss_percent: value } })} />
           <NullableNumber label="Lãi tối đa (%)" value={config.policy.max_profit_percent} onChange={(value) => onConfigChange({ ...config, policy: { ...config.policy, max_profit_percent: value } })} />
+          {!isSonPhuong && <>
           <label><span>Cửa sổ mua sau ngày bán</span><input type="number" min={1} value={config.policy.future_purchase_window_days} disabled={busy || !config.policy.allow_future_purchase_reorder} onChange={(event) => onConfigChange({ ...config, policy: { ...config.policy, future_purchase_window_days: parseInt(event.currentTarget.value) || 31 } })} /></label>
           <label className="inline-check"><input type="checkbox" checked={config.policy.ignore_sale_suffix} disabled={busy} onChange={(event) => onConfigChange({ ...config, policy: { ...config.policy, ignore_sale_suffix: event.currentTarget.checked } })} /> Bỏ hậu tố mã bán ra</label>
           <label className="inline-check"><input type="checkbox" checked={config.policy.allow_negative_export} disabled={busy} onChange={(event) => onConfigChange({ ...config, policy: { ...config.policy, allow_negative_export: event.currentTarget.checked } })} /> Cho phép xuất âm theo kho bán ra</label>
           <label className="inline-check"><input type="checkbox" checked={config.policy.allow_future_purchase_reorder} disabled={busy} onChange={(event) => onConfigChange({ ...config, policy: { ...config.policy, allow_future_purchase_reorder: event.currentTarget.checked } })} /> Đưa mua sau lên trước</label>
+          </>}
         </div>
+        {isSonPhuong && <SonPhuongSalesPairEditor config={config} busy={busy} onChange={onConfigChange} />}
         <div className="inventory-mapping-grid">
           {visibleMappingSections.map((section) => <MappingEditor key={section.key} title={section.label} mapping={config.mapping[section.key]} showInvoice={section.showInvoice} busy={busy} onChange={(mapping) => onConfigChange({ ...config, mapping: { ...config.mapping, [section.key]: mapping } })} />)}
         </div>
@@ -126,13 +131,59 @@ export function InventoryAllocationStage({ purchaseFile, salesFile, processedPur
   );
 }
 
-function ProcessedFileInput({ label, originalName, ready, stats, busy, onFileChange }: { label: string; originalName?: string; ready: boolean; stats: ProcessedFileStats | null; busy: boolean; onFileChange: (file: File | undefined) => void }) {
+export function SonPhuongSalesPairEditor({ config, busy, onChange }: { config: InventoryAllocationConfig; busy: boolean; onChange: (config: InventoryAllocationConfig) => void }) {
+  const defaults = [
+    { id: 'son-phuong-sales-materials', role: 'materials', label: 'H\u00e0ng h\u00f3a v\u1eadt t\u01b0', ma_kho: 'KHHVT', tk_vat_tu: '156' },
+    { id: 'son-phuong-sales-finished', role: 'finished_goods', label: 'Th\u00e0nh ph\u1ea9m th\u00e9p', ma_kho: 'KTP', tk_vat_tu: '155' },
+    { id: 'son-phuong-sales-fallback', role: 'fallback', label: 'S\u1ea3n ph\u1ea9m c\u00f2n l\u1ea1i', ma_kho: 'KHOCK', tk_vat_tu: '159' },
+  ];
+  const configured = Array.isArray(config.sales_inventory_pairs) ? config.sales_inventory_pairs : [];
+  const pairs = defaults.map((fallback) => configured.find((item) => item.role === fallback.role) || fallback);
+  const incomplete = pairs.some((pair) => !pair.ma_kho.trim() || !pair.tk_vat_tu.trim());
+  const updatePair = (role: string, field: 'ma_kho' | 'tk_vat_tu', value: string) => {
+    const nextPairs = pairs.map((pair) => pair.role === role ? { ...pair, [field]: value.toUpperCase() } : pair);
+    onChange({ ...config, sales_inventory_pairs: nextPairs });
+  };
+  const restorePair = (role: string) => {
+    const restored = defaults.find((item) => item.role === role);
+    if (!restored) return;
+    onChange({ ...config, sales_inventory_pairs: pairs.map((pair) => pair.role === role ? restored : pair) });
+  };
+  return (
+    <section className="inventory-card son-phuong-pair-editor">
+      <div className="inventory-card-title"><div><strong>{'C\u1eb7p kho b\u00e1n ra S\u01a1n Ph\u01b0\u01a1ng'}</strong><p className="muted">{'KHHVT ph\u1ea3i \u0111\u1ee7 t\u1ed3n th\u1ef1c; d\u00f2ng thi\u1ebfu KHHVT s\u1ebd b\u1ecb ch\u1eb7n khi t\u1ea1o FDI/FAST.'}</p></div></div>
+      <div className="inventory-table-scroll">
+        <table className="inventory-table">
+          <thead><tr><th>{'Vai tr\u00f2'}</th><th>{'M\u00e3 kho'}</th><th>{'TK v\u1eadt t\u01b0'}</th><th></th></tr></thead>
+          <tbody>{pairs.map((pair) => (
+            <tr key={pair.role}>
+              <td><strong>{pair.label}</strong></td>
+              <td><input value={pair.ma_kho} disabled={busy} onChange={(event) => updatePair(pair.role || '', 'ma_kho', event.currentTarget.value)} /></td>
+              <td><input value={pair.tk_vat_tu} disabled={busy} onChange={(event) => updatePair(pair.role || '', 'tk_vat_tu', event.currentTarget.value)} /></td>
+              <td><button type="button" className="btn-secondary compact-table-button" disabled={busy} onClick={() => restorePair(pair.role || '')}>{'Kh\u00f4i ph\u1ee5c'}</button></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      {incomplete && <p className="warning-text">{'M\u1ed7i vai tr\u00f2 ph\u1ea3i c\u00f3 \u0111\u1ee7 M\u00e3 kho v\u00e0 TK v\u1eadt t\u01b0 tr\u01b0\u1edbc khi ch\u1ea1y Ph\u00e2n kho.'}</p>}
+      <div className="inventory-policy-grid">
+        <label><span>{'S\u1ed1 ph\u01b0\u01a1ng \u00e1n \u1ed1ng/h\u1ed9p'}</span><input type="number" min={1} max={1000} value={config.scenario_count || 100} disabled={busy} onChange={(event) => onChange({ ...config, scenario_count: Math.max(1, Math.min(1000, Number(event.currentTarget.value) || 100)) })} /></label>
+        <label><span>{'S\u1ed1 lo\u1ea1i t\u1ed1i thi\u1ec3u ph\u1ea3i chia'}</span><input type="number" min={1} value={config.policy.generic_min_type_count ?? 2} disabled={busy} onChange={(event) => onChange({ ...config, policy: { ...config.policy, generic_min_type_count: Math.max(1, Number(event.currentTarget.value) || 2) } })} /></label>
+        <NullableNumber label={'Kh\u1ed1i l\u01b0\u1ee3ng t\u1ed1i thi\u1ec3u/m\u00e3'} value={config.policy.generic_min_take_quantity ?? null} onChange={(value) => onChange({ ...config, policy: { ...config.policy, generic_min_take_quantity: value } })} />
+        <NullableNumber label={'Kh\u1ed1i l\u01b0\u1ee3ng t\u1ed1i \u0111a/m\u00e3'} value={config.policy.generic_max_take_quantity ?? null} onChange={(value) => onChange({ ...config, policy: { ...config.policy, generic_max_take_quantity: value } })} />
+        <label><span>{'Sai s\u1ed1 barem (%)'}</span><input type="number" min={0} value={config.policy.barem_tolerance_percent ?? 5} disabled={busy} onChange={(event) => onChange({ ...config, policy: { ...config.policy, barem_tolerance_percent: Math.max(0, Number(event.currentTarget.value) || 0) } })} /></label>
+        <NullableNumber label={'Kg l\u1ebb t\u1ed1i \u0111a \u0111\u01b0\u1ee3c g\u1ed9p v\u00e0o lo\u1ea1i cu\u1ed1i'} value={config.policy.barem_remainder_max_kg ?? 10} onChange={(value) => onChange({ ...config, policy: { ...config.policy, barem_remainder_max_kg: value } })} />
+      </div>
+    </section>
+  );
+}
+function ProcessedFileInput({ label, cacheName, sourceName, ready, stats, busy, onFileChange }: { label: string; cacheName?: string; sourceName?: string; ready: boolean; stats: ProcessedFileStats | null; busy: boolean; onFileChange: (file: File | undefined) => void }) {
   return (
     <label className={`inventory-file-status ${ready ? 'ready' : ''}`}>
       <input type="file" accept=".xls,.xlsx,.xlsm" disabled={busy} onChange={(event) => onFileChange(event.currentTarget.files?.[0])} />
       <span>{label}</span>
-      <strong>{ready ? (originalName || 'Đã có cache') : 'Chưa có file đã xử lý'}</strong>
-      <small>{ready ? 'Đã sẵn sàng để phân bổ.' : 'Upload file đã xử lý nếu bỏ qua stage trước.'}</small>
+      <strong>{ready ? (cacheName || 'Đã có cache') : 'Chưa có file đã xử lý'}</strong>
+      <small>{ready ? `Artifact dùng để Phân kho${sourceName ? ` · Nguồn: ${sourceName}` : ''}` : 'Upload file đã xử lý nếu bỏ qua stage trước.'}</small>
       <ProcessedStats stats={stats} />
     </label>
   );
@@ -176,6 +227,7 @@ function AllocationResult({ result }: { result: InventoryAllocationResult }) {
     ['SL mua vào', summary.purchase_quantity],
     ['SL bán ra', summary.sales_quantity],
     ['SL khớp mua vào', summary.material_quantity],
+    ['SL KHHVT chưa đủ', summary.unresolved_material_quantity],
     ['SL còn lại theo kho bán ra', summary.finished_quantity],
     ['Mã chỉ bán ra', summary.sale_only_code_count],
   ];
@@ -191,7 +243,134 @@ function AllocationResult({ result }: { result: InventoryAllocationResult }) {
   );
 }
 
-export function InventoryAllocationReportStage({ result }: { result: InventoryAllocationResult | null; busy: boolean }) {
+
+type SonPhuongReviewFilter = 'all' | 'KHHVT' | 'KTP' | 'KHOCK' | 'unresolved' | 'missing';
+
+function SonPhuongAllocationReview({ result }: { result: InventoryAllocationResult }) {
+  const [filter, setFilter] = useState<SonPhuongReviewFilter>('all');
+  const rows = result.allocations ?? [];
+  const missingCodes = useMemo(
+    () => new Set((result.missing_barem_report ?? []).map((item) => item.variant_code)),
+    [result.missing_barem_report],
+  );
+  const visibleRows = useMemo(() => rows.filter((row) => {
+    if (filter === 'all') return true;
+    if (filter === 'unresolved') return (row.unresolved_material_quantity ?? 0) > 0;
+    if (filter === 'missing') return missingCodes.has(row.variant_code);
+    if (filter === 'KHHVT') return row.warehouse_code === 'KHHVT' && row.material_quantity > 0;
+    return row.remainder_warehouse_code === filter && row.finished_quantity > 0;
+  }), [filter, missingCodes, rows]);
+  const filters: Array<{ key: SonPhuongReviewFilter; label: string }> = [
+    { key: 'all', label: 'T\u1ea5t c\u1ea3' },
+    { key: 'KHHVT', label: 'KHHVT' },
+    { key: 'KTP', label: 'KTP' },
+    { key: 'KHOCK', label: 'KHOCK' },
+    { key: 'unresolved', label: 'Chưa đủ KHHVT' },
+    { key: 'missing', label: 'Thi\u1ebfu barem' },
+  ];
+  return (
+    <section className="inventory-allocation-card son-phuong-allocation-review">
+      <div className="stage-toolbar">
+        <div>
+          <h3>{'Review Ph\u00e2n kho b\u00e1n ra'}</h3>
+          <p>{'X\u1eed l\u00fd theo Ng\u00e0y H\u0110, S\u1ed1 H\u0110 v\u00e0 th\u1ee9 t\u1ef1 d\u00f2ng; t\u1ed3n \u0111\u01b0\u1ee3c t\u00ednh l\u1ea1i sau t\u1eebng d\u00f2ng b\u00e1n.'}</p>
+        </div>
+        <div className="segmented-control">
+          {filters.map((item) => <button type="button" key={item.key} className={filter === item.key ? 'active' : ''} onClick={() => setFilter(item.key)}>{item.label}</button>)}
+        </div>
+      </div>
+      {filter === 'missing' ? <MissingBaremTable rows={result.missing_barem_report ?? []} /> : <div className="inventory-table-scroll">
+        <table className="inventory-table">
+          <thead><tr>
+            <th>{'Ng\u00e0y H\u0110'}</th><th>{'S\u1ed1 H\u0110'}</th><th>{'T\u00ean h\u00e0ng b\u00e1n'}</th><th>SL</th>
+            <th>{'M\u00e3 VT \u0111\u00e3 chia'}</th><th>KHHVT</th><th>{'KHHVT ch\u01b0a \u0111\u1ee7'}</th><th>{'Kho ph\u1ea7n c\u00f2n l\u1ea1i'}</th><th>{'C\u1ea3nh b\u00e1o / l\u00fd do'}</th>
+          </tr></thead>
+          <tbody>
+            {visibleRows.map((row) => <tr key={[row.invoice_date, row.invoice_no, row.row_number].join('-')}>
+              <td>{row.invoice_date}</td>
+              <td>{row.invoice_no}</td>
+              <td><strong>{row.product_name}</strong><small className="muted">{row.variant_code}</small></td>
+              <td className="number-cell">{formatNumber(row.quantity)}</td>
+              <td>{row.sale_split_codes || '-'}</td>
+              <td className="number-cell">{formatNumber(row.material_quantity)}</td>
+              <td className={(row.unresolved_material_quantity ?? 0) > 0 ? 'warning-text number-cell' : 'number-cell'}>{formatNumber(row.unresolved_material_quantity ?? 0)}</td>
+              <td>{row.finished_quantity > 0 ? [row.remainder_warehouse_code || '-', ' / ', row.remainder_warehouse_account || '-', ': ', formatNumber(row.finished_quantity)].join('') : '-'}</td>
+              <td className={(row.unresolved_material_quantity ?? 0) > 0 ? 'warning-text' : ''}>{row.generic_plan_note || ((row.unresolved_material_quantity ?? 0) > 0 ? 'Ch\u01b0a \u0111\u1ee7 KHHVT th\u1ef1c; FDI b\u1ecb ch\u1eb7n' : '')}</td>
+            </tr>)}
+            {visibleRows.length === 0 && <tr><td colSpan={9} className="muted">{'Kh\u00f4ng c\u00f3 d\u00f2ng ph\u00f9 h\u1ee3p b\u1ed9 l\u1ecdc.'}</td></tr>}
+          </tbody>
+        </table>
+      </div>}
+    </section>
+  );
+}
+
+function MissingBaremTable({ rows }: { rows: NonNullable<InventoryAllocationResult['missing_barem_report']> }) {
+  const kindLabel = (value?: string) => value === 'pipe' ? '\u1ed0ng' : value === 'box' ? 'H\u1ed9p' : (value || 'Ch\u01b0a x\u00e1c \u0111\u1ecbnh');
+  const coatingLabel = (value?: string) => value === 'black' ? '\u0110en' : value === 'galvanized' ? 'M\u1ea1 k\u1ebdm' : (value || 'Kh\u00f4ng ghi');
+  return <div className="inventory-table-scroll missing-barem-table">
+    <table className="inventory-table">
+      <thead><tr>
+        <th>{'M\u00e3 VT thi\u1ebfu barem'}</th><th>{'T\u00ean h\u00e0ng mua'}</th><th>{'Lo\u1ea1i'}</th><th>{'B\u1ec1 m\u1eb7t'}</th>
+        <th>{'K\u00edch th\u01b0\u1edbc'}</th><th>{'T\u1ed3n c\u00f2n'}</th><th>{'H\u00f3a \u0111\u01a1n mua'}</th><th>{'L\u00fd do / c\u00e1ch x\u1eed l\u00fd'}</th>
+      </tr></thead>
+      <tbody>
+        {rows.map((row, index) => <tr key={`${row.variant_code}-${row.row_number ?? index}`}>
+          <td><strong>{row.variant_code || '-'}</strong><small className="muted">{row.profile_key || ''}</small></td>
+          <td>{row.product_name || '-'}</td>
+          <td>{kindLabel(row.steel_kind)}</td>
+          <td>{coatingLabel(row.steel_coating)}</td>
+          <td>{row.steel_dimension || '-'}</td>
+          <td className="number-cell">{formatNumber(row.quantity)}</td>
+          <td>{[row.invoice_date, row.invoice_no, row.row_number ? `d\u00f2ng ${row.row_number}` : ''].filter(Boolean).join(' \u2022 ') || '-'}</td>
+          <td className="warning-text">{row.reason || 'C\u1ea7n nh\u1eadp barem th\u1ee7 c\u00f4ng.'}</td>
+        </tr>)}
+        {rows.length === 0 && <tr><td colSpan={8} className="ok-text">{'Kh\u00f4ng c\u00f3 lo\u1ea1i n\u00e0o thi\u1ebfu barem.'}</td></tr>}
+      </tbody>
+    </table>
+  </div>;
+}
+
+
+export function SonPhuongAllocationReviewStage({ result }: { result: InventoryAllocationResult | null }) {
+  if (!result) {
+    return <PlaceholderAllocationResult title="Review kết quả Phân kho" detail="Chưa có kết quả. Quay lại Stage 8 để chạy Phân kho trước." />;
+  }
+  return <div className="inventory-allocation-stage report-only-stage"><SonPhuongAllocationReview result={result} /></div>;
+}
+
+
+export function InventoryAllocationOverviewStage({ result }: { result: InventoryAllocationResult | null }) {
+  if (!result) {
+    return <PlaceholderAllocationResult title="Tổng quan Phân kho" detail="Chưa có kết quả Phân kho để tổng hợp." />;
+  }
+  return (
+    <div className="inventory-allocation-stage report-only-stage">
+      <section className="inventory-allocation-card inventory-result-card">
+        <div className="report-stage-heading">
+          <span>Phân kho</span>
+          <h3>Tổng quan kết quả</h3>
+          <p>Đối chiếu số lượng, kho đã dùng và cảnh báo trước khi xem báo cáo chi tiết.</p>
+        </div>
+        <AllocationResult result={result} />
+      </section>
+    </div>
+  );
+}
+
+
+function PlaceholderAllocationResult({ title, detail }: { title: string; detail: string }) {
+  return (
+    <div className="inventory-allocation-stage report-only-stage">
+      <section className="inventory-allocation-card empty-report-stage">
+        <div><h3>{title}</h3><p className="muted">{detail}</p></div>
+      </section>
+    </div>
+  );
+}
+
+
+export function InventoryAllocationReportStage({ result, profile = 'vietmax' }: { result: InventoryAllocationResult | null; busy: boolean; profile?: string }) {
   if (!result?.report_view) {
     return (
       <div className="inventory-allocation-stage report-only-stage">
@@ -207,6 +386,7 @@ export function InventoryAllocationReportStage({ result }: { result: InventoryAl
   return (
     <div className="inventory-allocation-stage report-only-stage">
       <section className="inventory-allocation-card inventory-result-card">
+      {profile === 'son_phuong' && <SonPhuongAllocationReview result={result} />}
         <AllocationReportViewer reportView={result.report_view} />
       </section>
     </div>
@@ -424,7 +604,7 @@ function SalesSummaryPanel({ title, rows, onOpen }: { title: string; rows: Inven
       <h4>{title}</h4>
       <div className="report-table-scroll">
         <table className="data-table report-table sales-report-table">
-          <thead><tr><th>Kho</th><th>Mã VT</th><th>Tên hàng</th><th>ĐVT</th><th>SL</th><th>Tiền vốn</th><th>Tiền hàng</th><th>Lãi/lỗ</th><th>%</th><th>Thuế</th><th>Tổng TT</th></tr></thead>
+          <thead><tr><th>Kho</th><th>Mã VT mua vào</th><th>Tên hàng mua vào</th><th>ĐVT</th><th>SL</th><th>Tiền vốn</th><th>Tiền hàng</th><th>Lãi/lỗ</th><th>%</th><th>Thuế</th><th>Tổng TT</th></tr></thead>
           <tbody>
             {visibleRows.map((row) => (
               <tr key={row.key} onDoubleClick={() => onOpen(row)} title="Double-click để xem giải thích giá vốn">

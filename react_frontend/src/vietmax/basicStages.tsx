@@ -274,7 +274,7 @@ export function FastImportExportStage({
         <div className="report-stage-heading">
           <span>Xuất FAST</span>
           <h3>Xuất workbook FAST 5 sheet</h3>
-          <p>Workbook sẽ gồm Hoadonmuahang, Hoadonbanhang, DMvat_tu và DMkhachhang. Chỉ các cột có dữ liệu trong file mẫu FAST mới được điền.</p>
+          <p>Workbook gồm Hoadonmuahang, Bao_cao_trung_so_ct, Hoadonbanhang, DMvat_tu và DMkhachhang theo đúng Form mapping đang bật.</p>
         </div>
         <div className="inventory-file-grid">
           {renderUpload('FDI mua vào đã xử lý', Boolean(processedPurchaseSavedName), processedPurchaseStats, onProcessedPurchaseUpload)}
@@ -299,8 +299,8 @@ export function PlaceholderStage({ title, detail }: { title: string; detail: str
 
 export function LoadingStage({ title, detail, progress }: { title: string; detail: string; progress?: OperationProgress | null }) {
   const percent = Math.max(0, Math.min(100, Number(progress?.percent ?? 0)));
-  const hasRealRowProgress = Boolean(progress && Number(progress.total || 0) > 1);
-  const rowProgress = hasRealRowProgress ? progress : null;
+  const hasRowProgress = Boolean(progress && Number(progress.total || 0) > 1);
+  const rowProgress = progress;
   return (
     <div className="loading-stage">
       <div className="loading-spinner" aria-hidden="true" />
@@ -310,7 +310,7 @@ export function LoadingStage({ title, detail, progress }: { title: string; detai
         <div className="loading-progress-block">
           <div className="loading-progress-bar" aria-label="Tiến trình xử lý"><span style={{ width: `${percent}%` }} /></div>
           <strong>{percent}%</strong>
-          <small>{formatCount(rowProgress.done)} / {formatCount(rowProgress.total)} dòng</small>
+          {hasRowProgress && progress?.unit !== 'percent' && <small>{formatCount(rowProgress.done)} / {formatCount(rowProgress.total)} {progress?.unit === 'steps' ? 'bước' : 'dòng'}</small>}
         </div>
       )}
     </div>

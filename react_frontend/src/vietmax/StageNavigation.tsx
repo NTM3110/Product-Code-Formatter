@@ -1,21 +1,23 @@
-﻿import type { StageDefinition, StageId } from './workflowStages';
+import type { StageDefinition, StageId } from './workflowStages';
 
 export function StageNavigation({ stages, stage, busy, canEnterStage, goToStage }: { stages: StageDefinition[]; stage: StageId; busy: boolean; canEnterStage: (target: StageId) => boolean; goToStage: (target: StageId) => void | Promise<void> }) {
   const formatStages = stages.filter((item) => item.phase === 'format');
   const purchaseStages = stages.filter((item) => item.phase === 'purchase');
   const salesStages = stages.filter((item) => item.phase === 'sales');
   const inventoryStages = stages.filter((item) => item.phase === 'inventory');
+  const allocationStages = stages.filter((item) => item.phase === 'allocation');
   const fastStages = stages.filter((item) => item.phase === 'fast');
   const estimateStages = stages.filter((item) => item.phase === 'estimate');
   const shellStages = stages.filter((item) => item.phase === 'generic' || item.phase === 'price');
 
-  if (formatStages.length || purchaseStages.length || salesStages.length || inventoryStages.length || fastStages.length || estimateStages.length) {
+  if (formatStages.length || purchaseStages.length || salesStages.length || inventoryStages.length || allocationStages.length || fastStages.length || estimateStages.length) {
     return (
       <div className="stage-groups" aria-label="Stage navigation">
         <StageGroup title="Format" stages={formatStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Mua vào" stages={purchaseStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Bán ra" stages={salesStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Tồn kho" stages={inventoryStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
+        <StageGroup title={'Ph\u00e2n kho'} stages={allocationStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Xuất FAST" stages={fastStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Bóc tách" stages={estimateStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />
         <StageGroup title="Profile" stages={shellStages} stage={stage} busy={busy} canEnterStage={canEnterStage} goToStage={goToStage} />

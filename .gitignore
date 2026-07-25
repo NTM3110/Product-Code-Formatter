@@ -113,3 +113,11 @@ inventory_allocation_app/uploads/
 license_server/releases/*
 !license_server/releases/.gitkeep
 Releases/
+
+# Linux source preview
+.venv-linux/
+.runtime-linux/
+
+# Local analysis and copied remote-host worktrees
+.codex_tmp/
+admin@*/

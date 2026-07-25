@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import re
@@ -102,7 +103,9 @@ DEFAULT_POLICY = {
     },
     "generic_split_variance_percent": 0,
     "barem_tolerance_percent": 5,
+    "barem_remainder_max_kg": 10,
     "generic_min_take_quantity": None,
+    "generic_min_type_count": 2,
     "generic_max_take_quantity": None,
     "allow_future_purchase_reorder": False,
     "future_purchase_window_days": 31,
@@ -197,8 +200,14 @@ def son_phuong_product_family(product_name):
         return f"THEP_BAN_MA:{thickness}" if thickness else "THEP_BAN_MA"
     if "CUONCANNONG" in compact or ("THEPCUON" in compact and "NONG" in compact):
         return "THEP_CUON_CAN_NONG"
-    if re.search(r"\bTHEP\s*C\b", normalized) or compact.startswith("THEPC"):
-        return f"THEP_C:{thickness}" if thickness else "THEP_C"
+    c_shape_match = re.search(r"\bTHEP\s*C\s*[-.]?\s*(\d+(?:[.,]\d+)?)\b", normalized)
+    if not c_shape_match:
+        c_shape_match = re.search(r"^THEPC(\d+(?:[.,]\d+)?)$", compact)
+    if c_shape_match:
+        shape_size = canonical_dimension_token(c_shape_match.group(1))
+        return f"THEP_C:{shape_size}" if shape_size else "THEP_C"
+    if re.search(r"\bTHEP\s*C\b", normalized) or compact == "THEPC":
+        return "THEP_C"
     shape_match = re.search(r"\bTHEP\s+(?:HINH\s+|GOC\s+)?([VUIHL])\s*[-.]?\s*(\d+(?:[.,]\d+)?)\b", normalized)
     if not shape_match:
         shape_match = re.search(r"^THEP(?:HINH|GOC)?([VUIHL])(\d+(?:[.,]\d+)?)$", compact)
@@ -221,8 +230,6 @@ def son_phuong_line_match_keys(line):
     family = son_phuong_product_family(line.get("product_name", ""))
     if family:
         keys.add(f"NAME:{family}")
-        if ":" in family:
-            keys.add(f"NAME:{family.split(':', 1)[0]}")
     return keys
 
 
@@ -288,12 +295,24 @@ def extract_dimension_tokens(value):
 
 def steel_coating(product_name="", variant_code=""):
     normalized = normalize_match_text(f"{product_name} {variant_code}")
+    normalized_name = normalize_match_text(product_name)
     compact = re.sub(r"\s+", "", normalized)
     if "DEN" in normalized:
         return "black"
-    if "MA KEM" in normalized or "MAKEM" in compact or re.search(r"\bMK\b", normalized) or " KEM" in normalized:
+    if "MA KEM" in normalized or "MAKEM" in compact or re.search(r"\bMK\b", normalized) or " KEM" in normalized or re.search(r"\bMA\b", normalized_name):
         return "galvanized"
-    return "galvanized"
+    return "unknown"
+
+
+def explicit_steel_coating(product_name="", variant_code=""):
+    normalized = normalize_match_text(f"{product_name} {variant_code}")
+    normalized_name = normalize_match_text(product_name)
+    compact = re.sub(r"\s+", "", normalized)
+    if "DEN" in normalized:
+        return "black"
+    if "MA KEM" in normalized or "MAKEM" in compact or re.search(r"\bMK\b", normalized) or " KEM" in normalized or re.search(r"\bMA\b", normalized_name):
+        return "galvanized"
+    return None
 
 
 def steel_profile_key(product_name="", variant_code=""):
@@ -347,6 +366,13 @@ def steel_kind_detail(product_name="", variant_code=""):
     raw = text(product_name)
     normalized = normalize_match_text(raw)
     compact = re.sub(r"\s+", "", normalized)
+    solid_square = (
+        bool(re.search(r"\bTHEP\s+VUONG\b", normalized))
+        and not re.search(r"\bONG\b", normalized)
+        and not re.search(r"\bHOP\b", normalized)
+    )
+    if re.search(r"\bTHEP\s+(?:HINH\s+)?[UVCILH]\b", normalized) or solid_square:
+        return "unknown", "Thép hình/vuông đặc không thuộc nhóm ống/hộp."
     has_ong_word = bool(re.search(r"\bONG\b", normalized))
     tokens = extract_dimension_tokens(raw) or extract_dimension_tokens(variant_code)
     explicit_pipe = (
@@ -391,7 +417,17 @@ def steel_kind(product_name="", variant_code=""):
 def generic_steel_sale_type(product_name):
     normalized = normalize_match_text(product_name)
     compact = re.sub(r"\s+", "", normalized)
-    if "CAC LOAI" not in normalized or "THEP" not in normalized:
+    if "THEP" not in normalized:
+        return None
+    is_explicit_generic = "CAC LOAI" in normalized
+    has_dimensions = bool(extract_dimension_tokens(product_name))
+    is_dimensionless_generic = not has_dimensions and (
+        "ONG HOP" in normalized
+        or "ONGHOP" in compact
+        or bool(re.search(r"\bHOP\b", normalized))
+        or bool(re.search(r"\bONG\b", normalized))
+    )
+    if not is_explicit_generic and not is_dimensionless_generic:
         return None
     if "ONG HOP" in normalized or "ONGHOP" in compact:
         return "pipe_box"
@@ -410,6 +446,70 @@ def generic_allowed_kinds(generic_type):
     }.get(generic_type, set())
 
 
+def son_phuong_sales_pair_map(policy):
+    defaults = {
+        "materials": {"ma_kho": "KHHVT", "tk_vat_tu": "156"},
+        "finished_goods": {"ma_kho": "KTP", "tk_vat_tu": "155"},
+        "fallback": {"ma_kho": "KHOCK", "tk_vat_tu": "159"},
+    }
+    rows = policy.get("sales_inventory_pairs") if isinstance(policy, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    result = {key: dict(value) for key, value in defaults.items()}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = text(row.get("role"))
+        if role not in result:
+            continue
+        ma_kho = normalize_code(row.get("ma_kho"))
+        tk_vat_tu = text(row.get("tk_vat_tu"))
+        if not ma_kho or not tk_vat_tu:
+            raise ValueError(f"Vai tro {role} phai co du Ma kho va TK vat tu.")
+        result[role] = {"ma_kho": ma_kho, "tk_vat_tu": tk_vat_tu}
+    return result
+
+
+def son_phuong_sales_role(line):
+    product_name = line.get("product_name", "")
+    normalized = normalize_match_text(product_name)
+    compact = re.sub(r"[^A-Z0-9]+", "", normalized)
+    generic_type = generic_steel_sale_type(product_name)
+    steel_kind_value = steel_kind(product_name, line.get("source_variant_code") or line.get("variant_code", ""))
+    always_material_tokens = (
+        "THEPCUON",
+        "CUONCANNONG",
+        "TONMAMAU",
+        "TONMAU",
+        "TONMAT",
+        "TONLANH",
+        "TONCACHNHIET",
+    )
+    if generic_type or any(token in compact for token in always_material_tokens):
+        return "materials"
+    structural_tokens = (
+        "THEPHINH",
+        "THEPTAM",
+        "BANMA",
+        "NEPDET",
+        "THEPGOC",
+        "THANH",
+        "DAM",
+        "RAY",
+        "PHITRON",
+        "VUONGDAC",
+    )
+    structural_pattern = re.search(r"\bTHEP\s+(?:HINH\s+)?[UVCILH](?=\s|[-.]|\d|$)", normalized)
+    solid_square = (
+        "THEPVUONG" in compact
+        and not re.search(r"\bONG\b", normalized)
+        and not re.search(r"\bHOP\b", normalized)
+    )
+    if structural_pattern or solid_square or any(token in compact for token in structural_tokens):
+        return "finished_goods"
+    if steel_kind_value in {"pipe", "box"}:
+        return "materials"
+    return "fallback"
 def normalize_header(value):
     value = text(value).replace("Đ", "D").replace("đ", "d").replace("Ä", "D").replace("Ä‘", "d")
     value = unicodedata.normalize("NFD", value)
@@ -544,6 +644,9 @@ def clean_policy(raw):
     max_profit_percent = optional_percent(raw.get("max_profit_percent"))
     split_counts_raw = raw.get("son_phuong_split_counts") if isinstance(raw.get("son_phuong_split_counts"), dict) else {}
     split_counts = {}
+    remainder_max_kg = optional_quantity(raw.get("barem_remainder_max_kg"), "Kg le toi da")
+    if remainder_max_kg is None:
+        remainder_max_kg = DEFAULT_POLICY["barem_remainder_max_kg"]
     for key, default_value in DEFAULT_POLICY["son_phuong_split_counts"].items():
         try:
             split_counts[key] = max(1, int(number(split_counts_raw.get(key, default_value)) or default_value))
@@ -560,15 +663,25 @@ def clean_policy(raw):
     if min_take_quantity is not None and max_take_quantity is not None and min_take_quantity > max_take_quantity:
         raise ValueError("Khoi luong nho nhat khong duoc lon hon khoi luong lon nhat.")
     try:
+        min_type_count = max(1, int(number(raw.get("generic_min_type_count", DEFAULT_POLICY["generic_min_type_count"])) or DEFAULT_POLICY["generic_min_type_count"]))
+    except (TypeError, ValueError):
+        min_type_count = DEFAULT_POLICY["generic_min_type_count"]
+    try:
         future_purchase_window_days = int(number(raw.get("future_purchase_window_days", DEFAULT_POLICY["future_purchase_window_days"])) or DEFAULT_POLICY["future_purchase_window_days"])
     except (TypeError, ValueError):
         future_purchase_window_days = DEFAULT_POLICY["future_purchase_window_days"]
     future_purchase_window_days = max(1, min(future_purchase_window_days, 366))
+    try:
+        scenario_count = max(1, min(1000, int(number(raw.get("scenario_count", 100)) or 100)))
+    except (TypeError, ValueError):
+        scenario_count = 100
+    sales_inventory_pairs = son_phuong_sales_pair_map(raw) if company_profile == "son_phuong" else []
+
     if company_profile == "son_phuong":
         ignore_sale_suffix = False
         allow_negative_export = False
         allow_future_purchase_reorder = False
-    if ignore_sale_suffix or company_profile == "son_phuong":
+    if ignore_sale_suffix:
         max_loss_percent = None
         max_profit_percent = None
     return {
@@ -581,9 +694,13 @@ def clean_policy(raw):
         "generic_split_variance_percent": variance,
         "barem_tolerance_percent": barem_tolerance,
         "generic_min_take_quantity": min_take_quantity,
+        "barem_remainder_max_kg": remainder_max_kg,
         "generic_max_take_quantity": max_take_quantity,
+        "generic_min_type_count": min_type_count,
         "allow_future_purchase_reorder": allow_future_purchase_reorder,
         "future_purchase_window_days": future_purchase_window_days,
+        "sales_inventory_pairs": sales_inventory_pairs,
+        "scenario_count": scenario_count,
     }
 
 
@@ -610,7 +727,7 @@ def sheet_for_mapping(workbook, mapping):
 
 def header_column(sheet, header_row, labels, fallback=None):
     targets = {normalize_header(label) for label in labels}
-    for column in range(1, sheet.max_column + 1):
+    for column in range(1, (sheet.max_column or 128) + 1):
         if normalize_header(sheet.cell(header_row, column).value) in targets:
             return column
     return column_index(fallback) if fallback else None
@@ -618,7 +735,7 @@ def header_column(sheet, header_row, labels, fallback=None):
 
 def header_column_contains(sheet, header_row, labels):
     targets = [normalize_header(label) for label in labels]
-    for column in range(1, sheet.max_column + 1):
+    for column in range(1, (sheet.max_column or 128) + 1):
         header = normalize_header(sheet.cell(header_row, column).value)
         if header and any(target and target in header for target in targets):
             return column
@@ -653,6 +770,34 @@ def detect_sales_mapping(sheet, mapping):
             result["price_col"] = get_column_letter(price_col)
         return result
     return mapping
+
+
+def detect_opening_mapping(sheet, mapping):
+    for header_row in range(1, 11):
+        code_col = header_column_contains(sheet, header_row, ["M\u00e3 VT", "M\u00e3 v\u1eadt t\u01b0", "M\u00e3 h\u00e0ng", "ma_vt"])
+        qty_col = header_column_contains(sheet, header_row, [
+            "S\u1ed1 l\u01b0\u1ee3ng \u0111\u1ea7u k\u1ef3", "T\u1ed3n \u0111\u1ea7u k\u1ef3", "SL t\u1ed3n \u0111\u1ea7u", "S\u1ed1 l\u01b0\u1ee3ng t\u1ed3n", "S\u1ed1 l\u01b0\u1ee3ng",
+        ])
+        if not code_col or not qty_col:
+            continue
+        result = dict(mapping)
+        result["header_row"] = header_row
+        result["data_start_row"] = header_row + 1
+        result["code_col"] = get_column_letter(code_col)
+        result["qty_col"] = get_column_letter(qty_col)
+        product_col = header_column_contains(sheet, header_row, ["T\u00ean h\u00e0ng", "T\u00ean v\u1eadt t\u01b0", "T\u00ean s\u1ea3n ph\u1ea9m", "ten_hang"])
+        price_col = header_column_contains(sheet, header_row, [
+            "\u0110\u01a1n gi\u00e1 v\u1ed1n", "Gi\u00e1 v\u1ed1n", "\u0110\u01a1n gi\u00e1 t\u1ed3n", "\u0110\u01a1n gi\u00e1", "don_gia",
+        ])
+        if product_col:
+            result["product_col"] = get_column_letter(product_col)
+        if price_col:
+            result["price_col"] = get_column_letter(price_col)
+        return result
+    raise ValueError(
+        "File t?n ??u k? kh?ng t?m th?y c?t M? VT v? S? l??ng. "
+        "H?y d?ng header theo t?n ho?c t?i file m?u t?n ??u k?."
+    )
 
 
 def cell_value(values, column):
@@ -701,6 +846,8 @@ def read_lines(content, mapping, kind, company_profile="yen_thanh"):
     sheet = sheet_for_mapping(workbook, mapping)
     if kind == "sales":
         mapping = detect_sales_mapping(sheet, mapping)
+    if kind == "opening":
+        mapping = detect_opening_mapping(sheet, mapping)
     code_col = column_index(mapping["code_col"])
     qty_col = column_index(mapping["qty_col"])
     invoice_col = column_index(mapping["invoice_col"]) if text(mapping.get("invoice_col")) else None
@@ -727,13 +874,14 @@ def read_lines(content, mapping, kind, company_profile="yen_thanh"):
     unit_col = header_column(sheet, header_row, ["Đơn vị tính", "ĐVT", "DVT"], "N") if kind in {"purchase", "sales"} else None
     warehouse_col = header_column(sheet, header_row, ["Mã kho", "Ma kho", "ma_kho"]) if kind in {"purchase", "sales", "opening"} else None
     warehouse_account_col = header_column(sheet, header_row, ["TK vật tư", "TK vat tu", "tk_vat_tu"]) if kind in {"purchase", "sales", "opening"} else None
+    processing_group_col = header_column(sheet, header_row, ["Nh\u00f3m x\u1eed l\u00fd", "Nhom xu ly", "processing group", "processing_group"]) if company_profile == "son_phuong" and kind == "purchase" else None
     tax_rate_col = header_column(sheet, header_row, ["Thuế suất", "Thuế suất GTGT", "Thuế suất (thue_suat)"], "R") if kind == "sales" else None
     tax_amount_col = header_column(sheet, header_row, ["Tiền thuế nguyên tệ", "Tiền thuế", "Tiền thuế:N0 (tien_thue)"], "T") if kind == "sales" else None
     last_col = max(
         column for column in (
             code_col, qty_col, invoice_col, date_col, product_col, price_col,
             party_name_col, party_tax_col, amount_col, unit_col, warehouse_col, warehouse_account_col,
-            tax_rate_col, tax_amount_col,
+            tax_rate_col, tax_amount_col, processing_group_col,
         ) if column is not None
     )
     lines = []
@@ -745,6 +893,10 @@ def read_lines(content, mapping, kind, company_profile="yen_thanh"):
     for row_number, values in enumerate(row_values, start=mapping["data_start_row"]):
         raw_code = cell_value(values, code_col)
         product_name = text(cell_value(values, product_col)) if product_col else ""
+        if processing_group_col:
+            processing_group = normalize_header(cell_value(values, processing_group_col)).replace(" ", "_")
+            if processing_group and processing_group not in {"materials", "nhom_vat_tu"}:
+                continue
         if (kind == "sales" or company_profile == "son_phuong") and not valid_inventory_code(raw_code) and product_name:
             raw_code = generated_code_from_product(product_name)
         quantity = number(cell_value(values, qty_col))
@@ -879,8 +1031,17 @@ def make_lots(opening_lines, purchase_lines):
     return lots
 
 
-def sale_sort_key(sale):
-    return (sale.get("invoice_date_iso") or "9999-12-31", sale.get("row_number", 0))
+def sale_sort_key(sale, include_invoice=False):
+    sale_date = sale.get("invoice_date_iso") or "9999-12-31"
+    row_number = sale.get("row_number", 0)
+    if not include_invoice:
+        return (sale_date, row_number)
+    invoice_parts = tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", text(sale.get("invoice_no")))
+        if part
+    )
+    return (sale_date, invoice_parts, row_number)
 
 
 def lot_available_for_sale(lot, sale):
@@ -924,14 +1085,18 @@ def lot_priority(lot, sale_price):
     if lot["unit_price"] is None or sale_price is None:
         return (2, suffix, lot["sequence"])
     profit_per_unit = sale_price - lot["unit_price"]
-    if profit_per_unit < 0:
-        return (0, abs(profit_per_unit), suffix, lot["sequence"])
-    return (1, profit_per_unit, suffix, lot["sequence"])
+    if profit_per_unit >= 0:
+        return (0, profit_per_unit, suffix, lot["sequence"])
+    return (1, abs(profit_per_unit), suffix, lot["sequence"])
 
 
 def generic_lot_priority(lot, sale_price):
+    return generic_lot_priority_for_quantity(lot, sale_price, lot_unreserved_quantity(lot))
+
+
+def generic_lot_priority_for_quantity(lot, sale_price, available_quantity):
     suffix = lot["suffix"] if lot["suffix"] is not None else 999999
-    stock_priority = -clean_quantity(lot.get("remaining_quantity", 0))
+    stock_priority = -available_quantity
     if lot["unit_price"] is None or sale_price is None:
         return (2, stock_priority, suffix, lot["sequence"])
     profit_per_unit = sale_price - lot["unit_price"]
@@ -965,6 +1130,103 @@ def lot_acceptance(lot, sale_price, policy):
     return True, ""
 
 
+def lot_unreserved_quantity(lot):
+    return clean_quantity(max(
+        0,
+        clean_quantity(lot.get("remaining_quantity", 0))
+        - clean_quantity(lot.get("specific_reserved_quantity", 0)),
+    ))
+
+
+def son_phuong_sale_reservation_key(sale):
+    return (
+        sale.get("invoice_date_iso") or "",
+        text(sale.get("invoice_no")),
+        sale.get("row_number", 0),
+        normalize_code(sale.get("variant_code", "")),
+    )
+def son_phuong_compatible_profile_lots(by_steel_profile, profile_key):
+    """Return exact-surface lots first, then unknown-surface fallback lots."""
+    parts = text(profile_key).split("|", 2)
+    if len(parts) != 3:
+        return []
+    kind, coating, dimension = parts
+    compatible_keys = [profile_key]
+    if coating in {"black", "galvanized"}:
+        compatible_keys.append(f"{kind}|unknown|{dimension}")
+    elif coating == "unknown":
+        compatible_keys.extend((f"{kind}|black|{dimension}", f"{kind}|galvanized|{dimension}"))
+    result = []
+    seen = set()
+    for key in compatible_keys:
+        for lot in by_steel_profile.get(key, []):
+            lot_id = id(lot)
+            if lot_id in seen:
+                continue
+            seen.add(lot_id)
+            result.append(lot)
+    return result
+
+
+def son_phuong_surface_priority(lot, requested_profile_key):
+    parts = text(requested_profile_key).split("|", 2)
+    requested_coating = parts[1] if len(parts) == 3 else "unknown"
+    lot_coating = lot.get("steel_coating") or "unknown"
+    return 0 if lot_coating == requested_coating else 1
+
+
+
+
+def reserve_son_phuong_specific_sales(ordered_sales, by_steel_profile, policy):
+    """Reserve dated stock for exact pipe/box rows before generic rows plan."""
+    reservations = defaultdict(list)
+    for sale in ordered_sales:
+        if generic_steel_sale_type(sale.get("product_name", "")):
+            continue
+        if son_phuong_sales_role(sale) != "materials":
+            continue
+        profile_key = sale.get("steel_profile_key") or steel_profile_key(
+            sale.get("product_name", ""),
+            sale.get("source_variant_code") or sale.get("variant_code", ""),
+        )
+        if not profile_key:
+            continue
+        quantity_left = clean_quantity(sale.get("quantity", 0))
+        if quantity_left <= QUANTITY_EPSILON:
+            continue
+        candidates = []
+        for lot in son_phuong_compatible_profile_lots(by_steel_profile, profile_key):
+            available = clean_quantity(
+                lot.get("initial_quantity", 0)
+                - lot.get("specific_reserved_quantity", 0)
+            )
+            if available <= QUANTITY_EPSILON or not lot_available_for_sale(lot, sale):
+                continue
+            accepted, _reason = lot_acceptance(lot, sale.get("unit_price"), policy)
+            if accepted:
+                candidates.append(lot)
+        candidates.sort(key=lambda lot: (
+            son_phuong_surface_priority(lot, profile_key),
+            lot_priority(lot, sale.get("unit_price")),
+        ))
+        reservation_key = son_phuong_sale_reservation_key(sale)
+        for lot in candidates:
+            if quantity_left <= QUANTITY_EPSILON:
+                break
+            available = clean_quantity(
+                lot.get("initial_quantity", 0)
+                - lot.get("specific_reserved_quantity", 0)
+            )
+            amount = clean_quantity(min(quantity_left, available))
+            if amount <= QUANTITY_EPSILON:
+                continue
+            lot["specific_reserved_quantity"] = clean_quantity(
+                lot.get("specific_reserved_quantity", 0) + amount
+            )
+            reservations[reservation_key].append((lot, amount))
+            quantity_left = clean_quantity(quantity_left - amount)
+    return reservations
+
 def lot_within_generic_variance(lot, selected_lots, variance_percent):
     if not variance_percent or not selected_lots:
         return True
@@ -986,11 +1248,11 @@ def son_phuong_lot_pool(lots, sale):
     if not generic_type:
         return None, []
     allowed = generic_allowed_kinds(generic_type)
-    sale_coating = steel_coating(sale.get("product_name", ""), sale.get("variant_code", ""))
+    sale_coating = explicit_steel_coating(sale.get("product_name", ""), sale.get("source_variant_code") or sale.get("variant_code", ""))
     return generic_type, [
         lot for lot in lots
         if (lot.get("steel_kind") or steel_kind(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))) in allowed
-        and (lot.get("steel_coating") or steel_coating(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))) == sale_coating
+        and (not sale_coating or (lot.get("steel_coating") or steel_coating(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))) in {sale_coating, "unknown"})
     ]
 
 
@@ -1166,6 +1428,134 @@ def parse_barem_file(content):
     return result
 
 
+def theoretical_barem_weight(profile_key):
+    parts = text(profile_key).split("|", 2)
+    if len(parts) != 3:
+        return None
+    kind, _coating, dimension = parts
+    values = [number(token) for token in dimension.split("x")]
+    if any(value is None or value <= 0 for value in values):
+        return None
+    if kind == "pipe" and len(values) == 2:
+        diameter, thickness = values
+        if thickness * 2 >= diameter:
+            return None
+        area_mm2 = math.pi * (diameter * thickness - thickness * thickness)
+    elif kind == "box" and len(values) == 3:
+        width, height, thickness = values
+        if thickness * 2 >= min(width, height):
+            return None
+        area_mm2 = 2 * thickness * (width + height - 2 * thickness)
+    else:
+        return None
+    # 7.85 g/cm3, one standard bar is 6 metres.
+    return area_mm2 * 0.0471
+
+
+def barem_profile_parts(profile_key):
+    parts = text(profile_key).split("|", 2)
+    if len(parts) != 3:
+        return None
+    dimensions = [number(token) for token in parts[2].split("x")]
+    if any(value is None for value in dimensions):
+        return None
+    return parts[0], parts[1], dimensions
+
+
+def compatible_barem_profile_keys(profile_key):
+    parts = text(profile_key).split("|", 2)
+    if len(parts) != 3:
+        return []
+    kind, coating, dimension = parts
+    keys = [profile_key]
+    if coating == "unknown":
+        keys.extend((f"{kind}|galvanized|{dimension}", f"{kind}|black|{dimension}"))
+    elif coating in {"black", "galvanized"}:
+        keys.append(f"{kind}|unknown|{dimension}")
+    return keys
+
+
+def infer_barem_weight(by_profile, profile_key):
+    target = barem_profile_parts(profile_key)
+    if not target:
+        return None
+    kind, coating, dimensions = target
+    thickness = dimensions[-1]
+    same_base = []
+    calibration = []
+    for candidate_key, raw_weight in (by_profile or {}).items():
+        weight = number(raw_weight)
+        candidate = barem_profile_parts(candidate_key)
+        if weight is None or weight <= 0 or not candidate:
+            continue
+        candidate_kind, candidate_coating, candidate_dimensions = candidate
+        if candidate_kind != kind or candidate_coating != coating or len(candidate_dimensions) != len(dimensions):
+            continue
+        if all(abs(left - right) <= QUANTITY_EPSILON for left, right in zip(candidate_dimensions[:-1], dimensions[:-1])):
+            same_base.append((candidate_dimensions[-1], weight, candidate_key))
+        theoretical = theoretical_barem_weight(candidate_key)
+        if theoretical and theoretical > QUANTITY_EPSILON:
+            distance = sum(abs(left - right) / max(abs(right), 1) for left, right in zip(candidate_dimensions, dimensions))
+            calibration.append((distance, weight / theoretical, candidate_key))
+
+    same_base.sort(key=lambda item: item[0])
+    if len(same_base) >= 2:
+        lower = max((item for item in same_base if item[0] <= thickness), default=same_base[0], key=lambda item: item[0])
+        upper = min((item for item in same_base if item[0] >= thickness), default=same_base[-1], key=lambda item: item[0])
+        if abs(upper[0] - lower[0]) <= QUANTITY_EPSILON:
+            lower, upper = sorted(sorted(same_base, key=lambda item: abs(item[0] - thickness))[:2], key=lambda item: item[0])
+        if abs(upper[0] - lower[0]) > QUANTITY_EPSILON:
+            ratio = (thickness - lower[0]) / (upper[0] - lower[0])
+            inferred = lower[1] + ratio * (upper[1] - lower[1])
+            if inferred > QUANTITY_EPSILON:
+                return {"weight": round(inferred, 6), "source": "inferred", "method": "N?i suy/ngo?i suy theo ?? d?y c?ng k?ch th??c", "references": [lower[2], upper[2]], "confidence": "high" if lower[0] <= thickness <= upper[0] else "medium"}
+    if len(same_base) == 1 and same_base[0][0] > QUANTITY_EPSILON:
+        inferred = same_base[0][1] * thickness / same_base[0][0]
+        if inferred > QUANTITY_EPSILON:
+            return {"weight": round(inferred, 6), "source": "inferred", "method": "T? l? theo ?? d?y c?ng k?ch th??c", "references": [same_base[0][2]], "confidence": "medium"}
+
+    theoretical_target = theoretical_barem_weight(profile_key)
+    if theoretical_target and calibration:
+        nearest = sorted(calibration, key=lambda item: item[0])[:12]
+        ratios = sorted(item[1] for item in nearest)
+        middle = len(ratios) // 2
+        correction = ratios[middle] if len(ratios) % 2 else (ratios[middle - 1] + ratios[middle]) / 2
+        inferred = theoretical_target * correction
+        if inferred > QUANTITY_EPSILON:
+            return {"weight": round(inferred, 6), "source": "inferred", "method": "Suy ra t? ti?t di?n v? hi?u ch?nh theo c?c barem g?n nh?t", "references": [item[2] for item in nearest[:3]], "confidence": "medium"}
+    return None
+
+
+def resolve_barem_details(barem_map, lot):
+    if not barem_map:
+        return None
+    code = normalize_code(lot.get("variant_code", ""))
+    if not isinstance(barem_map, dict) or not ("by_code" in barem_map or "by_profile" in barem_map):
+        direct = barem_map.get(code) if hasattr(barem_map, "get") else None
+        return {"weight": direct, "source": "code", "method": "Barem theo M? VT", "references": [code], "confidence": "exact"} if direct is not None else None
+    by_code = barem_map.get("by_code") or {}
+    by_profile = barem_map.get("by_profile") or {}
+    direct = by_code.get(code)
+    if direct is not None:
+        return {"weight": direct, "source": "code", "method": "Barem theo M? VT", "references": [code], "confidence": "exact"}
+    profile_key = lot.get("steel_profile_key") or steel_profile_key(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))
+    for compatible_key in compatible_barem_profile_keys(profile_key):
+        profile_weight = by_profile.get(compatible_key)
+        if profile_weight is not None:
+            return {
+                "weight": profile_weight,
+                "source": "profile",
+                "method": "Barem theo khoa ky thuat",
+                "references": [compatible_key],
+                "confidence": "exact" if compatible_key == profile_key else "high",
+            }
+    for compatible_key in compatible_barem_profile_keys(profile_key):
+        inferred = infer_barem_weight(by_profile, compatible_key)
+        if inferred:
+            return inferred
+    return None
+
+
 def resolve_barem_weight(barem_map, lot):
     if not barem_map:
         return None
@@ -1180,7 +1570,8 @@ def resolve_barem_weight(barem_map, lot):
             lot.get("product_name", ""),
             lot.get("source_variant_code") or lot.get("variant_code", ""),
         )
-        return by_profile.get(profile_key)
+        details = resolve_barem_details(barem_map, lot)
+        return details.get("weight") if details else None
     return barem_map.get(code) if hasattr(barem_map, "get") else None
 
 
@@ -1309,6 +1700,7 @@ def save_company_detection_rules(profile, rules):
 
 
 def missing_barem_item(lot, reason="Thiếu khối lượng 1 barem"):
+    profile = steel_profile_summary(lot.get("product_name", ""), lot.get("source_variant_code") or lot.get("variant_code", ""))
     return {
         "variant_code": lot.get("variant_code", ""),
         "product_name": lot.get("product_name", ""),
@@ -1317,6 +1709,11 @@ def missing_barem_item(lot, reason="Thiếu khối lượng 1 barem"):
         "invoice_date": lot.get("invoice_date", ""),
         "row_number": lot.get("row_number", ""),
         "reason": reason,
+        "profile_key": profile.get("profile_key", ""),
+        "steel_kind": profile.get("kind", ""),
+        "steel_coating": profile.get("coating", ""),
+        "steel_dimension": profile.get("dimension", ""),
+        "status": "unresolved",
     }
 
 
@@ -1347,7 +1744,7 @@ def barem_multiple_quantity(target, available, barem, min_quantity=None, max_qua
     return amount
 
 
-def choose_barem_generic_plan(sale, candidates, policy, barem_map):
+def choose_barem_generic_plan_legacy(sale, candidates, policy, barem_map):
     if not candidates:
         return [], [], [], "Không có mã ứng viên."
     missing_barem = []
@@ -1456,7 +1853,6 @@ def choose_barem_generic_plan(sale, candidates, policy, barem_map):
         note = f"Chon {split_count} ma khong gioi han so loai, thieu {format_number(rounded_shortage)} kg sau khi lam tron theo barem."
     if not has_profitable_lots:
         note = "Khong co ma lai hop le; buoc phai chon ma lo thap nhat. " + note
-    return best_plan, missing_barem, selected_codes, note
     top_lot = source_lots[0]
     split_count = 4 if lot_capacity(top_lot) >= required * 0.25 else 6
     selected_lots = source_lots[:split_count]
@@ -1467,7 +1863,7 @@ def choose_barem_generic_plan(sale, candidates, policy, barem_map):
     tolerance = required * (policy.get("barem_tolerance_percent") or 0) / 100
     best_plan = None
     best_score = None
-    for option in random_percent_options(50, split_count, [
+    for option in random_percent_options(policy.get("scenario_count") or 100, split_count, [
         sale.get("invoice_no", ""),
         sale.get("row_number", ""),
         sale.get("variant_code", ""),
@@ -1527,12 +1923,447 @@ def choose_barem_generic_plan(sale, candidates, policy, barem_map):
         note = f"Chọn {split_count} mã; phần dư nhỏ cuối cùng được gộp vào mã phù hợp nhất."
     else:
         note = f"Chọn {split_count} mã, thiếu {format_number(rounded_shortage)} kg sau khi làm tròn theo barem."
+    note = f"Da danh gia {policy.get('scenario_count') or 100} phuong an tai lap. {note}"
     if remainder_quantity <= QUANTITY_EPSILON and best_score and best_score[2] == 0:
         note = f"Chon {split_count} ma; toan bo khoi luong dung boi so barem."
     if not has_profitable_lots:
         note = "Khong co ma lai hop le; buoc phai chon ma lo thap nhat. " + note
     return best_plan or [], missing_barem, selected_codes, note
 
+
+def choose_barem_generic_plan(sale, candidates, policy, barem_map):
+    """Plan by material type, then expand the accepted plan back to purchase lots."""
+    if not candidates:
+        return [], [], [], "Kh\u00f4ng c\u00f3 m\u00e3 \u1ee9ng vi\u00ean t\u1ea1i th\u1eddi \u0111i\u1ec3m b\u00e1n."
+
+    required = clean_quantity(sale.get("quantity", 0))
+    if required <= QUANTITY_EPSILON:
+        return [], [], [], "S\u1ed1 l\u01b0\u1ee3ng b\u00e1n ra b\u1eb1ng 0."
+
+    min_take = policy.get("generic_min_take_quantity")
+    max_take = policy.get("generic_max_take_quantity")
+    min_type_count = max(1, int(policy.get("generic_min_type_count") or 2))
+    scenario_count = max(1, int(policy.get("scenario_count") or 100))
+    missing_barem = []
+    missing_codes = set()
+    grouped = {}
+    available_by_lot = {}
+    priority_by_lot = dict(policy.get("_generic_priority_by_lot") or {})
+
+    def cached_priority(lot):
+        lot_id = id(lot)
+        if lot_id not in priority_by_lot:
+            priority = generic_lot_priority(lot, sale.get("unit_price"))
+            priority_by_lot[lot_id] = priority
+        return priority_by_lot[lot_id]
+
+    for lot in candidates:
+        code = lot.get("_normalized_variant_code") or normalize_code(lot.get("variant_code", ""))
+        lot["_normalized_variant_code"] = code
+        remaining = lot_unreserved_quantity(lot)
+        if remaining <= QUANTITY_EPSILON:
+            continue
+        available_by_lot[id(lot)] = remaining
+        if "_son_phuong_barem_details" in lot:
+            barem_details = lot.get("_son_phuong_barem_details") or None
+        else:
+            barem_details = resolve_barem_details(barem_map, lot)
+            lot["_son_phuong_barem_details"] = barem_details or {}
+        barem = barem_details.get("weight") if barem_details else None
+        if barem is None or barem <= QUANTITY_EPSILON:
+            missing_key = code or f"row:{lot.get('row_number', '')}"
+            if missing_key not in missing_codes:
+                missing_barem.append(missing_barem_item(
+                    lot,
+                    "Thi\u1ebfu kh\u1ed1i l\u01b0\u1ee3ng barem cho m\u00e3/kh\u00f3a k\u1ef9 thu\u1eadt.",
+                ))
+                missing_codes.add(missing_key)
+            continue
+        lot["barem_weight"] = barem
+        lot["barem_source"] = barem_details.get("source", "")
+        lot["barem_method"] = barem_details.get("method", "")
+        lot["barem_references"] = list(barem_details.get("references") or [])
+        profile_key = lot.get("steel_profile_key") or steel_profile_key(
+            lot.get("product_name", ""),
+            lot.get("source_variant_code") or lot.get("variant_code", ""),
+        )
+        material_key = (
+            f"profile:{profile_key}|barem:{barem:.12g}"
+            if profile_key else f"code:{strip_son_phuong_company_prefix(code)}|barem:{barem:.12g}"
+        )
+        group = grouped.setdefault(material_key, {
+            "code": code,
+            "material_key": material_key,
+            "steel_kind": lot.get("steel_kind") or steel_kind(
+                lot.get("product_name", ""),
+                lot.get("source_variant_code") or lot.get("variant_code", ""),
+            ),
+            "lots": [],
+            "barem_weight": barem,
+            "barem_source": lot.get("barem_source", ""),
+            "barem_method": lot.get("barem_method", ""),
+            "barem_references": lot.get("barem_references", []),
+            "capacity": 0.0,
+        })
+        group["lots"].append(lot)
+        group["capacity"] = clean_quantity(group["capacity"] + remaining)
+
+    groups = []
+    for group in grouped.values():
+        if max_take is not None:
+            group["capacity"] = clean_quantity(min(group["capacity"], max_take))
+        if group["capacity"] <= QUANTITY_EPSILON:
+            continue
+        if min_take is not None and group["capacity"] + QUANTITY_EPSILON < min_take:
+            continue
+        group["lots"].sort(key=cached_priority)
+        group["priority"] = cached_priority(group["lots"][0])
+        groups.append(group)
+
+    generic_type = generic_steel_sale_type(sale.get("product_name", ""))
+    kind_capacities = defaultdict(float)
+    for group in groups:
+        kind_capacities[group.get("steel_kind", "unknown")] += group["capacity"]
+    future_kind_demand = policy.get("_future_generic_kind_demand") or {}
+
+    groups.sort(key=lambda group: (
+        generic_lot_quality_rank(group["lots"][0], sale.get("unit_price")),
+        -max(
+            0,
+            kind_capacities.get(group.get("steel_kind", "unknown"), 0)
+            - clean_quantity(future_kind_demand.get(group.get("steel_kind", "unknown"), 0)),
+        ) if generic_type == "pipe_box" else 0,
+        group["priority"],
+        -group["capacity"],
+        group["code"],
+    ))
+    if not groups:
+        return [], missing_barem, [], "Kh\u00f4ng c\u00f3 m\u00e3 n\u00e0o c\u00f3 barem v\u00e0 t\u1ed3n h\u1ee3p l\u1ec7."
+
+    def minimum_amount(group):
+        barem = group["barem_weight"]
+        minimum = max(barem, min_take or 0)
+        multiples = max(1, int(math.ceil((minimum - QUANTITY_EPSILON) / barem)))
+        return clean_quantity(multiples * barem)
+
+    def targets_for_weights(selected, weights):
+        if len(selected) < min_type_count:
+            return None
+        if sum(group["capacity"] for group in selected) + QUANTITY_EPSILON < required:
+            return None
+        weight_total = sum(weights) or 1
+        targets = []
+        for group, weight in zip(selected, weights):
+            target = required * weight / weight_total
+            amount = barem_multiple_quantity(
+                target,
+                group["capacity"],
+                group["barem_weight"],
+            )
+            minimum = minimum_amount(group)
+            if amount + QUANTITY_EPSILON < minimum:
+                amount = minimum if minimum <= group["capacity"] + QUANTITY_EPSILON else 0
+            if amount <= QUANTITY_EPSILON:
+                return None
+            targets.append({
+                "group": group,
+                "amount": clean_quantity(amount),
+                "remainder": 0.0,
+            })
+        total = clean_quantity(sum(item["amount"] for item in targets))
+        if total > required + QUANTITY_EPSILON:
+            return None
+
+        shortage = clean_quantity(required - total)
+        for item in sorted(
+            targets,
+            key=lambda row: (
+                -(row["group"]["capacity"] - row["amount"]),
+                row["group"]["priority"],
+            ),
+        ):
+            if shortage <= QUANTITY_EPSILON:
+                break
+            spare = clean_quantity(item["group"]["capacity"] - item["amount"])
+            addition = barem_multiple_quantity(
+                shortage,
+                spare,
+                item["group"]["barem_weight"],
+            )
+            if addition <= QUANTITY_EPSILON:
+                continue
+            item["amount"] = clean_quantity(item["amount"] + addition)
+            shortage = clean_quantity(shortage - addition)
+
+        if shortage > QUANTITY_EPSILON:
+            remainder_limit = policy.get("barem_remainder_max_kg")
+            remainder_options = []
+            for item in targets:
+                if item["group"]["capacity"] - item["amount"] + QUANTITY_EPSILON < shortage:
+                    continue
+                barem = item["group"]["barem_weight"]
+                desired_amount = clean_quantity(item["amount"] + shortage)
+                barem_multiple = max(1, int(math.floor((desired_amount / barem) + 0.5)))
+                theoretical_amount = clean_quantity(barem_multiple * barem)
+                tolerance_kg = clean_quantity(desired_amount - theoretical_amount)
+                if remainder_limit is not None and abs(tolerance_kg) > remainder_limit + QUANTITY_EPSILON:
+                    continue
+                remainder_options.append((item, tolerance_kg))
+            if not remainder_options:
+                return None
+            remainder_target, tolerance_kg = sorted(
+                remainder_options,
+                key=lambda option: (
+                    -option[0]["group"]["barem_weight"],
+                    abs(option[1]),
+                    option[0]["group"]["priority"],
+                ),
+            )[0]
+            remainder_target["amount"] = clean_quantity(remainder_target["amount"] + shortage)
+            remainder_target["remainder"] = tolerance_kg
+            shortage = 0.0
+
+        return targets if shortage <= QUANTITY_EPSILON else None
+
+    def expand_targets(targets):
+        expanded = []
+        for target in sorted(targets, key=lambda row: row["group"]["priority"]):
+            group = target["group"]
+            quantity_left = target["amount"]
+            ratio = target["amount"] / required if required else 0
+            remainder_left = target["remainder"]
+            for lot in group["lots"]:
+                if quantity_left <= QUANTITY_EPSILON:
+                    break
+                amount = clean_quantity(min(quantity_left, available_by_lot.get(id(lot), 0)))
+                if amount <= QUANTITY_EPSILON:
+                    continue
+                quantity_left = clean_quantity(quantity_left - amount)
+                is_remainder = abs(remainder_left) > QUANTITY_EPSILON and quantity_left <= QUANTITY_EPSILON
+                expanded.append((lot, amount, ratio, remainder_left if is_remainder else 0.0))
+                if is_remainder:
+                    remainder_left = 0.0
+            if quantity_left > QUANTITY_EPSILON:
+                return None
+        return expanded
+
+    def plan_score(targets, expanded):
+        shortage = clean_quantity(max(0, required - sum(item["amount"] for item in targets)))
+        remainder = clean_quantity(sum(abs(item["remainder"]) for item in targets))
+        scarcity_cost = 0.0
+        used_by_kind = defaultdict(float)
+        positive_profit = 0.0
+        loss = 0.0
+        fifo = 0.0
+        sale_price = sale.get("unit_price")
+        for lot, amount, _ratio, _is_remainder in expanded:
+            fifo += (lot.get("sequence", 0) or 0) * amount
+            if generic_type == "pipe_box":
+                lot_kind = lot.get("steel_kind") or "unknown"
+                used_by_kind[lot_kind] += amount
+                kind_capacity = kind_capacities.get(lot_kind, 0)
+                if kind_capacity > QUANTITY_EPSILON:
+                    scarcity_cost += amount / kind_capacity
+            if sale_price is None or lot.get("unit_price") is None:
+                continue
+            difference = (sale_price - lot["unit_price"]) * amount
+            if difference >= 0:
+                positive_profit += difference
+            else:
+                loss += abs(difference)
+        preservation_shortage = clean_quantity(sum(
+            max(
+                0,
+                clean_quantity(future_kind_demand.get(kind, 0))
+                - clean_quantity(kind_capacities.get(kind, 0) - used_by_kind.get(kind, 0)),
+            )
+            for kind in ("pipe", "box")
+        )) if generic_type == "pipe_box" else 0.0
+        # Avoid a tiny barem improvement consuming stock required by constrained future sales.
+        # For KHHVT, actual loss is more important than barem, scarcity, or
+        # FIFO preferences.  Profit is minimized only after loss is minimized.
+        return (
+            shortage,
+            clean_quantity(loss),
+            1 if loss > QUANTITY_EPSILON else 0,
+            clean_quantity(positive_profit),
+            preservation_shortage,
+            remainder,
+            clean_quantity(scarcity_cost),
+            clean_quantity(fifo),
+        )
+
+    best_plan = None
+    best_targets = None
+    best_score = None
+    chosen_type_count = 0
+    attempts = 0
+    max_types = len(groups)
+    first_type_count = min(min_type_count, max_types)
+    total_capacity = clean_quantity(sum(group["capacity"] for group in groups))
+    if total_capacity + QUANTITY_EPSILON >= required:
+        capacity_total = 0.0
+        capacity_type_count = 0
+        for group in sorted(groups, key=lambda item: item["capacity"], reverse=True):
+            capacity_total = clean_quantity(capacity_total + group["capacity"])
+            capacity_type_count += 1
+            if capacity_total + QUANTITY_EPSILON >= required:
+                break
+        first_type_count = max(first_type_count, capacity_type_count)
+    rng = deterministic_random([
+        sale.get("invoice_date_iso", ""),
+        sale.get("invoice_no", ""),
+        sale.get("row_number", ""),
+        sale.get("variant_code", ""),
+    ])
+
+    type_counts = range(first_type_count, max_types + 1) if total_capacity + QUANTITY_EPSILON >= required else ()
+    for type_count in type_counts:
+        exact_plan_found = False
+        for option_index in range(scenario_count):
+            attempts += 1
+            if option_index == 0:
+                selected = groups[:type_count]
+                weights = [1.0] * type_count
+            elif option_index == 1:
+                selected = sorted(groups, key=lambda group: group["capacity"], reverse=True)[:type_count]
+                weights = [group["capacity"] for group in selected]
+            elif option_index == 2:
+                selected = groups[:type_count]
+                weights = [group["capacity"] for group in selected]
+            else:
+                selected = rng.sample(groups, type_count)
+                weights = [rng.random() + 0.05 for _ in selected]
+            targets = targets_for_weights(selected, weights)
+            if not targets:
+                continue
+            expanded = expand_targets(targets)
+            if not expanded:
+                continue
+            score = plan_score(targets, expanded)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_plan = expanded
+                best_targets = targets
+                chosen_type_count = type_count
+            if score[0] <= QUANTITY_EPSILON:
+                exact_plan_found = True
+        if best_plan:
+            break
+
+    generated_new_plan = False
+    if not best_plan:
+        generated_new_plan = True
+        selected = groups
+        capacity_weights = [group["capacity"] for group in selected]
+        targets = targets_for_weights(selected, capacity_weights)
+        if targets:
+            best_targets = targets
+            best_plan = expand_targets(targets)
+            chosen_type_count = len(targets)
+
+    if not best_plan:
+        generated_new_plan = True
+        best_plan = []
+        quantity_left = required
+        selected_codes = []
+        allocated_by_group = defaultdict(float)
+        for group in groups:
+            if quantity_left <= QUANTITY_EPSILON:
+                break
+            group_target = clean_quantity(min(group["capacity"], quantity_left))
+            group_target = barem_multiple_quantity(group_target, group["capacity"], group["barem_weight"])
+            if group_target <= QUANTITY_EPSILON:
+                continue
+            selected_codes.append(group["code"])
+            for lot in group["lots"]:
+                if group_target <= QUANTITY_EPSILON:
+                    break
+                amount = clean_quantity(min(group_target, available_by_lot.get(id(lot), 0)))
+                if amount <= QUANTITY_EPSILON:
+                    continue
+                best_plan.append((lot, amount, amount / required if required else 0, False))
+                allocated_by_group[group["material_key"]] = clean_quantity(
+                    allocated_by_group[group["material_key"]] + amount
+                )
+                group_target = clean_quantity(group_target - amount)
+                quantity_left = clean_quantity(quantity_left - amount)
+
+        # Keep the final small balance in real KHHVT stock. It may be assigned
+        # as the one permitted non-barem remainder, including to a second type
+        # whose remaining quantity is smaller than one full barem.
+        remainder_limit = policy.get("barem_remainder_max_kg")
+        remaining_stock_capacity = clean_quantity(sum(
+            max(0, group["capacity"] - allocated_by_group.get(group["material_key"], 0))
+            for group in groups
+        ))
+        remainder_quantity = clean_quantity(min(quantity_left, remaining_stock_capacity))
+        if (
+            remainder_quantity > QUANTITY_EPSILON
+            and (remainder_limit is None or remainder_quantity <= remainder_limit + QUANTITY_EPSILON)
+        ):
+            selected_group_keys = {
+                key for key, amount in allocated_by_group.items()
+                if amount > QUANTITY_EPSILON
+            }
+            remainder_groups = sorted(
+                groups,
+                key=lambda group: (
+                    0 if group["material_key"] not in selected_group_keys else 1,
+                    group["priority"],
+                ),
+            )
+            for group in remainder_groups:
+                group_used = allocated_by_group.get(group["material_key"], 0)
+                if clean_quantity(group["capacity"] - group_used) + QUANTITY_EPSILON < remainder_quantity:
+                    continue
+                amount_left = remainder_quantity
+                for lot in group["lots"]:
+                    lot_used = clean_quantity(sum(
+                        amount
+                        for planned_lot, amount, _ratio, _remainder in best_plan
+                        if id(planned_lot) == id(lot)
+                    ))
+                    lot_spare = clean_quantity(available_by_lot.get(id(lot), 0) - lot_used)
+                    amount = clean_quantity(min(amount_left, lot_spare))
+                    if amount <= QUANTITY_EPSILON:
+                        continue
+                    amount_left = clean_quantity(amount_left - amount)
+                    is_last = amount_left <= QUANTITY_EPSILON
+                    best_plan.append((
+                        lot,
+                        amount,
+                        amount / required if required else 0,
+                        remainder_quantity if is_last else 0.0,
+                    ))
+                    if is_last:
+                        break
+                if amount_left <= QUANTITY_EPSILON:
+                    if group["code"] not in selected_codes:
+                        selected_codes.append(group["code"])
+                    quantity_left = clean_quantity(quantity_left - remainder_quantity)
+                    break
+        note = (
+            f"Kh\u00f4ng c\u00f3 m\u1eabu \u0111\u1ee7 {format_number(required)} kg. "
+            f"\u0110\u00e3 t\u1ea1o m\u1eabu m\u1edbi t\u1eeb {len(selected_codes)} lo\u1ea1i c\u00f2n t\u1ed3n; "
+            f"c\u00f2n {format_number(max(0, quantity_left))} kg ch\u01b0a ph\u00e2n b\u1ed5 v\u00e0 kh\u00f4ng xu\u1ea5t \u00e2m KHHVT."
+        )
+        return best_plan, missing_barem, selected_codes, note
+
+    selected_codes = list(dict.fromkeys(
+        lot.get("_normalized_variant_code") or normalize_code(lot.get("variant_code", ""))
+        for lot, _amount, _ratio, _is_remainder in best_plan
+    ))
+    allocated_quantity = clean_quantity(sum(item["amount"] for item in (best_targets or [])))
+    unallocated_quantity = clean_quantity(max(0, required - allocated_quantity))
+    source = "m\u1eabu m\u1edbi" if generated_new_plan else "m\u1eabu th\u1eed"
+    note = (
+        f"Ch\u1ecdn {source} {chosen_type_count} lo\u1ea1i sau {attempts} l\u1ea7n ki\u1ec3m tra; "
+        f"\u0111\u00e3 g\u1ed9p t\u1ed3n theo m\u00e3 t\u1eeb nhi\u1ec1u h\u00f3a \u0111\u01a1n mua."
+    )
+    if unallocated_quantity > QUANTITY_EPSILON:
+        note += f" Ch\u01b0a ph\u00e2n b\u1ed5 {format_number(unallocated_quantity)} kg v\u00ec kh\u00f4ng th\u1ec3 bi\u1ec3u di\u1ec5n b\u1eb1ng b\u1ed9i s\u1ed1 barem; ph\u1ea7n n\u00e0y ph\u1ea3i xu\u1ea5t \u00e2m v\u00e0 c\u1ea3nh b\u00e1o."
+    return best_plan, missing_barem, selected_codes, note
 
 def inventory_snapshot(lots, sale_price):
     return [{
@@ -1551,19 +2382,42 @@ def inventory_snapshot(lots, sale_price):
 def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, progress_callback=None, barem_map=None):
     policy = clean_policy(policy or DEFAULT_POLICY)
     is_son_phuong = policy.get("company_profile") == "son_phuong"
-    allow_negative_export = is_son_phuong
-    purchase_lines = summarize_purchase_lines(purchase_lines)
+    sales_pair_map = policy.get("sales_inventory_pairs") if is_son_phuong else {}
+    material_pair = sales_pair_map.get("materials", {"ma_kho": "KHHVT", "tk_vat_tu": "156"}) if is_son_phuong else {}
+    # Sơn Phương material rows must not be completed by a negative KHHVT
+    # export. A shortfall remains unresolved and blocks FDI generation.
+    allow_negative_export = False if is_son_phuong else bool(policy.get("allow_negative_export"))
+    if is_son_phuong:
+        purchase_lines = sorted((dict(line) for line in purchase_lines), key=lambda line: sale_sort_key(line, True))
+        opening_lines = sorted((dict(line) for line in opening_lines), key=lambda line: sale_sort_key(line, True))
+    else:
+        purchase_lines = summarize_purchase_lines(purchase_lines)
     lots = make_lots(opening_lines, purchase_lines)
     by_code = defaultdict(list)
     by_variant = defaultdict(list)
     by_steel_profile = defaultdict(list)
+    by_steel_kind = defaultdict(list)
+    by_steel_kind_coating = defaultdict(list)
     by_son_phuong_match_key = defaultdict(list)
     for lot in lots:
+        lot["_normalized_variant_code"] = normalize_code(lot.get("variant_code", ""))
         by_code[lot["base_code"]].append(lot)
         by_variant[lot["variant_code"]].append(lot)
         if is_son_phuong and lot.get("steel_profile_key"):
             by_steel_profile[lot["steel_profile_key"]].append(lot)
         if is_son_phuong:
+            lot_kind = lot.get("steel_kind") or steel_kind(
+                lot.get("product_name", ""),
+                lot.get("source_variant_code") or lot.get("variant_code", ""),
+            )
+            lot_coating = lot.get("steel_coating") or steel_coating(
+                lot.get("product_name", ""),
+                lot.get("source_variant_code") or lot.get("variant_code", ""),
+            )
+            lot["steel_kind"] = lot_kind
+            lot["steel_coating"] = lot_coating
+            by_steel_kind[lot_kind].append(lot)
+            by_steel_kind_coating[(lot_kind, lot_coating)].append(lot)
             for key in son_phuong_line_match_keys(lot):
                 by_son_phuong_match_key[key].append(lot)
 
@@ -1571,22 +2425,70 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
     warnings = []
     missing_barem_report = []
     total_sales = len(sales_lines)
-    ordered_sales = sorted(sales_lines, key=sale_sort_key)
+    ordered_sales = sorted(sales_lines, key=lambda sale: sale_sort_key(sale, is_son_phuong))
+    remaining_generic_kind_demand = defaultdict(float)
+    if is_son_phuong:
+        for pending_sale in ordered_sales:
+            pending_type = generic_steel_sale_type(pending_sale.get("product_name", ""))
+            if pending_type in {"pipe", "box"}:
+                remaining_generic_kind_demand[pending_type] = clean_quantity(
+                    remaining_generic_kind_demand[pending_type] + pending_sale.get("quantity", 0)
+                )
+    specific_reservations = (
+        reserve_son_phuong_specific_sales(ordered_sales, by_steel_profile, policy)
+        if is_son_phuong else {}
+    )
     for sale_index, sale in enumerate(ordered_sales, start=1):
         if progress_callback and (sale_index == 1 or sale_index == total_sales or sale_index % 250 == 0):
             progress_callback(sale_index, total_sales)
         required = sale["quantity"]
         remaining = required
+        sale_role = son_phuong_sales_role(sale) if is_son_phuong else ""
         used = []
         # A sales row can be split back to any accepted purchase suffix under the same
         # base code (.001/.002/.003). If none passes date and margin checks, the
         # remainder is pushed to KTP.
-        generic_type, generic_pool = son_phuong_lot_pool(lots, sale) if is_son_phuong else (None, [])
+        generic_type = generic_steel_sale_type(sale.get("product_name", "")) if is_son_phuong else None
+        if generic_type and (sale_index == 1 or sale_index % 50 == 0):
+            for lot_kind, kind_lots in list(by_steel_kind.items()):
+                by_steel_kind[lot_kind] = [lot for lot in kind_lots if lot_unreserved_quantity(lot) > QUANTITY_EPSILON]
+            for kind_coating, coating_lots in list(by_steel_kind_coating.items()):
+                by_steel_kind_coating[kind_coating] = [lot for lot in coating_lots if lot_unreserved_quantity(lot) > QUANTITY_EPSILON]
+        if generic_type in {"pipe", "box"}:
+            remaining_generic_kind_demand[generic_type] = clean_quantity(max(
+                0,
+                remaining_generic_kind_demand.get(generic_type, 0) - required,
+            ))
+        generic_pool = []
+        if generic_type:
+            allowed_kinds = sorted(generic_allowed_kinds(generic_type))
+            sale_coating = explicit_steel_coating(
+                sale.get("product_name", ""),
+                sale.get("source_variant_code") or sale.get("variant_code", ""),
+            )
+            for allowed_kind in allowed_kinds:
+                if sale_coating:
+                    generic_pool.extend(by_steel_kind_coating.get((allowed_kind, sale_coating), []))
+                    generic_pool.extend(by_steel_kind_coating.get((allowed_kind, "unknown"), []))
+                else:
+                    generic_pool.extend(by_steel_kind.get(allowed_kind, []))
+        if is_son_phuong and sale_role == "fallback":
+            generic_type, generic_pool = None, []
         is_generic_sale = bool(generic_type)
-        if is_generic_sale:
+        specific_reservation_plan = specific_reservations.get(
+            son_phuong_sale_reservation_key(sale),
+            [],
+        ) if is_son_phuong else []
+        sale_profile_key = sale.get("steel_profile_key") or steel_profile_key(
+            sale.get("product_name", ""),
+            sale.get("source_variant_code") or sale.get("variant_code", ""),
+        ) if is_son_phuong and not is_generic_sale else ""
+        if is_son_phuong and sale_role == "fallback":
+            lot_pool = []
+        elif is_generic_sale:
             lot_pool = generic_pool
-        elif is_son_phuong and sale.get("steel_profile_key"):
-            lot_pool = by_steel_profile.get(sale["steel_profile_key"], [])
+        elif is_son_phuong and sale_profile_key:
+            lot_pool = son_phuong_compatible_profile_lots(by_steel_profile, sale_profile_key)
         elif is_son_phuong:
             lot_pool = []
             seen_lots = set()
@@ -1599,17 +2501,40 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                     lot_pool.append(lot)
         else:
             lot_pool = by_code.get(sale["base_code"], [])
-        available_lots = [
-            lot for lot in lot_pool
-            if lot["remaining_quantity"] > 0 and lot_available_for_sale(lot, sale)
-        ]
+        available_lots = []
+        generic_priority_by_lot = {}
+        for lot in lot_pool:
+            available_quantity = (
+                clean_quantity(lot.get("remaining_quantity", 0))
+                if specific_reservation_plan or not is_son_phuong
+                else lot_unreserved_quantity(lot)
+            )
+            if available_quantity <= QUANTITY_EPSILON or not lot_available_for_sale(lot, sale):
+                continue
+            available_lots.append(lot)
+            if is_generic_sale:
+                generic_priority_by_lot[id(lot)] = generic_lot_priority_for_quantity(
+                    lot,
+                    sale.get("unit_price"),
+                    available_quantity,
+                )
         future_reorder_lots = [
             lot for lot in lot_pool
             if lot["remaining_quantity"] > 0 and future_lot_allowed_for_sale(lot, sale, policy)
         ] if not is_son_phuong else []
         priority_fn = generic_lot_priority if is_generic_sale else lot_priority
-        available_lots.sort(key=lambda lot: priority_fn(lot, sale["unit_price"]))
-        future_reorder_lots.sort(key=lambda lot: priority_fn(lot, sale["unit_price"]))
+        def current_priority(lot):
+            if is_generic_sale and id(lot) in generic_priority_by_lot:
+                return generic_priority_by_lot[id(lot)]
+            return priority_fn(lot, sale["unit_price"])
+        if is_son_phuong and sale_profile_key:
+            available_lots.sort(key=lambda lot: (
+                son_phuong_surface_priority(lot, sale_profile_key),
+                current_priority(lot),
+            ))
+        else:
+            available_lots.sort(key=current_priority)
+        future_reorder_lots.sort(key=current_priority)
         future_reorder_ids = {id(lot) for lot in future_reorder_lots}
         candidate_pool = available_lots + future_reorder_lots
         inventory_before = inventory_snapshot(candidate_pool, sale["unit_price"])
@@ -1639,15 +2564,22 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
         generic_plan_note = ""
         if is_generic_sale:
             if is_son_phuong and barem_map is not None:
+                generic_policy = policy
+                if generic_type == "pipe_box":
+                    generic_policy = dict(policy)
+                    generic_policy["_future_generic_kind_demand"] = dict(remaining_generic_kind_demand)
+                else:
+                    generic_policy = dict(generic_policy)
+                generic_policy["_generic_priority_by_lot"] = generic_priority_by_lot
                 generic_barem_plan, missing_barem, selected_codes, generic_plan_note = choose_barem_generic_plan(
                     sale,
                     candidates,
-                    policy,
+                    generic_policy,
                     barem_map,
                 )
                 missing_barem_report.extend(missing_barem)
                 selected_generic_codes = set(selected_codes)
-                candidates = [lot for lot in candidates if lot.get("variant_code") in selected_generic_codes]
+                candidates = [lot for lot in candidates if lot.get("_normalized_variant_code") in selected_generic_codes]
             else:
                 selected_lots = []
                 selected_codes = []
@@ -1688,25 +2620,47 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
             margin = None
             if sale["unit_price"] is not None and lot["unit_price"] is not None:
                 margin = sale["unit_price"] - lot["unit_price"]
+            barem_weight = lot.get("barem_weight")
+            tolerance_kg = (
+                clean_quantity(barem_remainder)
+                if isinstance(barem_remainder, (int, float)) and not isinstance(barem_remainder, bool)
+                else 0.0
+            )
+            theoretical_amount = clean_quantity(amount - tolerance_kg)
+            barem_multiple = (
+                max(0, int(math.floor((theoretical_amount / barem_weight) + 0.5)))
+                if barem_weight else None
+            )
             used.append({
                 "variant_code": lot["variant_code"],
                 "purchase_variant_code": lot["variant_code"],
                 "purchase_source_variant_code": lot.get("source_variant_code", lot["variant_code"]),
                 "sale_variant_code": sale["variant_code"],
                 "sale_source_variant_code": sale.get("source_variant_code", sale["variant_code"]),
-                "ledger_variant_code": lot["variant_code"] if is_son_phuong else (sale["variant_code"] if allow_negative_export else lot["variant_code"]),
+                # Matched stock must keep the purchase variant that supplied
+                # both its inventory quantity and cost.
+                "ledger_variant_code": lot["variant_code"],
                 "steel_profile_key": lot.get("steel_profile_key", ""),
                 "source": lot["source"],
                 "invoice_no": lot.get("invoice_no", ""),
                 "invoice_date": lot.get("invoice_date", ""),
                 "invoice_date_iso": lot.get("invoice_date_iso", ""),
                 "row_number": lot["row_number"],
+                "purchase_product_name": lot.get("product_name", ""),
+                "purchase_party_name": lot.get("party_name", ""),
+                "purchase_party_tax_code": lot.get("party_tax_code", ""),
+                "purchase_unit_name": lot.get("unit_name", ""),
                 "quantity": amount,
                 "unit_cost": lot["unit_price"],
                 "profit_per_unit": margin,
                 "profit_percent": lot_margin_percent(lot, sale["unit_price"]),
                 "summary_count": lot.get("summary_count", 1),
-                "barem_weight": lot.get("barem_weight"),
+                "barem_weight": barem_weight,
+                "barem_multiple": barem_multiple,
+                "barem_remainder_kg": tolerance_kg,
+                "barem_source": lot.get("barem_source", ""),
+                "barem_method": lot.get("barem_method", ""),
+                "barem_references": lot.get("barem_references", []),
                 "barem_remainder": barem_remainder,
                 "future_purchase_reordered": id(lot) in future_reorder_ids,
                 "future_reorder_days": future_purchase_days(lot, sale) if id(lot) in future_reorder_ids else None,
@@ -1717,7 +2671,8 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                 "future_reorder_sale_invoice_no": sale.get("invoice_no", "") if id(lot) in future_reorder_ids else "",
                 "future_reorder_sale_row": sale.get("row_number", "") if id(lot) in future_reorder_ids else "",
                 "logic_note": (
-                    f"Phan du cuoi {format_number(amount)} kg khong tron boi so barem."
+                    f"Dung sai barem cuoi {format_number(tolerance_kg)} kg; "
+                    f"hoa don {format_number(amount)} kg, ly thuyet {format_number(theoretical_amount)} kg."
                     if barem_remainder else ""
                 ),
             })
@@ -1727,11 +2682,36 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                     f"HD ban ra ngay {sale.get('invoice_date', '')} trong {future_purchase_days(lot, sale)} ngay."
                 )
                 used[-1]["logic_note"] = f"{used[-1].get('logic_note', '')} {note}".strip()
+        if specific_reservation_plan:
+            accepted_lot_ids = {id(lot) for lot in candidates}
+            for lot, reserved_amount in specific_reservation_plan:
+                if remaining <= QUANTITY_EPSILON:
+                    break
+                if id(lot) not in accepted_lot_ids or not lot_available_for_sale(lot, sale):
+                    continue
+                amount = clean_quantity(min(
+                    remaining,
+                    reserved_amount,
+                    lot.get("remaining_quantity", 0),
+                ))
+                if amount <= QUANTITY_EPSILON:
+                    continue
+                consume_lot(lot, amount)
+                lot["specific_reserved_quantity"] = clean_quantity(max(
+                    0,
+                    lot.get("specific_reserved_quantity", 0) - amount,
+                ))
+                used[-1]["specific_stock_reserved"] = True
+
+        def consumable_quantity(lot):
+            if is_son_phuong:
+                return lot_unreserved_quantity(lot)
+            return clean_quantity(lot.get("remaining_quantity", 0))
         if is_generic_sale and generic_barem_plan is not None:
             for lot, planned_amount, _ratio, is_remainder in generic_barem_plan:
                 if remaining <= QUANTITY_EPSILON:
                     break
-                consume_lot(lot, min(remaining, planned_amount, lot["remaining_quantity"]), barem_remainder=is_remainder)
+                consume_lot(lot, min(remaining, planned_amount, consumable_quantity(lot)), barem_remainder=is_remainder)
         elif is_generic_sale and generic_first_pass_targets:
             for lot in candidates:
                 if remaining <= QUANTITY_EPSILON:
@@ -1739,7 +2719,7 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                 code = lot.get("variant_code", "")
                 target = generic_first_pass_targets.get(code, 0)
                 already_used = sum(item["quantity"] for item in used if item.get("variant_code") == code)
-                amount = min(remaining, lot["remaining_quantity"], max(0, target - already_used))
+                amount = min(remaining, consumable_quantity(lot), max(0, target - already_used))
                 consume_lot(lot, amount)
         if generic_barem_plan is None:
             for lot in candidates:
@@ -1747,9 +2727,9 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                     break
                 if selected_generic_codes is not None and lot.get("variant_code") not in selected_generic_codes:
                     continue
-                amount = min(remaining, lot["remaining_quantity"])
+                amount = min(remaining, consumable_quantity(lot))
                 consume_lot(lot, amount)
-        if is_son_phuong and remaining > QUANTITY_EPSILON:
+        if is_son_phuong and sale_role == "materials" and remaining > QUANTITY_EPSILON:
             if not lot_pool:
                 shortage_reason = "Khong co ma mua vao dung nhom ong/hop va den/ma kem."
             elif not available_lots:
@@ -1761,7 +2741,7 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
             warnings.append(f"{sale['variant_code']}: chua ghep du {format_number(remaining)} kg; {shortage_reason}")
         else:
             shortage_reason = ""
-        if is_son_phuong and allow_negative_export and remaining > QUANTITY_EPSILON:
+        if is_son_phuong and sale_role == "materials" and allow_negative_export and remaining > QUANTITY_EPSILON:
             fallback_lots = sorted(lot_pool, key=lambda lot: priority_fn(lot, sale["unit_price"]))
             fallback_lot = fallback_lots[0] if fallback_lots else {}
             unit_cost = fallback_lot.get("unit_price")
@@ -1777,12 +2757,18 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
                 "invoice_no": fallback_lot.get("invoice_no", ""),
                 "invoice_date": fallback_lot.get("invoice_date", ""),
                 "row_number": fallback_lot.get("row_number", sale.get("row_number", 0)),
+                "purchase_product_name": fallback_lot.get("product_name", ""),
+                "purchase_party_name": fallback_lot.get("party_name", ""),
+                "purchase_party_tax_code": fallback_lot.get("party_tax_code", ""),
+                "purchase_unit_name": fallback_lot.get("unit_name", ""),
                 "quantity": remaining,
                 "unit_cost": unit_cost,
                 "profit_per_unit": (sale["unit_price"] - unit_cost) if sale["unit_price"] is not None and unit_cost is not None else None,
                 "profit_percent": lot_margin_percent(fallback_lot, sale["unit_price"]) if fallback_lot else None,
                 "summary_count": fallback_lot.get("summary_count", 1),
                 "negative_export": True,
+                "barem_unallocated": bool(is_generic_sale),
+                "barem_weight": fallback_lot.get("barem_weight"),
                 "logic_note": shortage_reason if is_son_phuong else "",
             })
             remaining = 0
@@ -1793,19 +2779,36 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
             warnings.append(f"{sale['variant_code']}: có {len(rejected)} lô kho không đạt khoảng lãi/lỗ chấp nhận.")
         if generic_plan_note:
             warnings.append(f"{sale['variant_code']}: {generic_plan_note}")
+        unresolved_material_quantity = clean_quantity(remaining) if is_son_phuong and sale_role == "materials" else 0.0
+        if unresolved_material_quantity > QUANTITY_EPSILON:
+            warnings.append(
+                f"{sale['variant_code']}: còn thiếu {format_number(unresolved_material_quantity)} kg KHHVT thực; "
+                "không tạo xuất âm và không thể tạo FDI bán ra cho đến khi xử lý xong."
+            )
         finished_variant_code = sale["variant_code"]
         if remaining > QUANTITY_EPSILON:
             fallback_lots = sorted(lot_pool, key=lambda lot: priority_fn(lot, sale["unit_price"]))
             if fallback_lots:
                 finished_variant_code = fallback_lots[0].get("variant_code") or finished_variant_code
+        remainder_role = "finished_goods" if sale_role == "finished_goods" else "fallback"
+        remainder_pair = sales_pair_map.get(remainder_role, {"ma_kho": "KTP", "tk_vat_tu": "155"}) if is_son_phuong else {}
+
         allocations.append({
             **sale,
+            "allocation_role": sale_role,
+            "warehouse_code": material_pair.get("ma_kho", "") if is_son_phuong else sale.get("warehouse_code", ""),
+            "warehouse_account": material_pair.get("tk_vat_tu", "") if is_son_phuong else sale.get("warehouse_account", ""),
+            "remainder_warehouse_code": remainder_pair.get("ma_kho", "") if is_son_phuong else "",
+            "remainder_warehouse_account": remainder_pair.get("tk_vat_tu", "") if is_son_phuong else "",
+            "negative_warning": bool(is_son_phuong and sale_role == "materials" and any(item.get("negative_export") for item in used)),
+            "unresolved_material_quantity": unresolved_material_quantity,
             "material_quantity": material_quantity,
-            "finished_quantity": clean_quantity(remaining),
+            "finished_quantity": 0.0 if unresolved_material_quantity > QUANTITY_EPSILON else clean_quantity(remaining),
             "finished_variant_code": finished_variant_code,
             "sale_split_codes": ", ".join(dict.fromkeys(
                 item.get("ledger_variant_code") or item.get("purchase_variant_code") or item.get("variant_code", "")
                 for item in used
+                if not item.get("barem_unallocated")
             )),
             "used": used,
             "rejected": rejected,
@@ -1873,6 +2876,10 @@ def allocate_stock(opening_lines, purchase_lines, sales_lines, policy=None, prog
             for line in allocations
             for used in line.get("used", [])
             if used.get("negative_export")
+        )),
+        "unresolved_material_quantity": clean_quantity(sum(
+            line.get("unresolved_material_quantity", 0) or 0
+            for line in allocations
         )),
     }
     summary["material_percent"] = (
@@ -2225,7 +3232,7 @@ def normalize_warehouse_code(value):
 
 
 def warehouse_sort_key(warehouse_code):
-    warehouse_order = {MATERIAL_WAREHOUSE_CODE: 0, "KTP": 1, "KHH": 0}
+    warehouse_order = {MATERIAL_WAREHOUSE_CODE: 0, "KHHVT": 0, "KTP": 1, "KHOCK": 2, "KHH": 0}
     code = normalize_warehouse_code(warehouse_code) or ""
     return (warehouse_order.get(code, 20), code)
 
@@ -2245,6 +3252,8 @@ def default_warehouse_name(code):
         MATERIAL_WAREHOUSE_CODE: "KHO VẬT TƯ, HÀNG HÓA",
         "KHH": "KHO VẬT TƯ, HÀNG HÓA",
         "KTP": "KHO THÀNH PHẨM",
+        "KHHVT": "KHO HANG HOA VAT TU",
+        "KHOCK": "KHO SAN PHAM CON LAI",
     }
     return known.get(code, f"KHO {code}")
 
@@ -2255,6 +3264,8 @@ def default_warehouse_account(code):
         MATERIAL_WAREHOUSE_CODE: "152",
         "KHH": "152",
         "KTP": "155",
+        "KHHVT": "156",
+        "KHOCK": "159",
     }
     return known.get(code, "")
 
@@ -2268,6 +3279,9 @@ def allocation_sale_warehouse_account(allocation, fallback=""):
 
 
 def allocation_remainder_warehouse_code(allocation, fallback="KTP"):
+    explicit = normalize_code(allocation.get("remainder_warehouse_code"))
+    if explicit:
+        return explicit
     sale_warehouse_code = allocation_sale_warehouse_code(allocation, "")
     if normalize_warehouse_code(sale_warehouse_code) == MATERIAL_WAREHOUSE_CODE:
         return normalize_code(fallback) or "KTP"
@@ -2275,12 +3289,17 @@ def allocation_remainder_warehouse_code(allocation, fallback="KTP"):
 
 
 def allocation_remainder_warehouse_account(allocation, fallback=""):
+    explicit = text(allocation.get("remainder_warehouse_account"))
+    if explicit:
+        return explicit
     warehouse_code = allocation_remainder_warehouse_code(allocation, "KTP")
     return line_warehouse_account(allocation, fallback or default_warehouse_account(warehouse_code))
 
 
 def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lines=None, company_profile="yen_thanh"):
     warehouses = {}
+    material_warehouse_code = "KHHVT" if company_profile == "son_phuong" else MATERIAL_WAREHOUSE_CODE
+    material_warehouse_account = "156" if company_profile == "son_phuong" else default_warehouse_account(material_warehouse_code)
 
     def ensure_warehouse(warehouse_code, account=""):
         code = normalize_warehouse_code(warehouse_code or MATERIAL_WAREHOUSE_CODE) or MATERIAL_WAREHOUSE_CODE
@@ -2431,8 +3450,8 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
         if quantity <= QUANTITY_EPSILON:
             continue
         amount = unit_price * quantity if unit_price is not None else 0
-        warehouse_code = line_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
-        account = line_warehouse_account(line, default_warehouse_account(warehouse_code))
+        warehouse_code = line_warehouse_code(line, material_warehouse_code)
+        account = line_warehouse_account(line, material_warehouse_account or default_warehouse_account(warehouse_code))
         ensure_warehouse(warehouse_code, account)
         group_for(warehouse_code, line["variant_code"], line.get("product_name", ""), line.get("unit_name", ""))["rows"].append({
             "type": "opening",
@@ -2462,8 +3481,8 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
         row_date_iso = future_reorder.get("effective_date_iso") if future_reorder else line.get("invoice_date_iso", "")
         row_date = future_reorder.get("effective_date") if future_reorder else line.get("invoice_date", "")
         sequence = future_reorder.get("sequence") if future_reorder else line.get("row_number", 0)
-        warehouse_code = line_warehouse_code(line, MATERIAL_WAREHOUSE_CODE)
-        account = line_warehouse_account(line, default_warehouse_account(warehouse_code))
+        warehouse_code = line_warehouse_code(line, material_warehouse_code)
+        account = line_warehouse_account(line, material_warehouse_account or default_warehouse_account(warehouse_code))
         route_key = (line.get("variant_code", ""), line.get("invoice_date_iso", ""))
         route = purchase_route_destinations.get(route_key)
         if route:
@@ -2576,7 +3595,7 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
             if clean_quantity(used.get("quantity", 0)) > QUANTITY_EPSILON
         ]
         finished_quantity = clean_quantity(allocation.get("finished_quantity", 0))
-        if finished_quantity > QUANTITY_EPSILON and company_profile != "son_phuong":
+        if finished_quantity > QUANTITY_EPSILON:
             sale_split_entries.append(("finished", None))
         sale_split_quantities = [
             clean_quantity(item.get("quantity", 0)) if kind == "used" else finished_quantity
@@ -2637,7 +3656,7 @@ def build_inventory_ledger(opening_lines, purchase_lines, allocations, sales_lin
                 "cost_missing": cost_missing,
                 "sequence": allocation.get("row_number", 0) * 1000 + index,
             })
-        if finished_quantity > QUANTITY_EPSILON and company_profile != "son_phuong":
+        if finished_quantity > QUANTITY_EPSILON:
             finished_index = len(sale_split_entries) - 1
             code = allocation.get("finished_variant_code") or allocation.get("variant_code", "")
             unit_price = 0
@@ -4111,7 +5130,7 @@ def create_output_workbook(
     generated_sheet_names = {
         "PhanBoKho", "TonKhoHangHoa", "TongHopNhapXuatTon", "TongHopKho", "KiemTraDoiChieu",
         "MaChiBanRaKhongTon", "MaThieuBarem", "MaThepKhongRo", "MauMuaVao", "MauBanRa",
-        "HDMuaVaoDuaLenTruoc",
+        "HDMuaVaoDuaLenTruoc", "ChiTietPhanKho", "PhuongAnOngHop", "XuatAmKHHVT",
     }
     generated_sheet_prefixes = ("SoChiTiet", "TongHopNXT_", "BaoCaoBH_", "BangKeHDBH_")
     for removed_sheet in list(workbook.sheetnames):
@@ -4170,6 +5189,133 @@ def create_output_workbook(
         ["Lãi tối đa chấp nhận (%)", policy["max_profit_percent"] if policy["max_profit_percent"] is not None else "Không giới hạn"],
     ], status_callback=status_reporter("Đang định dạng tổng hợp kho..."))
     report(1, "Đã ghi tổng hợp kho.")
+
+    if policy.get("company_profile") == "son_phuong":
+        allocation_detail_rows = []
+        negative_rows = []
+        scenario_rows = []
+        for allocation in allocations:
+            common = [
+                allocation.get("invoice_date", ""),
+                allocation.get("invoice_no", ""),
+                allocation.get("row_number", ""),
+                allocation.get("product_name", ""),
+                allocation.get("variant_code", ""),
+                allocation.get("quantity", 0),
+                allocation.get("allocation_role", ""),
+            ]
+            for used in allocation.get("used", []):
+                warehouse_code = allocation.get("warehouse_code", "KHHVT")
+                warehouse_account = allocation.get("warehouse_account", "156")
+                detail_row = common + [
+                    used.get("ledger_variant_code") or used.get("variant_code", ""),
+                    used.get("quantity", 0),
+                    warehouse_code,
+                    warehouse_account,
+                    used.get("invoice_date", ""),
+                    used.get("invoice_no", ""),
+                    used.get("row_number", ""),
+                    "X" if used.get("negative_export") else "",
+                    used.get("logic_note", ""),
+                ]
+                allocation_detail_rows.append(detail_row)
+                if used.get("negative_export"):
+                    negative_rows.append(detail_row)
+            if allocation.get("finished_quantity", 0) > QUANTITY_EPSILON:
+                allocation_detail_rows.append(common + [
+                    allocation.get("finished_variant_code") or allocation.get("variant_code", ""),
+                    allocation.get("finished_quantity", 0),
+                    allocation.get("remainder_warehouse_code", ""),
+                    allocation.get("remainder_warehouse_account", ""),
+                    "", "", "", "",
+                    allocation.get("generic_plan_note", ""),
+                ])
+            if allocation.get("generic_plan_note"):
+                before_by_code = {}
+                after_by_code = {}
+                for snapshot_item in allocation.get("inventory_before", []):
+                    snapshot_code = normalize_code(snapshot_item.get("variant_code", ""))
+                    before_by_code[snapshot_code] = clean_quantity(
+                        before_by_code.get(snapshot_code, 0) + (snapshot_item.get("quantity", 0) or 0)
+                    )
+                for snapshot_item in allocation.get("inventory_after", []):
+                    snapshot_code = normalize_code(snapshot_item.get("variant_code", ""))
+                    after_by_code[snapshot_code] = clean_quantity(
+                        after_by_code.get(snapshot_code, 0) + (snapshot_item.get("quantity", 0) or 0)
+                    )
+                for used in allocation.get("used", []):
+                    profile_key = used.get("steel_profile_key", "")
+                    profile_parts = profile_key.split("|", 2) if profile_key else []
+                    split_code = used.get("ledger_variant_code") or used.get("variant_code", "")
+                    split_quantity = used.get("quantity", 0) or 0
+                    sale_amount = amount_for_quantity(allocation, split_quantity)
+                    unit_cost = used.get("unit_cost")
+                    cost_amount = unit_cost * split_quantity if unit_cost is not None else None
+                    normalized_split_code = normalize_code(split_code)
+                    before_qty = before_by_code.get(normalized_split_code, 0)
+                    after_qty = after_by_code.get(normalized_split_code, 0)
+                    scenario_rows.append([
+                        allocation.get("invoice_date", ""), allocation.get("invoice_no", ""), allocation.get("row_number", ""),
+                        allocation.get("party_tax_code", ""), allocation.get("party_name", ""),
+                        allocation.get("product_name", ""), allocation.get("variant_code", ""), allocation.get("quantity", 0),
+                        allocation.get("unit_name", ""), allocation.get("unit_price", ""), allocation.get("line_amount", ""),
+                        profile_parts[0] if len(profile_parts) == 3 else "", profile_parts[1] if len(profile_parts) == 3 else "", profile_parts[2] if len(profile_parts) == 3 else "",
+                        split_code, used.get("purchase_product_name", ""), split_quantity,
+                        used.get("barem_weight", ""), used.get("barem_multiple", ""), used.get("barem_remainder_kg", 0), used.get("barem_source", ""), used.get("barem_method", ""), ", ".join(used.get("barem_references") or []),
+                        allocation.get("warehouse_code", "KHHVT"), allocation.get("warehouse_account", "156"),
+                        used.get("invoice_date", ""), used.get("invoice_no", ""), used.get("row_number", ""), used.get("purchase_party_tax_code", ""), used.get("purchase_party_name", ""),
+                        unit_cost, cost_amount, sale_amount, (sale_amount - cost_amount) if sale_amount is not None and cost_amount is not None else None,
+                        before_qty, after_qty, "X" if used.get("negative_export") else "", "X" if used.get("barem_unallocated") else "",
+                        used.get("logic_note", "") or allocation.get("generic_plan_note", ""),
+                    ])
+            if False and allocation.get("generic_plan_note"):
+                scenario_rows.append([
+                    allocation.get("invoice_date", ""),
+                    allocation.get("invoice_no", ""),
+                    allocation.get("row_number", ""),
+                    allocation.get("product_name", ""),
+                    allocation.get("quantity", 0),
+                    allocation.get("sale_split_codes", ""),
+                    allocation.get("generic_plan_note", ""),
+                ])
+
+        scenario_headers = [
+            "Ng\u00e0y H\u0110 b\u00e1n", "S\u1ed1 H\u0110 b\u00e1n", "D\u00f2ng b\u00e1n", "MST kh\u00e1ch", "Kh\u00e1ch h\u00e0ng",
+            "T\u00ean h\u00e0ng b\u00e1n g\u1ed1c", "M\u00e3 VT b\u00e1n g\u1ed1c", "SL b\u00e1n g\u1ed1c", "\u0110VT b\u00e1n", "\u0110\u01a1n gi\u00e1 b\u00e1n", "Ti\u1ec1n b\u00e1n g\u1ed1c",
+            "Lo\u1ea1i", "B\u1ec1 m\u1eb7t", "K\u00edch th\u01b0\u1edbc / kh\u00f3a k\u1ef9 thu\u1eadt", "M\u00e3 VT \u0111\u00e3 t\u00e1ch", "T\u00ean v\u1eadt t\u01b0 mua",
+            "Kh\u1ed1i l\u01b0\u1ee3ng t\u00e1ch", "Kg / barem", "S\u1ed1 thanh nguy\u00ean", "Kg l\u1ebb cu\u1ed1i", "Ngu\u1ed3n barem", "Ph\u01b0\u01a1ng ph\u00e1p barem", "Barem tham chi\u1ebfu",
+            "M\u00e3 kho", "TK v\u1eadt t\u01b0", "Ng\u00e0y H\u0110 mua", "S\u1ed1 H\u0110 mua", "D\u00f2ng mua", "MST nh\u00e0 cung c\u1ea5p", "Nh\u00e0 cung c\u1ea5p",
+            "\u0110\u01a1n gi\u00e1 v\u1ed1n", "Ti\u1ec1n v\u1ed1n", "Ti\u1ec1n b\u00e1n ph\u00e2n b\u1ed5", "L\u00e3i/l\u1ed7", "T\u1ed3n tr\u01b0\u1edbc", "T\u1ed3n sau",
+            "Xu\u1ea5t \u00e2m KHHVT", "Ch\u01b0a ph\u00e2n b\u1ed5 theo barem", "L\u00fd do / ghi ch\u00fa",
+        ]
+
+        allocation_headers = [
+            "Ng\u00e0y H\u0110 b\u00e1n", "S\u1ed1 H\u0110 b\u00e1n", "D\u00f2ng b\u00e1n", "T\u00ean h\u00e0ng b\u00e1n",
+            "M\u00e3 VT b\u00e1n", "SL b\u00e1n", "Vai tr\u00f2", "M\u00e3 VT ph\u00e2n kho", "SL ph\u00e2n kho",
+            "M\u00e3 kho", "TK v\u1eadt t\u01b0", "Ng\u00e0y H\u0110 mua", "S\u1ed1 H\u0110 mua", "D\u00f2ng mua",
+            "Xu\u1ea5t \u00e2m KHHVT", "Ghi ch\u00fa",
+        ]
+        write_table(
+            replace_sheet(workbook, "ChiTietPhanKho"),
+            allocation_headers,
+            allocation_detail_rows,
+            progress_callback=row_reporter("\u0110ang ghi chi ti\u1ebft Ph\u00e2n kho"),
+            status_callback=status_reporter("\u0110ang \u0111\u1ecbnh d\u1ea1ng chi ti\u1ebft Ph\u00e2n kho..."),
+        )
+        write_table(
+            replace_sheet(workbook, "PhuongAnOngHop"),
+            scenario_headers,
+            scenario_rows,
+            progress_callback=row_reporter("\u0110ang ghi ph\u01b0\u01a1ng \u00e1n \u1ed1ng/h\u1ed9p"),
+            status_callback=status_reporter("\u0110ang \u0111\u1ecbnh d\u1ea1ng ph\u01b0\u01a1ng \u00e1n \u1ed1ng/h\u1ed9p..."),
+        )
+        write_table(
+            replace_sheet(workbook, "XuatAmKHHVT"),
+            allocation_headers,
+            negative_rows,
+            progress_callback=row_reporter("\u0110ang ghi xu\u1ea5t \u00e2m KHHVT"),
+            status_callback=status_reporter("\u0110ang \u0111\u1ecbnh d\u1ea1ng xu\u1ea5t \u00e2m KHHVT..."),
+        )
 
     write_verification_sheet(workbook, verification_rows)
     report(len(verification_rows), "Đã ghi kiểm tra đối chiếu dữ liệu.")
@@ -4421,7 +5567,18 @@ def purchase_classification_preview():
         return jsonify({"error": str(exc)}), 400
 
 
-def analysis_payload(purchase_content, sales_content, opening_content, raw_mapping, policy, sales_filename, progress=None, barem_content=None):
+def analysis_payload(
+    purchase_content,
+    sales_content,
+    opening_content,
+    raw_mapping,
+    policy,
+    sales_filename,
+    progress=None,
+    barem_content=None,
+    defer_workbook=False,
+    result_job_id=None,
+):
     progress = progress or (lambda _percent, _label, *_row_progress: None)
     progress(5, "Đang đọc cấu hình cột...")
     purchase_mapping = clean_mapping(raw_mapping, "purchase")
@@ -4466,50 +5623,65 @@ def analysis_payload(purchase_content, sales_content, opening_content, raw_mappi
     summary["sale_only_code_count"] = len(sale_only_codes)
     missing_barem_report = summary.get("missing_barem_report", [])
 
-    progress(74, "Đang dựng sổ chi tiết theo các kho trong file bán ra...")
-    ledger = build_inventory_ledger(
-        opening_lines,
-        purchase_lines,
-        allocations,
-        sales_lines=sales_lines,
-        company_profile=company_profile,
-    )
-    ledger["date_range"] = iso_in_line_range(purchase_lines, sales_lines)
-    sales_report_rows = build_sales_report_rows_from_ledger(ledger) if ledger else build_sales_report_rows(allocations, purchase_lines, sales_lines)
-    verification_rows = build_verification_rows(
-        purchase_lines,
-        sales_lines,
-        allocations,
-        ledger,
-        sales_report_rows,
-        policy,
-    )
+    if defer_workbook:
+        ledger = {}
+        sales_report_rows = []
+        verification_rows = []
+        progress(74, "Đã hoàn tất tính Phân kho. Sổ chi tiết sẽ được dựng khi mở Báo cáo.")
+    else:
+        progress(74, "Đang dựng sổ chi tiết theo các kho trong file bán ra...")
+        ledger = build_inventory_ledger(
+            opening_lines,
+            purchase_lines,
+            allocations,
+            sales_lines=sales_lines,
+            company_profile=company_profile,
+        )
+        ledger["date_range"] = iso_in_line_range(purchase_lines, sales_lines)
+        sales_report_rows = build_sales_report_rows_from_ledger(ledger) if ledger else build_sales_report_rows(allocations, purchase_lines, sales_lines)
+        verification_rows = build_verification_rows(
+            purchase_lines,
+            sales_lines,
+            allocations,
+            ledger,
+            sales_report_rows,
+            policy,
+        )
 
-    def output_progress(done, total, label):
-        ratio = done / total if total else 1
-        progress(78 + ratio * 16, label, done, total)
+    filename = output_filename(sales_filename)
+    if defer_workbook:
+        job_id = result_job_id or uuid.uuid4().hex
+        progress(94, "Đã hoàn tất Phân kho. File báo cáo sẽ được tạo khi bấm Xuất.")
+    else:
+        def output_progress(done, total, label):
+            ratio = done / total if total else 1
+            progress(78 + ratio * 16, label, done, total)
 
-    progress(78, "Đang tạo file Excel xuất...")
-    output = create_output_workbook(
-        sales_content,
-        sales_mapping,
-        allocations,
-        stock_rows,
-        summary,
-        policy,
-        sale_only_codes,
-        purchase_lines=purchase_lines,
-        sales_lines=sales_lines,
-        progress_callback=output_progress,
-        ledger=ledger,
-        missing_barem_report=missing_barem_report,
-        ambiguous_steel_rows=ambiguous_steel_rows,
-    )
-    progress(94, "Đang lưu file kết quả...")
-    job_id, filename, _ = save_output(output, sales_filename)
-    progress(99, "Đang chuẩn bị giao diện báo cáo...")
-    report_view = report_view_for_ui(ledger, sales_report_rows)
-    return {
+        progress(78, "Đang tạo file Excel xuất...")
+        output = create_output_workbook(
+            sales_content,
+            sales_mapping,
+            allocations,
+            stock_rows,
+            summary,
+            policy,
+            sale_only_codes,
+            purchase_lines=purchase_lines,
+            sales_lines=sales_lines,
+            progress_callback=output_progress,
+            ledger=ledger,
+            missing_barem_report=missing_barem_report,
+            ambiguous_steel_rows=ambiguous_steel_rows,
+        )
+        progress(94, "Đang lưu file kết quả...")
+        job_id, filename, _ = save_output(output, sales_filename)
+    if defer_workbook:
+        report_view = None
+        progress(99, "Đã sẵn sàng Review Phân kho.")
+    else:
+        progress(99, "Đang chuẩn bị giao diện báo cáo...")
+        report_view = report_view_for_ui(ledger, sales_report_rows)
+    result = {
         "job_id": job_id,
         "filename": filename,
         "summary": summary,
@@ -4546,8 +5718,16 @@ def analysis_payload(purchase_content, sales_content, opening_content, raw_mappi
             "invoice_date_iso": item.get("invoice_date_iso", ""),
             "sale_split_codes": item.get("sale_split_codes", ""),
             "material_quantity": item["material_quantity"],
+            "unresolved_material_quantity": item.get("unresolved_material_quantity", 0),
             "finished_quantity": item["finished_quantity"],
             "finished_variant_code": item.get("finished_variant_code", item.get("variant_code", "")),
+            "allocation_role": item.get("allocation_role", ""),
+            "warehouse_code": item.get("warehouse_code", ""),
+            "warehouse_account": item.get("warehouse_account", ""),
+            "remainder_warehouse_code": item.get("remainder_warehouse_code", ""),
+            "remainder_warehouse_account": item.get("remainder_warehouse_account", ""),
+            "negative_warning": bool(item.get("negative_warning")),
+            "generic_plan_note": item.get("generic_plan_note", ""),
             "inventory_before": item["inventory_before"],
             "used": item["used"],
             "inventory_after": item["inventory_after"],
@@ -4559,6 +5739,20 @@ def analysis_payload(purchase_content, sales_content, opening_content, raw_mappi
         } for item in allocations],
         "stock_rows": stock_rows,
     }
+    if defer_workbook:
+        result.update({
+            # Keep the complete allocation rows server-side. The compact public
+            # rows intentionally omit financial fields, so they cannot rebuild
+            # revenue/tax reports later without this private copy.
+            "_allocations": allocations,
+            "_sales_content": sales_content,
+            "_sales_mapping": sales_mapping,
+            "_purchase_lines": purchase_lines,
+            "_sales_lines": sales_lines,
+            "_opening_lines": opening_lines,
+            "_ambiguous_steel_rows": ambiguous_steel_rows,
+        })
+    return result
 
 
 def update_analysis_job(job_id, **fields):
@@ -4573,7 +5767,17 @@ def get_analysis_job(job_id):
         return dict(job) if job else None
 
 
-def run_analysis_job(job_id, purchase_content, sales_content, opening_content, raw_mapping, policy, sales_filename, barem_content=None):
+def run_analysis_job(
+    job_id,
+    purchase_content,
+    sales_content,
+    opening_content,
+    raw_mapping,
+    policy,
+    sales_filename,
+    barem_content=None,
+    defer_workbook=False,
+):
     def progress(percent, label, done=None, total=None):
         fields = {"status": "running", "progress": round(percent), "label": label}
         if done is not None and total is not None:
@@ -4597,6 +5801,8 @@ def run_analysis_job(job_id, purchase_content, sales_content, opening_content, r
             sales_filename,
             progress=progress,
             barem_content=barem_content,
+            defer_workbook=defer_workbook,
+            result_job_id=job_id,
         )
         update_analysis_job(job_id, status="complete", progress=100, done=0, total=0, label="Hoàn tất phân bổ tồn kho.", result=result)
     except Exception as exc:

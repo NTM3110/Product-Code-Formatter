@@ -34,7 +34,7 @@ from product_code.release_version import NOTES as RELEASE_NOTES, VERSION as RELE
 
 APP_VERSION = RELEASE_VERSION
 APP_RELEASE_NOTES = RELEASE_NOTES
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 LEGACY_VIETMAX_STORAGE_PROFILES = {"vietmax_mua_vao", "vietmax_ban_ra"}
 LOCAL_KEYGEN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 XLS_MAX_ROWS = 65536
@@ -55,24 +55,27 @@ class CustomJSONProvider(DefaultJSONProvider):
         return super().default(o)
 
 
+SOURCE_DIR = Path(__file__).resolve().parent
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ProductCodeFormatter"
-LEGACY_REPO_CONFIG_PATH = Path(__file__).resolve().parent / "product_code_config.json"
+LEGACY_REPO_CONFIG_PATH = SOURCE_DIR / "product_code_config.json"
 
 if getattr(sys, "frozen", False):
     BASE_DIR = APP_DATA_DIR
     STATIC_DIR = Path(getattr(sys, "_MEIPASS", str(BASE_DIR))) / "static"
     RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", str(BASE_DIR)))
 else:
-    BASE_DIR = Path(__file__).resolve().parent
-    STATIC_DIR = BASE_DIR / "static"
-    RESOURCE_DIR = BASE_DIR
+    raw_runtime_dir = os.environ.get("PRODUCT_CODE_FORMATTER_RUNTIME_DIR")
+    BASE_DIR = Path(raw_runtime_dir).resolve() if raw_runtime_dir else SOURCE_DIR
+    STATIC_DIR = SOURCE_DIR / "static"
+    RESOURCE_DIR = SOURCE_DIR
 
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
-CONFIG_PATH = APP_DATA_DIR / "product_code_config.json"
+_configured_config_path = os.environ.get("PRODUCT_CODE_FORMATTER_CONFIG_PATH", "").strip()
+CONFIG_PATH = Path(_configured_config_path).expanduser().resolve() if _configured_config_path else APP_DATA_DIR / "product_code_config.json"
 LICENSE_PATH = APP_DATA_DIR / "license.json"
 DEFAULT_FORM_MAPPINGS_PATH = APP_DATA_DIR / "default_form_mappings.json"
-CONFIG_BACKUP_DIR = APP_DATA_DIR / "config_backups"
+CONFIG_BACKUP_DIR = CONFIG_PATH.parent / "config_backups"
 TEMPLATE_DIR = APP_DATA_DIR / "templates"
 ICON_PATH = RESOURCE_DIR / "app_icon.ico"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -230,12 +233,51 @@ def empty_profile_config(profile_key_name=None, include_scopes=True):
         "company_group_assignments": {},
         "form_mapping_presets": [],
         "form_mapping_initialized": False,
+        "disabled_default_form_ids": [],
         "columns": {},
     }
+    if profile_key_name == "ho_guom":
+        config["processing_groups"] = [
+            {
+                "id": "materials",
+                "label": "Nhóm vật tư",
+                "builtin": True,
+                "uses_product_code": True,
+                "forms": [],
+            },
+            {
+                "id": "services",
+                "label": "Nhóm dịch vụ",
+                "builtin": True,
+                "uses_product_code": True,
+                "forms": [],
+            },
+            {
+                "id": "payment_voucher",
+                "label": "Nhóm phiếu chi",
+                "builtin": True,
+                "uses_product_code": True,
+                "forms": [],
+            },
+            {
+                "id": "ignored",
+                "label": "Không xử lý",
+                "builtin": True,
+                "uses_product_code": False,
+                "forms": [],
+            },
+        ]
     if include_scopes:
+        purchase_scope = empty_profile_config(profile_key_name, include_scopes=False)
+        sales_scope = empty_profile_config(profile_key_name, include_scopes=False)
+        if profile_key_name == "son_phuong":
+            purchase_scope["inventory_pairs"] = son_phuong_purchase_inventory_pairs()
+            purchase_scope["use_default_inventory_pair"] = True
+            purchase_scope["default_inventory_pair_id"] = "son-phuong-purchase-materials"
+            config["inventory_allocation_config"] = normalize_son_phuong_allocation_config({})
         config["scopes"] = {
-            VIETMAX_PHASE_PURCHASE: empty_profile_config(profile_key_name, include_scopes=False),
-            VIETMAX_PHASE_SALES: empty_profile_config(profile_key_name, include_scopes=False),
+            VIETMAX_PHASE_PURCHASE: purchase_scope,
+            VIETMAX_PHASE_SALES: sales_scope,
         }
     return config
 
@@ -467,12 +509,70 @@ def normalize_inventory_pairs(value):
         tk_vat_tu = str(item.get("tk_vat_tu") or "").strip()
         if re.fullmatch(r"\d+(?:\.\d+)?", ma_kho) and re.search(r"[A-Za-z]", tk_vat_tu):
             ma_kho, tk_vat_tu = tk_vat_tu, ma_kho
-        result.append({
+        normalized = {
             "id": pair_id,
             "ma_kho": ma_kho,
             "tk_vat_tu": tk_vat_tu,
-        })
+        }
+        role = str(item.get("role") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if role:
+            normalized["role"] = role
+        if label:
+            normalized["label"] = label
+        result.append(normalized)
     return result
+
+
+def son_phuong_purchase_inventory_pairs():
+    return [{
+        "id": "son-phuong-purchase-materials",
+        "role": "materials",
+        "label": "Nh\u00f3m v\u1eadt t\u01b0",
+        "ma_kho": "KHHVT",
+        "tk_vat_tu": "156",
+    }]
+
+
+def son_phuong_sales_inventory_pairs():
+    return [
+        {
+            "id": "son-phuong-sales-materials",
+            "role": "materials",
+            "label": "H\u00e0ng h\u00f3a v\u1eadt t\u01b0",
+            "ma_kho": "KHHVT",
+            "tk_vat_tu": "156",
+        },
+        {
+            "id": "son-phuong-sales-finished",
+            "role": "finished_goods",
+            "label": "Th\u00e0nh ph\u1ea9m th\u00e9p",
+            "ma_kho": "KTP",
+            "tk_vat_tu": "155",
+        },
+        {
+            "id": "son-phuong-sales-fallback",
+            "role": "fallback",
+            "label": "S\u1ea3n ph\u1ea9m c\u00f2n l\u1ea1i",
+            "ma_kho": "KHOCK",
+            "tk_vat_tu": "159",
+        },
+    ]
+
+
+def merge_inventory_pairs_by_role(current, defaults):
+    normalized = normalize_inventory_pairs(current)
+    occupied = {
+        str(item.get("role") or item.get("id") or "").strip()
+        for item in normalized
+        if str(item.get("role") or item.get("id") or "").strip()
+    }
+    for item in defaults:
+        key = str(item.get("role") or item.get("id") or "").strip()
+        if key not in occupied:
+            normalized.append(dict(item))
+            occupied.add(key)
+    return normalized
 
 
 def normalize_inventory_rule_priority(value):
@@ -500,6 +600,28 @@ def normalize_inventory_pair_rules(value):
             "enabled": item.get("enabled") is not False,
             "priority": normalize_inventory_rule_priority(item.get("priority")),
         })
+    return result
+
+
+def normalize_son_phuong_allocation_config(value):
+    result = dict(value or {}) if isinstance(value, dict) else {}
+    result["sales_inventory_pairs"] = merge_inventory_pairs_by_role(
+        result.get("sales_inventory_pairs"),
+        son_phuong_sales_inventory_pairs(),
+    )
+    result["sales_inventory_pair_rules"] = normalize_inventory_pair_rules(
+        result.get("sales_inventory_pair_rules") or []
+    )
+    try:
+        result["scenario_count"] = max(1, min(1000, int(result.get("scenario_count") or 100)))
+    except (TypeError, ValueError):
+        result["scenario_count"] = 100
+    policy = dict(result.get("policy") or {}) if isinstance(result.get("policy"), dict) else {}
+    try:
+        policy["generic_min_type_count"] = max(1, int(policy.get("generic_min_type_count") or 2))
+    except (TypeError, ValueError):
+        policy["generic_min_type_count"] = 2
+    result["policy"] = policy
     return result
 
 
@@ -1073,6 +1195,7 @@ def sanitize_review_merge_rules_for_config(value, comparison_scope=VIETMAX_COMPA
 BUILTIN_PROCESSING_GROUP_LABELS = {
     "materials": "Nhóm vật tư",
     "services": "Nhóm dịch vụ",
+    "payment_voucher": "Nhóm phiếu chi",
     "ignored": "Không xử lý",
 }
 
@@ -1150,8 +1273,28 @@ def normalize_profile_config(profile_key_name, profile, include_scopes=True):
         "company_group_assignments": dict(profile.get("company_group_assignments") or {}),
         "form_mapping_presets": list(profile.get("form_mapping_presets") or []),
         "form_mapping_initialized": bool(profile.get("form_mapping_initialized")) or bool(profile.get("form_mapping_presets")),
+        "disabled_default_form_ids": sorted({
+            raw_text(form_id)
+            for form_id in (profile.get("disabled_default_form_ids") or [])
+            if raw_text(form_id)
+        }),
         "columns": dict(profile.get("columns") or {}) if isinstance(profile.get("columns"), dict) else {},
     }
+    if profile_key_name == "ho_guom":
+        existing_groups = {
+            raw_text(group.get("id")): group
+            for group in normalized["processing_groups"]
+            if isinstance(group, dict) and raw_text(group.get("id"))
+        }
+        merged_groups = []
+        for default_group in defaults["processing_groups"]:
+            group_id = raw_text(default_group.get("id"))
+            current = existing_groups.pop(group_id, {})
+            merged = {**default_group, **current, "id": group_id}
+            merged["label"] = default_group["label"]
+            merged["uses_product_code"] = default_group["uses_product_code"]
+            merged_groups.append(merged)
+        normalized["processing_groups"] = merged_groups + list(existing_groups.values())
     if include_scopes:
         raw_scopes = profile.get("scopes") if isinstance(profile.get("scopes"), dict) else {}
         normalized["scopes"] = {
@@ -1166,6 +1309,28 @@ def normalize_profile_config(profile_key_name, profile, include_scopes=True):
                 include_scopes=False,
             ),
         }
+    if profile_key_name == "son_phuong":
+        normalized["inventory_allocation_config"] = normalize_son_phuong_allocation_config(
+            normalized.get("inventory_allocation_config")
+        )
+        if include_scopes:
+            purchase_scope = normalized["scopes"][VIETMAX_PHASE_PURCHASE]
+            current_purchase_pairs = merge_inventory_pairs_by_role(
+                purchase_scope.get("inventory_pairs"),
+                son_phuong_purchase_inventory_pairs(),
+            )
+            configured_material_pair = next((
+                item for item in current_purchase_pairs
+                if item.get("role") == "materials" or item.get("id") == "son-phuong-purchase-materials"
+            ), son_phuong_purchase_inventory_pairs()[0])
+            purchase_scope["inventory_pairs"] = [{
+                **son_phuong_purchase_inventory_pairs()[0],
+                "ma_kho": configured_material_pair.get("ma_kho") or "KHHVT",
+                "tk_vat_tu": configured_material_pair.get("tk_vat_tu") or "156",
+            }]
+            purchase_scope["use_default_inventory_pair"] = True
+            if not purchase_scope.get("default_inventory_pair_id"):
+                purchase_scope["default_inventory_pair_id"] = "son-phuong-purchase-materials"
     return normalized
 
 
@@ -2704,7 +2869,7 @@ def company_selection_key(company="", mst=""):
     return f"{NO_MST_COMPANY_KEY_PREFIX}{company_key}" if company_key else ""
 
 
-def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None):
+def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=None, address_col=None, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None, allow_zero_quantity=False, data_start_row=0):
     ci, mi, pi = map(excel_col_to_index, [company_col, mst_col, product_col])
     qi = excel_col_to_index(qty_col) if str(qty_col or "").strip() else None
     indexes = [ci, mi, pi]
@@ -2723,11 +2888,12 @@ def company_rows(df, company_col, mst_col, product_col, qty_col=None, price_col=
     if df.shape[1] <= max(indexes):
         raise ValueError("Selected columns exceed the number of columns in the sheet.")
     rows = []
-    for i in range(len(df)):
+    start_row = max(0, int(data_start_row or 0))
+    for i in range(start_row, len(df)):
         report_loop_progress(progress_callback, i + 1, len(df), "Đang quét dòng hóa đơn")
         if status_index is not None and df.shape[1] > status_index and ignored_invoice_status(cell(df, i, status_index), invoice_status_skip_values):
             continue
-        if qi is not None and not should_process_qty(cell(df, i, qi)):
+        if qi is not None and not allow_zero_quantity and not should_process_qty(cell(df, i, qi)):
             continue
         company = "" if pd.isna(cell(df, i, ci)) else str(cell(df, i, ci)).strip()
         mst = "" if pd.isna(cell(df, i, mi)) else str(cell(df, i, mi)).strip()
@@ -4134,9 +4300,9 @@ def unique_values(values):
     return result
 
 
-def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None):
+def analyze(path, company_col, mst_col, address_col, product_col, qty_col, price_col, profile_cfg, invoice_status_col=DEFAULT_INVOICE_STATUS_COL, invoice_status_skip_values=None, progress_callback=None, allow_zero_quantity=False, data_start_row=0):
     _, df = read_workbook(path)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col, invoice_status_col, invoice_status_skip_values, progress_callback=progress_callback)
+    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, address_col, invoice_status_col, invoice_status_skip_values, progress_callback=progress_callback, allow_zero_quantity=allow_zero_quantity, data_start_row=data_start_row)
     by = {}
     addresses = {}
     products = {}
@@ -4240,6 +4406,7 @@ def validate_payload(data):
     prefix_map = {}
     selected_products = {}
     used = {}
+    group_assignments = data.get("company_group_assignments") if isinstance(data.get("company_group_assignments"), dict) else {}
     errors = []
     for mst in all_mst:
         if not mst or mst not in selected:
@@ -4253,15 +4420,39 @@ def validate_payload(data):
             if not re.fullmatch(r"[A-Z0-9]{1,20}", prefix):
                 errors.append(f"{mst}: prefix must use only A-Z or 0-9.")
                 continue
-            if prefix in used and used[prefix] != mst:
-                errors.append(f"{mst}: prefix {prefix} duplicates MST {used[prefix]}.")
+            group_id = raw_text(group_assignments.get(mst)) or FAST_MATERIALS_GROUP_ID
+            used_key = (group_id, prefix)
+            if used_key in used and used[used_key] != mst:
+                errors.append(f"{mst}: prefix {prefix} duplicates {used[used_key]} in group {group_id}.")
                 continue
-            used[prefix] = mst
+            used[used_key] = mst
             prefix_map[mst] = prefix
         selected_products[mst] = set(data.get(f"selected_products_{sid}", []))
     if errors:
         raise ValueError("\n".join(errors))
     return prefix_map, selected_products
+
+
+def processing_group_for_company_row(row, company_group_assignments, selected_company_ids):
+    company_group_assignments = company_group_assignments if isinstance(company_group_assignments, dict) else {}
+    selected_company_ids = set(raw_text(value) for value in (selected_company_ids or []) if raw_text(value))
+    mst = row.get("mst")
+    company = row.get("company")
+    candidates = [
+        row.get("selection_key"),
+        row.get("company_key"),
+        row.get("safe_id"),
+        mst,
+        company,
+        company_selection_key(company, mst),
+        vietmax_company_identity_key(company, mst),
+    ]
+    for candidate in candidates:
+        key = raw_text(candidate)
+        if key and key in company_group_assignments:
+            return raw_text(company_group_assignments.get(key)) or FAST_MATERIALS_GROUP_ID
+    company_id = raw_text(row.get("selection_key")) or company_selection_key(company, mst)
+    return FAST_MATERIALS_GROUP_ID if company_id in selected_company_ids else FAST_IGNORED_GROUP_ID
 
 
 def process_workbook(path, out, data, progress_callback=None):
@@ -4270,16 +4461,23 @@ def process_workbook(path, out, data, progress_callback=None):
     sheet, df = read_workbook(path)
     if progress_callback:
         progress_callback(1, 1, f"Đã đọc workbook nguồn: {len(df)} dòng")
+    profile = profile_key(data.get("profile", "son_phuong"))
+    uses_ho_guom_formatter = profile == "ho_guom"
     company_col = data.get("company_col", "F").upper()
     mst_col = data.get("mst_col", "G").upper()
     product_col = data.get("product_col", "N").upper()
     qty_col = str(data.get("qty_col", "P") or "").upper()
-    profile = profile_key(data.get("profile", "son_phuong"))
+    if uses_ho_guom_formatter:
+        validate_ho_guom_fdi_headers(df)
+        company_col = "F"
+        mst_col = "G"
+        product_col = "M"
+        qty_col = "O"
     vietmax_phase = normalize_vietmax_phase(data.get("vietmax_phase"))
     effective_profile = effective_processing_profile(profile, vietmax_phase)
     uses_price_rules = effective_profile == "cao_thanh"
     price_col = str(data.get("price_col", "R") or "").upper() if uses_price_rules else ""
-    output_col = data.get("output_col", "M").upper()
+    output_col = "L" if uses_ho_guom_formatter else data.get("output_col", "M").upper()
     invoice_status_col = str(data.get("invoice_status_col", DEFAULT_INVOICE_STATUS_COL) or "").upper()
     invoice_status_skip_values = data.get("invoice_status_skip_values")
     ci, mi, pi, oi = map(excel_col_to_index, [company_col, mst_col, product_col, output_col])
@@ -4316,31 +4514,22 @@ def process_workbook(path, out, data, progress_callback=None):
     vietmax_sales_split_code_overrides = normalize_vietmax_split_code_overrides(data.get("vietmax_ban_ra_sales_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_sales else {}
     vietmax_purchase_split_code_overrides = normalize_vietmax_split_code_overrides(data.get("vietmax_mua_vao_internal_merges") or [], vietmax_comparison_scope) if uses_vietmax_purchase else {}
     prefix_map, selected_products = validate_payload(data)
-    rows = company_rows(df, company_col, mst_col, product_col, qty_col, price_col, invoice_status_col=invoice_status_col, invoice_status_skip_values=invoice_status_skip_values, progress_callback=progress_callback)
+    rows = company_rows(
+        df,
+        company_col,
+        mst_col,
+        product_col,
+        qty_col,
+        price_col,
+        invoice_status_col=invoice_status_col,
+        invoice_status_skip_values=invoice_status_skip_values,
+        progress_callback=progress_callback,
+        allow_zero_quantity=uses_ho_guom_formatter,
+        data_start_row=2 if uses_ho_guom_formatter else 0,
+    )
     company_group_assignments = data.get("company_group_assignments") if isinstance(data.get("company_group_assignments"), dict) else {}
     selected_company_ids = set(str(x).strip() for x in data.get("process_mst", []))
     tag_processing_groups = bool(company_group_assignments)
-
-    def row_processing_group(row):
-        mst = row.get("mst")
-        company = row.get("company")
-        candidates = [
-            row.get("selection_key"),
-            row.get("company_key"),
-            row.get("safe_id"),
-            mst,
-            company,
-            company_selection_key(company, mst),
-            vietmax_company_identity_key(company, mst),
-        ]
-        for candidate in candidates:
-            key = raw_text(candidate)
-            if key and key in company_group_assignments:
-                return raw_text(company_group_assignments.get(key)) or FAST_MATERIALS_GROUP_ID
-        company_id = row.get("selection_key") or company_selection_key(company, mst)
-        if company_id in selected_company_ids:
-            return FAST_MATERIALS_GROUP_ID
-        return FAST_IGNORED_GROUP_ID
 
     processed_purchase_path = raw_text(data.get("vietmax_processed_purchase_path"))
     if uses_vietmax_sales and processed_purchase_path:
@@ -4424,18 +4613,21 @@ def process_workbook(path, out, data, progress_callback=None):
     sales_tax_rate_index = qi + 3 if uses_vietmax_sales and qi is not None else None
     sales_tax_amount_index = qi + 5 if uses_vietmax_sales and qi is not None else None
     sales_total_index = qi + 6 if uses_vietmax_sales and qi is not None else None
+    ho_guom_invoice_sequences = Counter()
     for row_index, row in enumerate(rows):
         report_loop_progress(progress_callback, row_index + 1, len(rows), "Đang tạo mã VT cho dòng xử lý")
         i = row["excel_row"] - 1
         mst = row["mst"]
         company_id = row.get("selection_key") or company_selection_key(row.get("company"), mst)
-        processing_group = row_processing_group(row) if tag_processing_groups else FAST_MATERIALS_GROUP_ID
-        if tag_processing_groups:
-            processing_group_by_row_index[i] = processing_group
-            retained_group_row_indexes.add(i)
+        processing_group = processing_group_for_company_row(row, company_group_assignments, selected_company_ids) if tag_processing_groups else FAST_MATERIALS_GROUP_ID
         prod = row["product"]
         key = product_key(company_id, prod)
         qty = cell(df, i, qi) if qi is not None else 1
+        if uses_ho_guom_formatter and processing_group == FAST_MATERIALS_GROUP_ID and not should_process_qty(qty):
+            continue
+        if tag_processing_groups:
+            processing_group_by_row_index[i] = processing_group
+            retained_group_row_indexes.add(i)
         purchase_merge = find_vietmax_internal_merge(
             vietmax_purchase_internal_merges,
             prod,
@@ -4481,10 +4673,17 @@ def process_workbook(path, out, data, progress_callback=None):
                 row.get("company_key"),
                 vietmax_comparison_scope,
             )
-        if not code:
+        if not code and not uses_ho_guom_formatter:
             code = str(manual_code_overrides.get(key) or "").strip()
         code = sanitize_product_code(code)
-        if not code:
+        if not code and uses_ho_guom_formatter:
+            prefix = raw_text(prefix_map.get(company_id)).upper()
+            invoice_no = raw_text(row.get("invoice_no"))
+            if prefix and invoice_no:
+                invoice_key = (prefix, invoice_no)
+                ho_guom_invoice_sequences[invoice_key] += 1
+                code = f"VT.{prefix}.{invoice_no}.{ho_guom_invoice_sequences[invoice_key]:02d}"
+        if not code and not uses_ho_guom_formatter:
             code = make_code(company_id, effective_prod, qty, prefix_map, effective_profile, word_rules, first_word_rules, require_qty=(qi is not None), include_company_prefix=include_company_prefix, repeated_phrase_removals=repeated_phrase_removals)
         code = apply_product_code_replacement(code, product_code_replacements)
         rule = price_rules.get(key) or price_range_rules.get(code)
@@ -5090,11 +5289,136 @@ VIETMAX_FDI_SOURCE_HEADERS = {
 }
 
 
+HO_GUOM_FDI_SOURCE_HEADERS = {
+    "A": "Mẫu số HD",
+    "B": "Ký hiệu hóa đơn",
+    "C": "Số hóa đơn",
+    "D": "Ngày lập hóa đơn",
+    "E": "Ngày người bán ký số",
+    "F": "Tên người bán",
+    "G": "MST người bán",
+    "H": "Địa chỉ người bán",
+    "I": "Tên người mua",
+    "J": "MST người mua",
+    "K": "Địa chỉ người mua",
+    "L": "Mã VT",
+    "M": "Tên hàng hóa, dịch vụ",
+    "N": "Đơn vị tính",
+    "O": "Số lượng",
+    "P": "Đơn giá",
+    "Q": "Chiết khấu",
+    "R": "Thuế suất",
+    "S": "Tiền chưa thuế nguyên tệ",
+    "T": "Tiền thuế nguyên tệ",
+    "U": "Tiền sau thuế nguyên tệ",
+    "V": "Mã thuế",
+    "W": "Thuế xuất",
+    "X": "Mã nx (Tk nợ 2) (tk_nvl)",
+    "Y": "Mã dự án (ma_vv_i)",
+    "Z": "Tiền chưa thuế (VND)",
+    "AA": "Tiền thuế (VND)",
+    "AB": "Tiền sau thuế (VND)",
+    "AC": "Số tiền chiết khấu",
+    "AD": "Tổng tiền chiết khấu thương mại",
+    "AE": "Tổng tiền phí",
+    "AF": "Tổng tiền thanh toán",
+    "AG": "Tổng tiền thanh toán (VND)",
+    "AH": "Tên file hóa đơn (XML/HTML/PDF)",
+    "AI": "Ghi chú: Hóa đơn thay thế, điều chỉnh, bị thay thế, bị điều chỉnh",
+    "AJ": "Ghi Chú: Các trường hợp đặc biệt kế toán xem xét kỹ hơn",
+    "AK": "Ghi chú 1",
+    "AL": "Hình thức thanh toán",
+    "AM": "Tính chất",
+    "AN": "Trạng thái hóa đơn",
+    "AO": "Kết quả kiểm tra hóa đơn",
+    "AP": "Biển số xe",
+    "AQ": "Website người bán",
+    "AR": "url tra cứu hóa đơn gốc",
+    "AS": "Mã tra cứu hóa đơn gốc",
+    "AT": "Copy dòng này lên google để tìm link tra cứu hóa đơn gốc",
+    "AU": "Đơn vị tiền tệ",
+    "AV": "Tỷ giá",
+    "AW": "MCCQT",
+    "AX": "Ngày CQT ký số",
+    "AY": "",
+}
+
+HO_GUOM_REQUIRED_FDI_HEADERS = {
+    letter: HO_GUOM_FDI_SOURCE_HEADERS[letter]
+    for letter in ("A", "B", "C", "D", "F", "G", "H", "L", "M", "N", "O", "P", "V", "W", "X", "Y", "Z", "AA", "AU", "AV")
+}
+
+
+def validate_ho_guom_fdi_headers(df):
+    header_index = 1
+    missing = []
+    normalized = lambda value: re.sub(r"\s+", " ", rm_accents(raw_text(value))).strip().casefold()
+    for letter, expected in HO_GUOM_REQUIRED_FDI_HEADERS.items():
+        column_index = excel_col_to_index(letter)
+        actual = raw_text(cell(df, header_index, column_index)) if len(df) > header_index else ""
+        if normalized(actual) != normalized(expected):
+            missing.append(f"{letter} - {expected} (hiện tại: {actual or 'trống'})")
+    if missing:
+        raise ValueError(
+            "File FDI mua vào Hồ Gươm thiếu hoặc sai header bắt buộc tại dòng 2: "
+            + "; ".join(missing)
+        )
+
+
+HO_GUOM_IMEXPC1_HEADERS = [
+    "Mã khách hàng (ma_kh)", "Người nộp tiền (ong_ba)", "Diễn giải (dien_giai)",
+    "Mã giao dịch (ma_gd)", "Quyển sổ (ma_qs)", "Số chứng từ (so_ct)",
+    "Ngày chứng từ (ngay_ct)", "Tk có (tk)", "Tk nợ (tk_i)",
+    "Mã KH chi tiết (ma_kh_i)", "Diễn giải chi tiết (dien_giaii)", "Tiền:N0 (tien)",
+    "Mã dự án (ma_vv_i)", "Loại HĐ (loai_hd)", "Nhóm (ma_ms)",
+    "Mẫu HĐ (kh_mau_hd)", "Số HĐ thuế (so_ct0)", "Ngày HĐ (ngay_ct0)",
+    "Số seri (so_seri0)", "Mã KH thuế (ma_kh_t)", "Tên KH thuế (ten_kh_t)",
+    "Địa chỉ thuế (dia_chi_t)", "Mã số thuế (mst_t)", "Tên hàng hóa (ten_vt_t)",
+    "Mã thuế (ma_thue_i)",
+]
+
+HO_GUOM_IMEXPN1_HEADERS = [
+    "Mã khách hàng (ma_kh)", "Người giao hàng (ong_ba)", "Diễn giải (dien_giai)",
+    "Tài khoản có (ma_nx)", "Quyển sổ (ma_qs)", "Số chứng từ (so_ct)",
+    "Ngày chứng từ (ngay_ct)", "Mã nt (ma_nt)", "Tỷ giá (ty_gia)",
+    "Tk nợ (tk_vt)", "Diễn giải chi tiết (dien_giaii)", "Tiền hàng nt (tien_nt)",
+    "Mã vụ việc (ma_vv_i)", "Số hóa đơn (so_ct0)", "Số seri (so_seri0)",
+    "Ngày hóa đơn (ngay_ct0)", "Hàng hóa dịch vụ thuế (ten_vt)", "Mã thuế (ma_thue)",
+    "Thuế suất (thue_suat)", "Tiền thuế nt (t_thue_nt)", "Tài khoản thuế (tk_thue_no)",
+]
+
+HO_GUOM_IMEXPNG_HEADERS = [
+    "Ngày chứng từ (ngay_ct)", "Số chứng từ (so_ct)", "Mã khách hàng (ma_kh)",
+    "Người mua hàng (ong_ba)", "Diễn giải (dien_giai)", "Quyển sổ (ma_qs)",
+    "Mã nx (Tk có) (ma_nx)", "Mã ngoại tệ (ma_nt)", "Tỷ giá (ty_gia)",
+    "Mã kho (ma_kho)", "Mã vật tư (ma_vt)", "Số lượng:Q (so_luong)",
+    "Giá mua chưa thuế:P0 (gia0)", "Tiền mua:N0 (tien0)", "Chi phí:N0 (cp)",
+    "Tk nợ (tk_vt)", "Mã nx (Tk nợ 2) (tk_nvl)", "Mã dự án (ma_vv_i)",
+    "Mã ĐVCS (ma_dvcs)", "Số HĐ thuế (so_ct0)", "Ngày HĐ (ngay_ct0)",
+    "Mẫu HĐ (kh_mau_hd)", "Số seri (so_seri0)", "Mã KH thuế (ma_kh_t)",
+    "Tên KH thuế (ten_kh_t)", "Địa chỉ thuế (dia_chi_t)", "MST thuế (mst_t)",
+    "Tên hàng hóa (ten_vt_t)", "Tiền hàng:N0 (t_tien)", "Mã thuế (ma_thue)",
+    "Tiền thuế:N0 (t_thue)",
+]
+
+
 def vietmax_default_source_columns(phase=None):
     return [
         {"letter": letter, "header": header, "label": f"{letter}. {header}"}
         for letter, header in VIETMAX_FDI_SOURCE_HEADERS.items()
     ]
+
+
+def ho_guom_default_source_columns(phase=None):
+    columns = [
+        {"letter": letter, "header": header, "label": f"{letter}. {header}"}
+        for letter, header in HO_GUOM_FDI_SOURCE_HEADERS.items()
+    ]
+    columns.extend([
+        {"letter": "MA_KHO", "header": "Mã kho", "label": "Mã kho (theo header FDI)"},
+        {"letter": "TK_VAT_TU", "header": "TK vật tư", "label": "TK vật tư (theo header FDI)"},
+    ])
+    return columns
 
 
 def fast_mapping_rule(target_col, source_col="", source_phase="purchase", source_type="source_column", **extra):
@@ -5107,6 +5431,138 @@ def fast_mapping_rule(target_col, source_col="", source_phase="purchase", source
         rule["source_col"] = source_col
     rule.update({key: value for key, value in extra.items() if value is not None})
     return rule
+
+
+def ho_guom_source_mapping(target_col, source_col, **extra):
+    return fast_mapping_rule(
+        target_col,
+        source_col,
+        "purchase",
+        transform=extra.pop("transform", "zero_to_blank"),
+        **extra,
+    )
+
+
+def ho_guom_default_form_mapping_presets(phase=None):
+    payment_form = {
+        "id": "ho_guom_imexpc1",
+        "label": "IMEXPC1",
+        "scope": "purchase",
+        "type": "builtin",
+        "enabled": True,
+        "builtin_exporter": "ho_guom_imexpc1",
+        "group_id": "payment_voucher",
+        "input_phase": "purchase",
+        "sheet": "IMEXPC1",
+        "split_duplicate_invoices": True,
+        "output_columns": fast_output_columns(HO_GUOM_IMEXPC1_HEADERS),
+        "mappings": [
+            ho_guom_source_mapping("A", "F"),
+            ho_guom_source_mapping("B", "M", transform="ho_guom_cash_payee"),
+            fast_mapping_rule("C", source_type="text_template", source_phase="purchase", value="Mua {M} HĐ{C}", transform="zero_to_blank"),
+            fast_mapping_rule("D", source_type="constant", source_phase="purchase", value="8"),
+            ho_guom_source_mapping("F", "C"),
+            ho_guom_source_mapping("G", "D"),
+            fast_mapping_rule("H", source_type="constant", source_phase="purchase", value="1111"),
+            ho_guom_source_mapping("I", "M", transform="ho_guom_cash_debit_account"),
+            ho_guom_source_mapping("J", "F"),
+            fast_mapping_rule("K", source_type="text_template", source_phase="purchase", value="Mua {M} HĐ{C}", transform="zero_to_blank"),
+            ho_guom_source_mapping("L", "W"),
+            fast_mapping_rule("N", source_type="constant", source_phase="purchase", value=1),
+            fast_mapping_rule("O", source_type="constant", source_phase="purchase", value=1),
+            ho_guom_source_mapping("Q", "C"),
+            ho_guom_source_mapping("R", "D"),
+            ho_guom_source_mapping("S", "B"),
+            ho_guom_source_mapping("T", "G"),
+            ho_guom_source_mapping("U", "F"),
+            ho_guom_source_mapping("V", "H"),
+            ho_guom_source_mapping("W", "G"),
+            fast_mapping_rule("X", source_type="text_template", source_phase="purchase", value="Mua {M} HĐ{C}", transform="zero_to_blank"),
+            ho_guom_source_mapping("Y", "V"),
+        ],
+    }
+    service_form = {
+        "id": "ho_guom_imexpn1",
+        "label": "IMEXPN1",
+        "scope": "purchase",
+        "type": "builtin",
+        "enabled": True,
+        "builtin_exporter": "ho_guom_imexpn1",
+        "group_id": "services",
+        "input_phase": "purchase",
+        "sheet": "IMEXPN1",
+        "split_duplicate_invoices": True,
+        "output_columns": fast_output_columns(HO_GUOM_IMEXPN1_HEADERS),
+        "mappings": [
+            ho_guom_source_mapping("A", "G"),
+            ho_guom_source_mapping("B", "F"),
+            fast_mapping_rule("C", source_type="text_template", source_phase="purchase", value="{M} HĐ{C}", transform="zero_to_blank"),
+            fast_mapping_rule("D", source_type="constant", source_phase="purchase", value="3311"),
+            ho_guom_source_mapping("F", "C"),
+            ho_guom_source_mapping("G", "D"),
+            fast_mapping_rule("H", source_type="constant", source_phase="purchase", value="VND"),
+            fast_mapping_rule("I", source_type="constant", source_phase="purchase", value=1),
+            ho_guom_source_mapping("J", "X"),
+            fast_mapping_rule("K", source_type="text_template", source_phase="purchase", value="{M} HĐ{C}", transform="zero_to_blank"),
+            ho_guom_source_mapping("L", "Z"),
+            ho_guom_source_mapping("N", "C"),
+            ho_guom_source_mapping("O", "B"),
+            ho_guom_source_mapping("P", "D"),
+            fast_mapping_rule("Q", source_type="text_template", source_phase="purchase", value="{M} HĐ{C}", transform="zero_to_blank"),
+            ho_guom_source_mapping("R", "V"),
+            ho_guom_source_mapping("S", "W"),
+            ho_guom_source_mapping("T", "AA"),
+            fast_mapping_rule("U", source_type="constant", source_phase="purchase", value="13311"),
+        ],
+    }
+    materials_form = {
+        "id": "ho_guom_imexpng",
+        "label": "IMEXPNG",
+        "scope": "purchase",
+        "type": "builtin",
+        "enabled": True,
+        "builtin_exporter": "ho_guom_imexpng",
+        "group_id": "materials",
+        "input_phase": "purchase",
+        "sheet": "IMEXPNG",
+        "split_duplicate_invoices": True,
+        "output_columns": fast_output_columns(HO_GUOM_IMEXPNG_HEADERS),
+        "mappings": [
+            ho_guom_source_mapping("A", "D"),
+            ho_guom_source_mapping("B", "C"),
+            ho_guom_source_mapping("C", "G"),
+            ho_guom_source_mapping("D", "F"),
+            fast_mapping_rule("E", source_type="text_template", source_phase="purchase", value="Nhập mua vật tư HĐ{C}", transform="zero_to_blank"),
+            fast_mapping_rule("G", source_type="constant", source_phase="purchase", value="3311"),
+            fast_mapping_rule("H", source_type="constant", source_phase="purchase", value="VND"),
+            fast_mapping_rule("I", source_type="constant", source_phase="purchase", value=1),
+            ho_guom_source_mapping("J", "MA_KHO"),
+            ho_guom_source_mapping("K", "L"),
+            ho_guom_source_mapping("L", "O"),
+            ho_guom_source_mapping("M", "P"),
+            ho_guom_source_mapping("N", "Z"),
+            ho_guom_source_mapping("P", "TK_VAT_TU"),
+            ho_guom_source_mapping("Q", "X"),
+            ho_guom_source_mapping("R", "Y"),
+            fast_mapping_rule("S", source_type="constant", source_phase="purchase", value="CTY"),
+            ho_guom_source_mapping("T", "C"),
+            ho_guom_source_mapping("U", "D"),
+            ho_guom_source_mapping("W", "B"),
+            ho_guom_source_mapping("X", "G"),
+            ho_guom_source_mapping("Y", "F"),
+            ho_guom_source_mapping("Z", "H"),
+            ho_guom_source_mapping("AA", "G"),
+            fast_mapping_rule("AB", source_type="text_template", source_phase="purchase", value="Nhập mua vật tư HĐ{B}", transform="zero_to_blank"),
+            ho_guom_source_mapping("AC", "Z"),
+            ho_guom_source_mapping("AD", "V"),
+            ho_guom_source_mapping("AE", "AA"),
+        ],
+    }
+    forms = [materials_form, service_form, payment_form]
+    normalized_phase = raw_text(phase)
+    if normalized_phase == VIETMAX_PHASE_SALES:
+        return []
+    return forms
 
 
 def default_vietmax_form_mapping_presets(phase=None):
@@ -5244,7 +5700,7 @@ def default_vietmax_form_mapping_presets(phase=None):
     return forms
 
 
-SYSTEM_DEFAULT_FORM_MAPPING_VERSION = 2
+SYSTEM_DEFAULT_FORM_MAPPING_VERSION = 5
 
 
 def default_form_mapping_document():
@@ -5252,6 +5708,9 @@ def default_form_mapping_document():
         "schema_version": SYSTEM_DEFAULT_FORM_MAPPING_VERSION,
         "product": "ProductCodeFormatter",
         "forms": default_vietmax_form_mapping_presets(),
+        "profile_forms": {
+            "ho_guom": ho_guom_default_form_mapping_presets(),
+        },
     }
 
 
@@ -5266,10 +5725,13 @@ def normalize_default_form_mapping_document(value):
         "schema_version": schema_version,
         "product": "ProductCodeFormatter",
         "forms": list(forms) if isinstance(forms, list) and forms else default_vietmax_form_mapping_presets(),
+        "profile_forms": {
+            "ho_guom": list((value.get("profile_forms") or {}).get("ho_guom") or ho_guom_default_form_mapping_presets()),
+        },
     }
 
 
-def load_system_default_form_mappings(phase=None):
+def load_system_default_form_mappings(phase=None, profile=None):
     if not DEFAULT_FORM_MAPPINGS_PATH.exists():
         document = config_store.save_config_file(
             DEFAULT_FORM_MAPPINGS_PATH,
@@ -5292,7 +5754,13 @@ def load_system_default_form_mappings(phase=None):
                 default_form_mapping_document(),
                 normalize_default_form_mapping_document,
             )
-    forms = json.loads(json.dumps(document.get("forms") or [], ensure_ascii=False))
+    normalized_profile = profile_key(profile) if raw_text(profile) else ""
+    if normalized_profile == "ho_guom":
+        profile_forms = document.get("profile_forms") if isinstance(document.get("profile_forms"), dict) else {}
+        source_forms = profile_forms.get("ho_guom") or ho_guom_default_form_mapping_presets()
+    else:
+        source_forms = document.get("forms") or []
+    forms = json.loads(json.dumps(source_forms, ensure_ascii=False))
     normalized_phase = raw_text(phase)
     if normalized_phase == VIETMAX_PHASE_PURCHASE:
         return [form for form in forms if form.get("scope") in {"purchase", "both"}]
@@ -5307,8 +5775,39 @@ def _form_without_runtime_markers(form):
     return clean
 
 
-def merge_system_default_form_mappings(forms, phase=None):
-    defaults = load_system_default_form_mappings(phase)
+def migrate_ho_guom_inventory_source_mappings(form):
+    if raw_text(form.get("id")) != "ho_guom_imexpng":
+        return form
+    current = dict(form)
+    mappings = [dict(rule) for rule in (current.get("mappings") or []) if isinstance(rule, dict)]
+    default_rules = {
+        raw_text(rule.get("target_col")): dict(rule)
+        for preset in ho_guom_default_form_mapping_presets()
+        if raw_text(preset.get("id")) == "ho_guom_imexpng"
+        for rule in (preset.get("mappings") or [])
+        if isinstance(rule, dict)
+    }
+    has_tk_vat_tu = False
+    for index, rule in enumerate(mappings):
+        target_col = raw_text(rule.get("target_col")).upper()
+        if target_col == "J" and raw_text(rule.get("source_type")) == "constant" and raw_text(rule.get("value")).upper() == "KHO1":
+            mappings[index] = dict(default_rules["J"])
+        elif target_col == "P":
+            has_tk_vat_tu = True
+    if not has_tk_vat_tu:
+        mappings.append(dict(default_rules["P"]))
+    def mapping_order(rule):
+        try:
+            return excel_col_to_index(raw_text(rule.get("target_col")))
+        except ValueError:
+            return 10**9
+    mappings.sort(key=mapping_order)
+    current["mappings"] = mappings
+    return current
+
+
+def merge_system_default_form_mappings(forms, phase=None, profile=None):
+    defaults = load_system_default_form_mappings(phase, profile)
     configured = [form for form in (forms or []) if isinstance(form, dict)]
     configured_by_id = {
         raw_text(form.get("id")): form
@@ -5324,6 +5823,8 @@ def merge_system_default_form_mappings(forms, phase=None):
         if selected is None:
             selected = dict(default)
             selected["_system_default"] = True
+        elif profile_key(profile) == "ho_guom":
+            selected = migrate_ho_guom_inventory_source_mappings(selected)
         result.append(selected)
     result.extend(
         form for form in configured
@@ -5332,10 +5833,10 @@ def merge_system_default_form_mappings(forms, phase=None):
     return result
 
 
-def hydrate_builtin_default_form_assets(forms, phase=None):
+def hydrate_builtin_default_form_assets(forms, phase=None, profile=None):
     defaults = {
         raw_text(form.get("id")): form
-        for form in load_system_default_form_mappings(phase)
+        for form in load_system_default_form_mappings(phase, profile)
         if raw_text(form.get("id"))
     }
     hydrated = []
@@ -5364,52 +5865,59 @@ def hydrate_builtin_default_form_assets(forms, phase=None):
 def apply_system_default_forms_to_config(cfg):
     profiles = cfg.get("profiles") if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict) else {}
 
-    def initialize_profile(profile, phase=None):
-        if not isinstance(profile, dict):
+    def initialize_profile(profile_cfg, phase=None, profile_name=None):
+        if not isinstance(profile_cfg, dict):
             return
-        profile["form_mapping_presets"] = merge_system_default_form_mappings(
-            profile.get("form_mapping_presets"), phase
+        disabled_ids = {
+            raw_text(form_id)
+            for form_id in (profile_cfg.get("disabled_default_form_ids") or [])
+            if raw_text(form_id)
+        }
+        merged_forms = merge_system_default_form_mappings(
+            profile_cfg.get("form_mapping_presets"), phase, profile_name
         )
-        profile["form_mapping_initialized"] = True
-        profile["form_mapping_presets"] = hydrate_builtin_default_form_assets(
-            profile.get("form_mapping_presets"), phase
+        profile_cfg["form_mapping_presets"] = [
+            form for form in merged_forms
+            if raw_text(form.get("id")) not in disabled_ids
+        ]
+        profile_cfg["form_mapping_initialized"] = True
+        profile_cfg["form_mapping_presets"] = hydrate_builtin_default_form_assets(
+            profile_cfg.get("form_mapping_presets"), phase, profile_name
         )
 
-    for profile in profiles.values():
-        initialize_profile(profile)
-        scopes = profile.get("scopes") if isinstance(profile, dict) and isinstance(profile.get("scopes"), dict) else {}
+    for profile_name, profile_cfg in profiles.items():
+        initialize_profile(profile_cfg, profile_name=profile_name)
+        scopes = profile_cfg.get("scopes") if isinstance(profile_cfg, dict) and isinstance(profile_cfg.get("scopes"), dict) else {}
         for phase in (VIETMAX_PHASE_PURCHASE, VIETMAX_PHASE_SALES):
-            initialize_profile(scopes.get(phase), phase)
+            initialize_profile(scopes.get(phase), phase, profile_name)
     return cfg
 
 
 def strip_system_default_forms_from_profiles(cfg):
     profiles = cfg.get("profiles") if isinstance(cfg, dict) and isinstance(cfg.get("profiles"), dict) else {}
-    system_by_phase = {
-        "all": {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings()},
-        VIETMAX_PHASE_PURCHASE: {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings(VIETMAX_PHASE_PURCHASE)},
-        VIETMAX_PHASE_SALES: {raw_text(form.get("id")): _form_without_runtime_markers(form) for form in load_system_default_form_mappings(VIETMAX_PHASE_SALES)},
-    }
-
-    def strip_profile(profile, phase="all"):
-        if not isinstance(profile, dict):
+    def strip_profile(profile_cfg, phase="all", profile_name=None):
+        if not isinstance(profile_cfg, dict):
             return
+        defaults = {
+            raw_text(form.get("id")): _form_without_runtime_markers(form)
+            for form in load_system_default_form_mappings(None if phase == "all" else phase, profile_name)
+        }
         kept = []
-        for form in profile.get("form_mapping_presets") or []:
+        for form in profile_cfg.get("form_mapping_presets") or []:
             if not isinstance(form, dict):
                 continue
             clean = _form_without_runtime_markers(form)
-            system = system_by_phase[phase].get(raw_text(clean.get("id")))
+            system = defaults.get(raw_text(clean.get("id")))
             if system is not None and clean == system:
                 continue
             kept.append(clean)
-        profile["form_mapping_presets"] = kept
-        scopes = profile.get("scopes") if isinstance(profile.get("scopes"), dict) else {}
+        profile_cfg["form_mapping_presets"] = kept
+        scopes = profile_cfg.get("scopes") if isinstance(profile_cfg.get("scopes"), dict) else {}
         for scope_phase in (VIETMAX_PHASE_PURCHASE, VIETMAX_PHASE_SALES):
-            strip_profile(scopes.get(scope_phase), scope_phase)
+            strip_profile(scopes.get(scope_phase), scope_phase, profile_name)
 
-    for profile in profiles.values():
-        strip_profile(profile)
+    for profile_name, profile_cfg in profiles.items():
+        strip_profile(profile_cfg, profile_name=profile_name)
     return cfg
 
 
@@ -5742,6 +6250,12 @@ def fast_mapping_source_value(source_row, source_col):
     col = raw_text(source_col).upper()
     if not col:
         return ""
+    virtual_field = {
+        "MA_KHO": "ma_kho",
+        "TK_VAT_TU": "tk_vat_tu",
+    }.get(col)
+    if virtual_field:
+        return source_row.get(virtual_field, "")
     field = FAST_MAPPING_SOURCE_FIELD_BY_COL.get(col)
     if field and field in source_row:
         return source_row.get(field)
@@ -5849,6 +6363,15 @@ def fast_apply_mapping_transform(transform, value, source_row, transform_rules=N
     transform = raw_text(transform)
     if not transform:
         return value
+    if transform == "zero_to_blank":
+        if value is None or raw_text(value) in {"", "0"}:
+            return ""
+        number = parse_price(value)
+        return "" if number is not None and abs(number) < 0.000000001 else value
+    if transform == "ho_guom_cash_payee":
+        return raw_text(source_row.get("ho_guom_cash_payee"))
+    if transform == "ho_guom_cash_debit_account":
+        return raw_text(source_row.get("ho_guom_cash_debit_account"))
     if transform == "mst_or_prefix":
         return fast_mapping_customer_code(source_row, value)
     if transform == "tax_code":
@@ -5872,6 +6395,72 @@ def fast_apply_mapping_transform(transform, value, source_row, transform_rules=N
             return value
         return fast_loai_vat_tu(value)
     return value
+
+
+HO_GUOM_DIESEL_PAYEES = (
+    "Phan Văn Thời",
+    "Trần Minh Thông",
+    "Trần Vũ Ngọc Bảo",
+)
+
+
+def ho_guom_cash_category(value):
+    text = rm_accents(raw_text(value)).casefold()
+    if re.search(r"\bxang\b", text):
+        return "gasoline"
+    if re.search(r"\bdau\b", text):
+        return "diesel"
+    return "other"
+
+
+def ho_guom_invoice_sort_key(source_row):
+    value = source_row.get("invoice_date")
+    try:
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+        date_key = parsed.isoformat() if not pd.isna(parsed) else raw_text(value)
+    except Exception:
+        date_key = raw_text(value)
+    return (
+        date_key,
+        int(source_row.get("row_index") or 0),
+        raw_text(source_row.get("seller_mst") or source_row.get("seller_name")).casefold(),
+        fast_import_invoice_sort_key(source_row.get("invoice_no")),
+    )
+
+
+def enrich_ho_guom_cash_payment_rows(rows):
+    rows = list(rows or [])
+    diesel_invoices = {}
+    for row in rows:
+        if ho_guom_cash_category(row.get("product")) != "diesel":
+            continue
+        company_key = raw_text(row.get("seller_mst") or row.get("seller_name"))
+        invoice_no = raw_text(row.get("invoice_no"))
+        invoice_key = (company_key, invoice_no)
+        current = diesel_invoices.get(invoice_key)
+        if current is None or ho_guom_invoice_sort_key(row) < ho_guom_invoice_sort_key(current):
+            diesel_invoices[invoice_key] = row
+    ordered_diesel_keys = sorted(diesel_invoices, key=lambda key: ho_guom_invoice_sort_key(diesel_invoices[key]))
+    diesel_payees = {
+        invoice_key: HO_GUOM_DIESEL_PAYEES[index % len(HO_GUOM_DIESEL_PAYEES)]
+        for index, invoice_key in enumerate(ordered_diesel_keys)
+    }
+    for row in rows:
+        category = ho_guom_cash_category(row.get("product"))
+        if category == "gasoline":
+            row["ho_guom_cash_payee"] = "Nguyễn Đức Quy"
+            row["ho_guom_cash_debit_account"] = "642"
+        elif category == "diesel":
+            invoice_key = (
+                raw_text(row.get("seller_mst") or row.get("seller_name")),
+                raw_text(row.get("invoice_no")),
+            )
+            row["ho_guom_cash_payee"] = diesel_payees.get(invoice_key) or HO_GUOM_DIESEL_PAYEES[0]
+            row["ho_guom_cash_debit_account"] = "6230"
+        else:
+            row["ho_guom_cash_payee"] = "Đặng Thị Thanh"
+            row["ho_guom_cash_debit_account"] = "642"
+    return rows
 
 
 def fast_mapping_rule_value(rule, source_row):
@@ -6147,14 +6736,19 @@ def fast_import_sheet_rows(
     require_inventory_columns=True,
     include_duplicate_report=True,
     use_default_forms_when_empty=True,
+    profile=None,
 ):
     purchase_rows = fast_processed_rows(purchase_df, progress_callback, "Đang đọc FDI mua vào", VIETMAX_PHASE_PURCHASE, require_inventory_columns=require_inventory_columns) if purchase_df is not None else []
     sales_rows = fast_processed_rows(sales_df, progress_callback, "Đang đọc FDI bán ra", VIETMAX_PHASE_SALES, require_inventory_columns=require_inventory_columns) if sales_df is not None else []
     purchase_raw_rows = purchase_rows
     sales_raw_rows = sales_rows
+    normalized_profile = profile_key(profile) if raw_text(profile) else ""
+    if normalized_profile == "ho_guom":
+        purchase_rows = enrich_ho_guom_cash_payment_rows(purchase_rows)
+        purchase_raw_rows = purchase_rows
     forms = fast_mapping_forms_from_payload(form_mapping_presets)
     if not forms and use_default_forms_when_empty:
-        forms = load_system_default_form_mappings()
+        forms = load_system_default_form_mappings(profile=normalized_profile)
     total_steps = 4
     done_steps = 0
 
@@ -6213,9 +6807,19 @@ def fast_import_sheet_rows(
             continue
         source_rows = fast_rows_for_form(form, purchase_rows, sales_rows, purchase_raw_rows, sales_raw_rows, purchase_company_group_assignments, sales_company_group_assignments)
         headers = fast_form_output_headers(form)
-        rows = [fast_apply_form_mapping(form, row, headers) for row in source_rows]
         title = raw_text(form.get("sheet") or form.get("label") or form.get("id") or "CustomForm")
-        result[title] = (headers, rows)
+        items = [{"row": fast_apply_form_mapping(form, row, headers), "source": row} for row in source_rows]
+        if form.get("split_duplicate_invoices"):
+            invoice_sheets, _ = split_fast_invoice_rows(
+                items,
+                title,
+                ["seller_mst", "seller_name"],
+                "seller_name",
+            )
+            for sheet_title, rows in invoice_sheets.items():
+                result[sheet_title] = (headers, rows)
+        else:
+            result[title] = (headers, [item["row"] for item in items])
     return result
 
 

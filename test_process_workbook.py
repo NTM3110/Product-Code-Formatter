@@ -45,6 +45,265 @@ class XlsWorkbookAdapter:
 
 
 class ProcessWorkbookTests(unittest.TestCase):
+    def test_ho_guom_defaults_define_three_purchase_forms_and_groups(self):
+        profile = app.normalize_profile_config("ho_guom", {})
+        groups = {group["id"]: group for group in profile["processing_groups"]}
+        self.assertEqual(
+            set(groups),
+            {"materials", "services", "payment_voucher", "ignored"},
+        )
+        self.assertTrue(groups["materials"]["uses_product_code"])
+        self.assertTrue(groups["services"]["uses_product_code"])
+        self.assertTrue(groups["payment_voucher"]["uses_product_code"])
+        self.assertFalse(groups["ignored"]["uses_product_code"])
+
+        forms = app.load_system_default_form_mappings(profile="ho_guom")
+        self.assertEqual(
+            {(form["id"], form["group_id"], form["sheet"]) for form in forms},
+            {
+                ("ho_guom_imexpng", "materials", "IMEXPNG"),
+                ("ho_guom_imexpn1", "services", "IMEXPN1"),
+                ("ho_guom_imexpc1", "payment_voucher", "IMEXPC1"),
+            },
+        )
+
+        profile["disabled_default_form_ids"] = ["ho_guom_imexpn1"]
+        restored = app.apply_system_default_forms_to_config({"profiles": {"ho_guom": profile}})
+        self.assertNotIn(
+            "ho_guom_imexpn1",
+            {form["id"] for form in restored["profiles"]["ho_guom"]["form_mapping_presets"]},
+        )
+
+    def test_ho_guom_purchase_forms_use_seller_identity_columns(self):
+        forms = {
+            form["id"]: form
+            for form in app.load_system_default_form_mappings(profile="ho_guom")
+        }
+
+        def source_columns(form_id):
+            return {
+                mapping["target_col"]: mapping.get("source_col")
+                for mapping in forms[form_id]["mappings"]
+                if mapping.get("source_type") == "source_column"
+            }
+
+        self.assertEqual(
+            {key: source_columns("ho_guom_imexpng")[key] for key in ("C", "D", "X", "Y", "Z", "AA")},
+            {"C": "G", "D": "F", "X": "G", "Y": "F", "Z": "H", "AA": "G"},
+        )
+        self.assertEqual(
+            {key: source_columns("ho_guom_imexpng")[key] for key in ("J", "P")},
+            {"J": "MA_KHO", "P": "TK_VAT_TU"},
+        )
+        self.assertEqual(
+            {column["letter"] for column in app.ho_guom_default_source_columns()} & {"MA_KHO", "TK_VAT_TU"},
+            {"MA_KHO", "TK_VAT_TU"},
+        )
+        self.assertEqual(
+            {key: source_columns("ho_guom_imexpn1")[key] for key in ("A", "B")},
+            {"A": "G", "B": "F"},
+        )
+        self.assertEqual(
+            {key: source_columns("ho_guom_imexpc1")[key] for key in ("A", "J", "T", "U", "V", "W")},
+            {"A": "F", "J": "F", "T": "G", "U": "F", "V": "H", "W": "G"},
+        )
+
+    def test_ho_guom_old_default_inventory_mapping_is_migrated_without_touching_custom_rules(self):
+        old_form = next(
+            form for form in app.ho_guom_default_form_mapping_presets()
+            if form["id"] == "ho_guom_imexpng"
+        )
+        old_form["mappings"] = [
+            rule for rule in old_form["mappings"]
+            if rule.get("target_col") != "P"
+        ]
+        for rule in old_form["mappings"]:
+            if rule.get("target_col") == "J":
+                rule.clear()
+                rule.update({
+                    "target_col": "J",
+                    "source_type": "constant",
+                    "source_phase": "purchase",
+                    "value": "KHO1",
+                })
+            if rule.get("target_col") == "S":
+                rule["value"] = "CUSTOM"
+
+        merged = app.merge_system_default_form_mappings([old_form], profile="ho_guom")
+        migrated = next(form for form in merged if form["id"] == "ho_guom_imexpng")
+        mappings = {rule["target_col"]: rule for rule in migrated["mappings"]}
+        self.assertEqual(mappings["J"].get("source_col"), "MA_KHO")
+        self.assertEqual(mappings["P"].get("source_col"), "TK_VAT_TU")
+        self.assertEqual(mappings["S"].get("value"), "CUSTOM")
+
+    def test_ho_guom_formatter_excludes_zero_material_quantity_but_keeps_other_groups(self):
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "ho_guom.xlsx"
+            output = Path(tmpdir) / "ho_guom_fdi.xls"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Invoices"
+            for letter, header in app.HO_GUOM_FDI_SOURCE_HEADERS.items():
+                sheet.cell(2, app.excel_col_to_index(letter) + 1, header)
+            sheet.cell(2, app.excel_col_to_index("AZ") + 1, "TK vật tư")
+            sheet.cell(2, app.excel_col_to_index("BA") + 1, "Mã kho")
+
+            def add_row(row_number, *, invoice, company, mst, product, quantity, amount=100, tax=8):
+                values = {
+                    "B": "1C24TAA",
+                    "C": invoice,
+                    "D": "01/06/2026",
+                    "F": company,
+                    "G": mst,
+                    "L": 0,
+                    "M": product,
+                    "N": "kg",
+                    "O": quantity,
+                    "P": 10,
+                    "V": "08",
+                    "W": 0,
+                    "X": 0,
+                    "Y": 0,
+                    "Z": amount,
+                    "AA": tax,
+                    "AU": amount,
+                    "AV": tax,
+                    "AZ": "156",
+                    "BA": "KHHVT",
+                }
+                for letter, value in values.items():
+                    sheet.cell(row_number, app.excel_col_to_index(letter) + 1, value)
+
+            add_row(3, invoice="237", company="Công ty Dương Châu", mst="010A", product="Vật tư bỏ", quantity=0)
+            add_row(4, invoice="237", company="Công ty Dương Châu", mst="010A", product="Vật tư giữ", quantity=5)
+            add_row(5, invoice="237", company="Công ty Dương Châu", mst="010A", product="Vật tư giữ 2", quantity=7)
+            add_row(6, invoice="237", company="Công ty Khác", mst="010D", product="Vật tư công ty khác", quantity=9)
+            add_row(7, invoice="501", company="Công ty Dịch vụ", mst="010B", product="Dịch vụ kiểm định", quantity=0)
+            add_row(8, invoice="601", company="Công ty Phiếu chi", mst="010C", product="Xăng E10", quantity=0)
+            workbook.save(source)
+            workbook.close()
+
+            payload = {
+                "profile": "ho_guom",
+                "include_company_prefix": True,
+                "all_mst": ["010A", "010D", "010B", "010C"],
+                "process_mst": ["010A", "010D", "010B", "010C"],
+                "mst_safe_id": ["010A|||0", "010D|||1", "010B|||2", "010C|||3"],
+                "prefix_0": "DC",
+                "prefix_1": "KH",
+                "prefix_2": "DV",
+                "prefix_3": "PC",
+                "selected_products_0": ["Vật tư bỏ", "Vật tư giữ", "Vật tư giữ 2"],
+                "selected_products_1": ["Vật tư công ty khác"],
+                "selected_products_2": ["Dịch vụ kiểm định"],
+                "selected_products_3": ["Xăng E10"],
+                "company_group_assignments": {
+                    "010A": "materials",
+                    "010D": "materials",
+                    "010B": "services",
+                    "010C": "payment_voucher",
+                },
+            }
+            processed = app.process_workbook(source, output, payload)
+            code_index = app.excel_col_to_index("L")
+            product_index = app.excel_col_to_index("M")
+            group_index = processed.shape[1] - 1
+            data = {
+                app.raw_text(row.iloc[product_index]): (
+                    app.raw_text(row.iloc[code_index]),
+                    app.raw_text(row.iloc[group_index]),
+                )
+                for _, row in processed.iloc[2:].iterrows()
+            }
+
+            self.assertNotIn("Vật tư bỏ", data)
+            self.assertEqual(data["Vật tư giữ"], ("VT.DC.237.01", "materials"))
+            self.assertEqual(data["Vật tư giữ 2"], ("VT.DC.237.02", "materials"))
+            self.assertEqual(data["Vật tư công ty khác"], ("VT.KH.237.01", "materials"))
+            self.assertEqual(data["Dịch vụ kiểm định"], ("VT.DV.501.01", "services"))
+            self.assertEqual(data["Xăng E10"], ("VT.PC.601.01", "payment_voucher"))
+
+            sheets = app.fast_import_sheet_rows(
+                processed,
+                None,
+                form_mapping_presets=app.load_system_default_form_mappings(profile="ho_guom"),
+                require_inventory_columns=False,
+                include_duplicate_report=False,
+                profile="ho_guom",
+            )
+            material_sheets = {name: value for name, value in sheets.items() if name.startswith("IMEXPNG")}
+            self.assertEqual(set(sheets) - set(material_sheets), {"IMEXPN1", "IMEXPC1"})
+            self.assertEqual(len(material_sheets), 2)
+            self.assertEqual(sum(len(rows) for _, rows in material_sheets.values()), 3)
+            for _, rows in material_sheets.values():
+                self.assertTrue(all(row[app.excel_col_to_index("J")] == "KHHVT" for row in rows))
+                self.assertTrue(all(row[app.excel_col_to_index("P")] == "156" for row in rows))
+            self.assertEqual(len(sheets["IMEXPN1"][1]), 1)
+            self.assertEqual(len(sheets["IMEXPC1"][1]), 1)
+
+    def test_ho_guom_workflow_preflight_does_not_require_inventory_pairs(self):
+        import web_api
+        from product_code.workflow_runtime import WorkflowFailure
+
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "ho_guom.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            for column in range(1, 16):
+                sheet.cell(1, column, f"Cột {column}")
+            workbook.save(source)
+            workbook.close()
+
+            payload = {
+                "profile": "ho_guom",
+                "process_mst": ["010A"],
+                "company_col": "F",
+                "mst_col": "G",
+                "product_col": "M",
+                "qty_col": "O",
+                "inventory_pairs": [],
+            }
+            web_api.validate_workflow_process_payload(source, payload, app.VIETMAX_PHASE_PURCHASE)
+
+            payload["profile"] = "quang_thinh"
+            with self.assertRaises(WorkflowFailure) as raised:
+                web_api.validate_workflow_process_payload(source, payload, app.VIETMAX_PHASE_PURCHASE)
+            self.assertEqual(raised.exception.code, "INVENTORY_PAIR_REQUIRED")
+
+    def test_son_phuong_inventory_defaults_are_scoped_and_preserve_custom_values(self):
+        config = normalize_config({
+            "profiles": {
+                "son_phuong": {
+                    "inventory_allocation_config": {
+                        "scenario_count": 250,
+                        "sales_inventory_pairs": [
+                            {"id": "custom-materials", "role": "materials", "ma_kho": "KHH-CUSTOM", "tk_vat_tu": "1561"},
+                        ],
+                    },
+                    "scopes": {
+                        "purchase": {
+                            "inventory_pairs": [
+                                {"id": "purchase-custom", "role": "materials", "ma_kho": "KHH-MUA", "tk_vat_tu": "1562"},
+                            ],
+                        },
+                    },
+                },
+            },
+        })
+
+        profile = config["profiles"]["son_phuong"]
+        purchase_pairs = profile["scopes"]["purchase"]["inventory_pairs"]
+        sales_pairs = profile["inventory_allocation_config"]["sales_inventory_pairs"]
+        self.assertEqual(len(purchase_pairs), 1)
+        self.assertEqual(profile["inventory_allocation_config"]["policy"]["generic_min_type_count"], 2)
+
+        self.assertEqual(purchase_pairs[0]["ma_kho"], "KHH-MUA")
+        self.assertEqual(purchase_pairs[0]["tk_vat_tu"], "1562")
+        self.assertEqual(profile["inventory_allocation_config"]["scenario_count"], 250)
+        self.assertEqual(next(item for item in sales_pairs if item["role"] == "materials")["ma_kho"], "KHH-CUSTOM")
+        self.assertEqual(next(item for item in sales_pairs if item["role"] == "finished_goods")["ma_kho"], "KTP")
+        self.assertEqual(next(item for item in sales_pairs if item["role"] == "fallback")["ma_kho"], "KHOCK")
+
     def test_estimate_detector_supports_raw_layout_and_excel_control_markers(self):
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "raw_estimate.xlsx"
@@ -2974,6 +3233,86 @@ class ProcessWorkbookTests(unittest.TestCase):
         self.assertEqual(len(report_rows), 2)
         self.assertEqual({row[0] for row in report_rows}, {"777"})
         self.assertEqual({row[1] for row in report_rows}, {"KH-A", "KH-B"})
+
+    def test_son_phuong_allocation_builds_split_processed_sales_fdi(self):
+        from web_api import son_phuong_processed_sales_dataframe
+
+        max_col = app.excel_col_to_index("AU") + 1
+        rows = [[""] * max_col for _ in range(3)]
+        for col, header in {
+            "C": "Số HĐ",
+            "J": "MST người mua",
+            "L": "Mã VT",
+            "O": "Số lượng",
+            "S": "Tiền hàng quy đổi",
+            "V": "Tiền hàng",
+            "W": "Tiền thuế",
+            "AS": "TK vật tư",
+            "AT": "Mã kho",
+            "AU": "Mã khách hàng",
+        }.items():
+            rows[1][app.excel_col_to_index(col)] = header
+
+        for col, value in {
+            "C": "SP-001",
+            "J": "010TEST",
+            "L": "ONGHOP.CACLOAI",
+            "O": 10,
+            "S": 1000,
+            "V": 1000,
+            "W": 80,
+        }.items():
+            rows[2][app.excel_col_to_index(col)] = value
+
+        result = {
+            "allocations": [{
+                "row_number": 3,
+                "warehouse_code": "KHHVT",
+                "warehouse_account": "156",
+                "used": [
+                    {"ledger_variant_code": "ONG.20X20", "quantity": 4},
+                    {"ledger_variant_code": "ONG.30X30", "quantity": 6},
+                ],
+            }],
+        }
+        processed = son_phuong_processed_sales_dataframe(
+            app.pd.DataFrame(rows),
+            {"sales": {"header_row": 2, "data_start_row": 3, "code_col": "L", "qty_col": "O"}},
+            result,
+        )
+
+        self.assertEqual(len(processed), 4)
+        data_rows = processed.iloc[2:]
+        self.assertEqual(set(data_rows.iloc[:, app.excel_col_to_index("L")]), {"ONG.20X20", "ONG.30X30"})
+        self.assertAlmostEqual(float(data_rows.iloc[:, app.excel_col_to_index("O")].sum()), 10)
+        self.assertAlmostEqual(float(data_rows.iloc[:, app.excel_col_to_index("S")].sum()), 1000)
+        self.assertAlmostEqual(float(data_rows.iloc[:, app.excel_col_to_index("V")].sum()), 1000)
+        self.assertAlmostEqual(float(data_rows.iloc[:, app.excel_col_to_index("W")].sum()), 80)
+        self.assertEqual(set(data_rows.iloc[:, app.excel_col_to_index("AS")]), {"156"})
+        self.assertEqual(set(data_rows.iloc[:, app.excel_col_to_index("AT")]), {"KHHVT"})
+        self.assertEqual(set(data_rows.iloc[:, app.excel_col_to_index("AU")]), {"010TEST"})
+        self.assertEqual(set(data_rows.iloc[:, -1]), {"materials"})
+
+    def test_son_phuong_processed_sales_fdi_rejects_unresolved_material_shortage(self):
+        from web_api import son_phuong_processed_sales_dataframe
+
+        rows = [[""] * (app.excel_col_to_index("O") + 1) for _ in range(3)]
+        rows[1][app.excel_col_to_index("L")] = "Mã VT"
+        rows[1][app.excel_col_to_index("O")] = "Số lượng"
+        rows[2][app.excel_col_to_index("L")] = "ONGHOP.CACLOAI"
+        rows[2][app.excel_col_to_index("O")] = 10
+
+        with self.assertRaisesRegex(ValueError, "còn thiếu KHHVT thực"):
+            son_phuong_processed_sales_dataframe(
+                app.pd.DataFrame(rows),
+                {"sales": {"header_row": 2, "data_start_row": 3, "code_col": "L", "qty_col": "O"}},
+                {"allocations": [{
+                    "row_number": 3,
+                    "allocation_role": "materials",
+                    "unresolved_material_quantity": 2,
+                    "used": [{"ledger_variant_code": "ONG.20X20", "quantity": 8}],
+                }]},
+            )
 
     def test_fast_import_validation_requires_inventory_columns(self):
         outputs = Path(__file__).parent / "outputs"

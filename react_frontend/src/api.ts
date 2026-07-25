@@ -1,19 +1,35 @@
 import type { CompanyRow, EstimateAnalysis, EstimateSheetSelection, EstimateUploadSummary, FormatMappingDefaults, FormMappingPreset, GenericAnalyzeResult, InventoryAllocationConfig, InventoryAllocationJob, InventoryPair, InventoryRule, InvoiceStatusOption, LicenseStatus, MissingMstCompanyWarning, MatchRow, OperationProgress, ProcessResult, ProcessedFileStats, ReviewProduct, ReviewRow, UploadSummary, WorkflowJob, WorkflowSession, UpdateManifest } from './types';
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  const endpoint = response.url || 'API';
+  const parsePayload = () => {
+    if (!text.trim()) return { empty: true, value: null as unknown };
+    try {
+      return { empty: false, value: JSON.parse(text) as unknown };
+    } catch {
+      return { empty: false, value: null as unknown };
+    }
+  };
+  const parsed = parsePayload();
   if (response.ok) {
-    return response.json() as Promise<T>;
+    if (parsed.empty) {
+      throw new Error(`Backend trả về phản hồi rỗng từ ${endpoint}. Vui lòng thử lại, nếu còn lỗi hãy gửi trạng thái debug cho dev.`);
+    }
+    return parsed.value as T;
   }
-  const payload = await response.json().catch(() => ({}));
+  const payload = parsed.value && typeof parsed.value === 'object' ? parsed.value as Record<string, unknown> : {};
   const detail = payload.detail || payload.error;
   if (detail && typeof detail === 'object') {
-    const message = String(detail.message || response.statusText);
-    const code = String(detail.code || 'API_ERROR');
-    const operationId = String(detail.operation_id || '-');
+    const detailRecord = detail as Record<string, unknown>;
+    const message = String(detailRecord.message || response.statusText);
+    const code = String(detailRecord.code || 'API_ERROR');
+    const operationId = String(detailRecord.operation_id || '-');
     throw new Error(`${message} [${code}; ${operationId}]`);
   }
-  throw new Error(String(detail || response.statusText));
+  throw new Error(String(detail || text || `${response.status} ${response.statusText} từ ${endpoint}`));
 }
+
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000, timeoutMessage = 'Yêu cầu xử lý quá lâu và đã được dừng. Vui lòng thử lại hoặc kiểm tra file có đang mở trong Excel không.'): Promise<Response> {
   const controller = new AbortController();
@@ -220,8 +236,9 @@ export async function inspectProcessedVietmaxFile(savedName: string, phase: 'pur
   );
 }
 
-export async function getVietmaxFormatMappingDefaults(): Promise<FormatMappingDefaults> {
-  return parseJsonResponse<FormatMappingDefaults>(await fetch('/api/vietmax/format-mapping-defaults'));
+export async function getVietmaxFormatMappingDefaults(profile?: string): Promise<FormatMappingDefaults> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : '';
+  return parseJsonResponse<FormatMappingDefaults>(await fetch(`/api/vietmax/format-mapping-defaults${query}`));
 }
 
 export async function validateFastImportProcessedFile(savedName: string, phase: 'purchase' | 'sales'): Promise<{ valid_rows: number; tk_vat_tu_col: string; ma_kho_col: string }> {
@@ -235,21 +252,31 @@ export async function validateFastImportProcessedFile(savedName: string, phase: 
 }
 
 export async function getLicenseStatus(): Promise<LicenseStatus> {
-  return parseJsonResponse<LicenseStatus>(await fetch('/api/license/status'));
+  return parseJsonResponse<LicenseStatus>(await fetchWithTimeout(
+    '/api/license/status',
+    {},
+    10000,
+    'Kiểm tra license quá 10 giây chưa xong. Hãy kiểm tra kết nối tới license server rồi bấm Kiểm tra lại.',
+  ));
 }
 
 export async function activateLicense(payload: { license_key: string; server_url?: string; account_id?: string }): Promise<LicenseStatus> {
   return parseJsonResponse<LicenseStatus>(
-    await fetch('/api/license/activate', {
+    await fetchWithTimeout('/api/license/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-    }),
+    }, 30000, 'Kích hoạt license quá 30 giây chưa xong. Hãy kiểm tra kết nối tới license server rồi thử lại.'),
   );
 }
 
 export async function reloadLicense(): Promise<LicenseStatus> {
-  return parseJsonResponse<LicenseStatus>(await fetch('/api/license/reload', { method: 'POST' }));
+  return parseJsonResponse<LicenseStatus>(await fetchWithTimeout(
+    '/api/license/reload',
+    { method: 'POST' },
+    30000,
+    'Tải lại license quá 30 giây chưa xong. Hãy kiểm tra kết nối tới license server rồi thử lại.',
+  ));
 }
 
 export async function getOperationProgress(operationId: string): Promise<OperationProgress> {
@@ -423,12 +450,27 @@ export async function startInventoryAllocation(payload: { purchaseSavedName: str
   return parseJsonResponse<{ analysis_job_id: string }>(await fetch('/api/inventory-allocation/analyze-job', { method: 'POST', body: form }));
 }
 
-export async function getInventoryAllocationJob(jobId: string): Promise<InventoryAllocationJob> {
-  return parseJsonResponse<InventoryAllocationJob>(await fetch(`/api/inventory-allocation/analyze-job/${encodeURIComponent(jobId)}`));
+export async function getInventoryAllocationJob(jobId: string, includeReport = false): Promise<InventoryAllocationJob> {
+  const query = includeReport ? '?include_report=true' : '';
+  return parseJsonResponse<InventoryAllocationJob>(await fetch(`/api/inventory-allocation/analyze-job/${encodeURIComponent(jobId)}${query}`));
 }
 
-export async function downloadInventoryAllocationReport(jobId: string): Promise<Blob> {
-  const response = await fetch(`/api/inventory-allocation/download/${encodeURIComponent(jobId)}`);
+
+export async function createSonPhuongProcessedSales(jobId: string, operationId = ''): Promise<{ processed_sales_saved_name: string; result?: InventoryAllocationJob['result']; rows?: number; columns?: number }> {
+  const query = operationId ? `?operation_id=${encodeURIComponent(operationId)}` : '';
+  return parseJsonResponse<{ processed_sales_saved_name: string; result?: InventoryAllocationJob['result']; rows?: number; columns?: number }>(
+    await fetchWithTimeout(`/api/inventory-allocation/analyze-job/${encodeURIComponent(jobId)}/create-sales-fdi${query}`, { method: 'POST' }, 300000, workbookTimeoutMessage),
+  );
+}
+
+export async function downloadInventoryAllocationReport(jobId: string, operationId = ''): Promise<Blob> {
+  const query = operationId ? `?operation_id=${encodeURIComponent(operationId)}` : '';
+  const response = await fetchWithTimeout(
+    `/api/inventory-allocation/download/${encodeURIComponent(jobId)}${query}`,
+    {},
+    300000,
+    'Tạo báo cáo Phân kho quá 5 phút chưa xong. Hãy kiểm tra trạng thái lỗi và thử lại.',
+  );
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(String(payload.detail || payload.error || response.statusText));

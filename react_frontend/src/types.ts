@@ -127,6 +127,7 @@ export type OperationProgress = {
   total: number;
   percent: number;
   label: string;
+  unit?: 'rows' | 'steps' | 'percent';
 };
 
 export type ProcessResult = {
@@ -195,9 +196,16 @@ export type InventoryAllocationMapping = {
 export type InventoryAllocationPolicy = {
   max_loss_percent: number | null;
   max_profit_percent: number | null;
+  generic_min_take_quantity?: number | null;
+  generic_max_take_quantity?: number | null;
+  generic_min_type_count?: number;
+  barem_tolerance_percent?: number;
+  barem_remainder_max_kg?: number | null;
   ignore_sale_suffix: boolean;
   allow_negative_export: boolean;
   company_profile: string;
+  sales_inventory_pairs?: InventoryPair[];
+  scenario_count?: number;
   allow_future_purchase_reorder: boolean;
   future_purchase_window_days: number;
 };
@@ -205,6 +213,9 @@ export type InventoryAllocationPolicy = {
 export type InventoryAllocationConfig = {
   mapping: InventoryAllocationMapping;
   policy: InventoryAllocationPolicy;
+  sales_inventory_pairs?: InventoryPair[];
+  sales_inventory_pair_rules?: InventoryRule[];
+  scenario_count?: number;
 };
 
 export type InventoryAllocationSummary = {
@@ -212,6 +223,7 @@ export type InventoryAllocationSummary = {
   purchase_quantity?: number;
   sales_quantity?: number;
   material_quantity?: number;
+  unresolved_material_quantity?: number;
   finished_quantity?: number;
   sale_only_code_count?: number;
   range_rejected_lines?: number;
@@ -326,14 +338,41 @@ export type InventoryAllocationReportView = {
   ledger_detail_rows?: InventoryLedgerDetailRow[];
 };
 
+
+export type InventoryAllocationRow = {
+  row_number: number;
+  variant_code: string;
+  product_name: string;
+  quantity: number;
+  invoice_no?: string;
+  invoice_date?: string;
+  sale_split_codes?: string;
+  material_quantity: number;
+  unresolved_material_quantity?: number;
+  finished_quantity: number;
+  allocation_role?: 'materials' | 'finished_goods' | 'fallback' | string;
+  warehouse_code?: string;
+  warehouse_account?: string;
+  remainder_warehouse_code?: string;
+  remainder_warehouse_account?: string;
+  negative_warning?: boolean;
+  generic_plan_note?: string;
+  detail?: string;
+  inventory_before_detail?: string;
+  inventory_after_detail?: string;
+};
+
 export type InventoryAllocationResult = {
   job_id: string;
   filename: string;
+  processed_sales_saved_name?: string;
   summary?: InventoryAllocationSummary;
   warnings?: string[];
   allocation_count?: number;
   stock_count?: number;
   verification?: Array<{ group: string; check: string; status: string; difference?: number; explanation?: string }>;
+  allocations?: InventoryAllocationRow[];
+  missing_barem_report?: Array<{ variant_code: string; product_name?: string; quantity?: number; invoice_no?: string; invoice_date?: string; row_number?: number | string; profile_key?: string; steel_kind?: string; steel_coating?: string; steel_dimension?: string; status?: string; reason?: string }>;
   report_view?: InventoryAllocationReportView;
 };
 
@@ -433,6 +472,8 @@ export type InventoryPair = {
   id: string;
   ma_kho: string;
   tk_vat_tu: string;
+  role?: 'materials' | 'finished_goods' | 'fallback' | string;
+  label?: string;
 };
 
 export type InventoryRule = {

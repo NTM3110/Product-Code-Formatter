@@ -27,6 +27,7 @@ from app import (
     configured_license_server_url,
     configured_license_server_urls,
     APP_DATA_DIR,
+    LICENSE_PATH,
     DEFAULT_INVOICE_STATUS_COL,
     DEFAULT_INVOICE_STATUS_SKIP_VALUES,
     ICON_PATH,
@@ -52,10 +53,13 @@ from app import (
     empty_profile_config,
     excel_col_to_index,
     index_to_excel_col,
+    inventory_column_indexes,
     invoice_status_options,
     license_allows_profile,
     license_has_local_activation,
     load_config,
+    load_license_config,
+    normalize_son_phuong_allocation_config,
     make_excel_workbook,
     make_product_part,
     merge_price_ranges,
@@ -88,6 +92,7 @@ from app import (
     fast_import_multi_sheet_workbook,
     validate_vietmax_processed_purchase_workbook,
     validate_fast_import_processed_dataframe,
+    ho_guom_default_source_columns,
     vietmax_default_source_columns,
     vietmax_ban_ra_match_key,
     vietmax_ban_ra_sales_products_from_workbook,
@@ -95,11 +100,21 @@ from app import (
     vietmax_product_review_rows,
     vietmax_purchase_match_export_rows,
     vietmax_purchase_products_from_workbook,
+    customer_code_column_index,
+    write_dataframe_workbook,
 )
 
 from inventory_allocation_app.app import (
     OUTPUT_DIR as INVENTORY_OUTPUT_DIR,
+    build_inventory_ledger,
+    build_sales_report_rows,
+    build_sales_report_rows_from_ledger,
+    build_verification_rows,
+    create_output_workbook as create_inventory_output_workbook,
     get_analysis_job as get_inventory_analysis_job,
+    iso_in_line_range,
+    output_filename as inventory_output_filename,
+    report_view_for_ui,
     run_analysis_job as run_inventory_analysis_job,
     update_analysis_job as update_inventory_analysis_job,
 )
@@ -766,6 +781,120 @@ def safe_xlsx_download_name(original_name: str, suffix: str) -> str:
     return f"{safe_stem}{suffix}.xlsx"
 
 
+def public_inventory_allocation_result(result: dict, include_report: bool = False) -> dict:
+    public_result = {
+        key: value
+        for key, value in result.items()
+        if not str(key).startswith("_")
+    }
+    for key in (
+        "ledger",
+        "stock_rows",
+        "sales_report_rows",
+        "sale_only_codes",
+        "company_detection_rules",
+        "future_purchase_reorder_report",
+    ):
+        public_result.pop(key, None)
+    allocation_keys = (
+        "row_number",
+        "variant_code",
+        "base_code",
+        "product_name",
+        "quantity",
+        "invoice_no",
+        "invoice_date",
+        "invoice_date_iso",
+        "sale_split_codes",
+        "material_quantity",
+        "unresolved_material_quantity",
+        "finished_quantity",
+        "finished_variant_code",
+        "allocation_role",
+        "warehouse_code",
+        "warehouse_account",
+        "remainder_warehouse_code",
+        "remainder_warehouse_account",
+        "negative_warning",
+        "generic_plan_note",
+        "inventory_before_detail",
+        "detail",
+        "inventory_after_detail",
+        "rejected_detail",
+    )
+    public_result["allocations"] = [
+        {key: allocation.get(key) for key in allocation_keys if key in allocation}
+        for allocation in (public_result.get("allocations") or [])
+        if isinstance(allocation, dict)
+    ]
+    if not include_report:
+        public_result.pop("report_view", None)
+    return public_result
+
+
+def hydrate_inventory_allocation_report(result: dict) -> dict:
+    if result.get("report_view") and result.get("ledger"):
+        return result
+    purchase_lines = result.get("_purchase_lines") or []
+    sales_lines = result.get("_sales_lines") or []
+    opening_lines = result.get("_opening_lines") or []
+    allocations = result.get("_allocations") or []
+    if not allocations:
+        # Jobs created before complete allocations were retained can still be
+        # hydrated from their private sales source rows. Allocation decisions
+        # override source fields, while revenue, tax and unit price are restored.
+        sales_by_row = {
+            row.get("row_number"): row
+            for row in sales_lines
+            if isinstance(row, dict) and row.get("row_number") is not None
+        }
+        allocations = [
+            {**sales_by_row.get(row.get("row_number"), {}), **row}
+            for row in (result.get("allocations") or [])
+            if isinstance(row, dict)
+        ]
+    policy = result.get("policy") or {}
+    company_profile = str(policy.get("company_profile") or "yen_thanh")
+    ledger = build_inventory_ledger(
+        opening_lines,
+        purchase_lines,
+        allocations,
+        sales_lines=sales_lines,
+        company_profile=company_profile,
+    )
+    ledger["date_range"] = iso_in_line_range(purchase_lines, sales_lines)
+    sales_report_rows = (
+        build_sales_report_rows_from_ledger(ledger)
+        if ledger
+        else build_sales_report_rows(allocations, purchase_lines, sales_lines)
+    )
+    verification_rows = build_verification_rows(
+        purchase_lines,
+        sales_lines,
+        allocations,
+        ledger,
+        sales_report_rows,
+        policy,
+    )
+    return {
+        **result,
+        "_allocations": allocations,
+        "ledger": ledger,
+        "sales_report_rows": sales_report_rows,
+        "verification": [{
+            "group": row[0],
+            "check": row[1],
+            "original_value": row[2],
+            "processed_value": row[3],
+            "difference": row[4],
+            "tolerance": row[5],
+            "status": row[6],
+            "explanation": row[7],
+        } for row in verification_rows],
+        "report_view": report_view_for_ui(ledger, sales_report_rows),
+    }
+
+
 def create_app() -> FastAPI:
     api = FastAPI(title="ProductCodeFormatter API", version="0.1.0")
     api.add_middleware(
@@ -948,7 +1077,10 @@ def create_app() -> FastAPI:
 
     @api.get("/api/license/status")
     def license_status() -> dict:
-        return public_license_status(load_config())
+        # License state is stored separately. Avoid loading and migrating the
+        # potentially large workflow config for this lightweight status check.
+        config = {"license": load_license_config()} if LICENSE_PATH.exists() else load_config()
+        return public_license_status(config)
 
     @api.post("/api/license/activate")
     def activate_license(payload: LicenseActivationRequest) -> dict:
@@ -1173,13 +1305,15 @@ def create_app() -> FastAPI:
         return await upload_excel(file)
 
     @api.get("/api/vietmax/format-mapping-defaults")
-    def vietmax_format_mapping_defaults() -> dict:
+    def vietmax_format_mapping_defaults(profile: str = "") -> dict:
+        normalized_profile = profile_key(profile) if raw_text(profile) else ""
+        source_columns = ho_guom_default_source_columns if normalized_profile == "ho_guom" else vietmax_default_source_columns
         return json_safe({
             "source_columns": {
-                "purchase": vietmax_default_source_columns(VIETMAX_PHASE_PURCHASE),
-                "sales": vietmax_default_source_columns(VIETMAX_PHASE_SALES),
+                "purchase": source_columns(VIETMAX_PHASE_PURCHASE),
+                "sales": source_columns(VIETMAX_PHASE_SALES),
             },
-            "form_mapping_presets": load_system_default_form_mappings(),
+            "form_mapping_presets": load_system_default_form_mappings(profile=normalized_profile),
         })
 
     @api.post("/api/invoice_statuses")
@@ -1214,6 +1348,8 @@ def create_app() -> FastAPI:
                 profile_cfg,
                 invoice_status_col=payload.invoice_status_col,
                 invoice_status_skip_values=payload.invoice_status_skip_values,
+                allow_zero_quantity=profile == "ho_guom",
+                data_start_row=2 if profile == "ho_guom" else 0,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1486,7 +1622,7 @@ def create_app() -> FastAPI:
                     form_mapping_presets = process_payload.get("form_mapping_presets") if isinstance(process_payload.get("form_mapping_presets"), list) else []
                 else:
                     saved_form_mapping_presets = profile_cfg.get("form_mapping_presets")
-                    form_mapping_presets = saved_form_mapping_presets if isinstance(saved_form_mapping_presets, list) else load_system_default_form_mappings(input_phase)
+                    form_mapping_presets = saved_form_mapping_presets if isinstance(saved_form_mapping_presets, list) else load_system_default_form_mappings(input_phase, profile)
                 final_stream = generic_form_mapping_export_workbook_stream(
                     processed_df,
                     form_mapping_presets=form_mapping_presets,
@@ -1795,6 +1931,24 @@ def create_app() -> FastAPI:
             "inventory_pair_rules": normalize_inventory_pair_rules(keep_existing_when_empty(payload, profile_cfg, "inventory_pair_rules", [])),
             "inventory_allocation_config": keep_existing_when_empty(payload, profile_cfg, "inventory_allocation_config", {}),
         })
+        if payload.get("replace_form_mapping_presets") is True:
+            incoming_form_ids = {
+                raw_text(form.get("id"))
+                for form in (payload.get("form_mapping_presets") or [])
+                if isinstance(form, dict) and raw_text(form.get("id"))
+            }
+            default_form_ids = {
+                raw_text(form.get("id"))
+                for form in load_system_default_form_mappings(phase, profile)
+                if isinstance(form, dict) and raw_text(form.get("id"))
+            }
+            profile_cfg["disabled_default_form_ids"] = sorted(default_form_ids - incoming_form_ids)
+            profile_cfg["form_mapping_initialized"] = True
+        if profile == "son_phuong" and isinstance(payload.get("inventory_allocation_config"), dict):
+            root_profile = cfg.setdefault("profiles", {}).setdefault(profile, {})
+            root_profile["inventory_allocation_config"] = normalize_son_phuong_allocation_config(
+                payload.get("inventory_allocation_config")
+            )
         if stable_signature(profile_cfg) != previous_profile_signature:
             invalidation_kinds = [f"processed:{profile}:{phase}"]
             if phase == VIETMAX_PHASE_PURCHASE:
@@ -1923,6 +2077,11 @@ def create_app() -> FastAPI:
             purchase_content = workbook_content_for_openpyxl(purchase_path)
             sales_content = workbook_content_for_openpyxl(sales_path)
             job_id = uuid.uuid4().hex
+            update_inventory_analysis_job(
+                job_id,
+                _sales_saved_name=sales_saved_name,
+                _sales_mapping=raw_mapping,
+            )
             update_inventory_analysis_job(job_id, status="queued", progress=0, done=0, total=0, label="Đã nhận file. Đang xếp hàng phân bổ tồn kho...")
             worker = threading.Thread(
                 target=run_inventory_analysis_job,
@@ -1935,35 +2094,160 @@ def create_app() -> FastAPI:
                     allocation_policy,
                     sales_original_name or sales_path.name,
                 ),
+                kwargs={"defer_workbook": True},
                 daemon=True,
             )
             worker.start()
-            return {"analysis_job_id": job_id}
+            return JSONResponse({"analysis_job_id": job_id})
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.get("/api/inventory-allocation/analyze-job/{job_id}")
-    def inventory_allocation_job_status(job_id: str) -> dict:
+    def inventory_allocation_job_status(job_id: str, include_report: bool = False) -> dict:
         if not re_fullmatch_hex(job_id):
             raise HTTPException(status_code=404, detail="Mã xử lý không hợp lệ.")
         job = get_inventory_analysis_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Không tìm thấy tiến trình phân bổ tồn kho.")
-        return json_safe(job)
+        public_job = {key: value for key, value in job.items() if not str(key).startswith("_")}
+        result = public_job.get("result")
+        if isinstance(result, dict):
+            if include_report and not result.get("report_view"):
+                result = hydrate_inventory_allocation_report(result)
+                update_inventory_analysis_job(job_id, result=result)
+            # Raw rows stay server-side for later report/FDI generation.
+            public_job["result"] = public_inventory_allocation_result(result, include_report)
+        return JSONResponse(json_safe(public_job))
 
-    @api.get("/api/inventory-allocation/download/{job_id}")
-    def inventory_allocation_download(job_id: str) -> Response:
+
+    @api.post("/api/inventory-allocation/analyze-job/{job_id}/create-sales-fdi")
+    def inventory_allocation_create_sales_fdi(job_id: str, operation_id: str = "") -> dict:
+        update_progress_job(operation_id, 0, 4, "Đang kiểm tra kết quả Phân kho", status="running", unit="steps")
         if not re_fullmatch_hex(job_id):
+            update_progress_job(operation_id, 4, 4, "Mã xử lý không hợp lệ", status="error", unit="steps")
+            raise HTTPException(status_code=404, detail="Ma xu ly khong hop le.")
+        job = get_inventory_analysis_job(job_id)
+        if not job:
+            update_progress_job(operation_id, 4, 4, "Không tìm thấy kết quả Phân kho", status="error", unit="steps")
+            raise HTTPException(status_code=404, detail="Khong tim thay tien trinh phan kho.")
+        if job.get("status") != "complete":
+            update_progress_job(operation_id, 4, 4, "Phân kho chưa hoàn tất", status="error", unit="steps")
+            raise HTTPException(status_code=400, detail="Can chay xong Phan kho truoc khi tao FDI ban ra.")
+        result = job.get("result") if isinstance(job.get("result"), dict) else None
+        if not result:
+            update_progress_job(operation_id, 4, 4, "Kết quả Phân kho không hợp lệ", status="error", unit="steps")
+            raise HTTPException(status_code=400, detail="Ket qua Phan kho khong hop le.")
+        if result.get("policy", {}).get("company_profile") != "son_phuong":
+            update_progress_job(operation_id, 4, 4, "Kết quả không thuộc profile Sơn Phương", status="error", unit="steps")
+            raise HTTPException(status_code=400, detail="Chi profile Son Phuong moi tao FDI ban ra tu ket qua Phan kho.")
+        existing_saved_name = str(result.get("processed_sales_saved_name") or "")
+        if existing_saved_name:
+            try:
+                existing_path = uploaded_path(existing_saved_name)
+                if existing_path.exists():
+                    update_progress_job(operation_id, 4, 4, "Đã tìm thấy FDI bán ra trong cache", status="complete", unit="steps")
+                    return json_safe({
+                        "processed_sales_saved_name": existing_saved_name,
+                        "result": public_inventory_allocation_result(result),
+                    })
+            except Exception:
+                pass
+        sales_saved_name = str(job.get("_sales_saved_name") or "")
+        if not sales_saved_name:
+            update_progress_job(operation_id, 4, 4, "Thiếu file bán ra nguồn", status="error", unit="steps")
+            raise HTTPException(status_code=400, detail="Thieu file ban ra nguon cua job Phan kho.")
+        try:
+            update_progress_job(operation_id, 1, 4, "Đang tạo các dòng FDI bán ra đã Phân kho", status="running", unit="steps")
+            saved_name, processed_df = cache_son_phuong_processed_sales_workbook(
+                uploaded_path(sales_saved_name),
+                job.get("_sales_mapping") or {},
+                result,
+            )
+            update_progress_job(operation_id, 3, 4, "Đang đăng ký cache FDI bán ra", status="running", unit="steps")
+            artifact = WORKFLOW_SESSION_STORE.register_file(
+                saved_name,
+                kind="processed:son_phuong:sales",
+                original_name=result.get("filename") or "son_phuong_ban_ra_da_phan_kho.xls",
+                metadata={
+                    "profile": "son_phuong",
+                    "phase": "sales",
+                    "source": "inventory_allocation",
+                    "rows": int(len(processed_df.index)),
+                    "columns": int(processed_df.shape[1]),
+                },
+                supersede_kind=True,
+            )
+            result = {
+                **result,
+                "processed_sales_saved_name": saved_name,
+                "processed_sales_artifact": artifact,
+            }
+            update_inventory_analysis_job(job_id, result=result)
+            update_progress_job(operation_id, 4, 4, "Đã tạo xong FDI bán ra đã Phân kho", status="complete", unit="steps")
+            return json_safe({
+                "processed_sales_saved_name": saved_name,
+                "processed_sales_artifact": artifact,
+                "rows": int(len(processed_df.index)),
+                "columns": int(processed_df.shape[1]),
+                "result": public_inventory_allocation_result(result),
+            })
+        except Exception as exc:
+            update_progress_job(operation_id, 4, 4, f"Không tạo được FDI bán ra: {exc}", status="error", unit="steps")
+            raise HTTPException(status_code=400, detail=f"Khong tao duoc FDI ban ra da Phan kho: {exc}") from exc
+    @api.get("/api/inventory-allocation/download/{job_id}")
+    def inventory_allocation_download(job_id: str, operation_id: str = "") -> Response:
+        update_progress_job(operation_id, 0, 100, "Đang kiểm tra báo cáo Phân kho", status="running", unit="percent")
+        if not re_fullmatch_hex(job_id):
+            update_progress_job(operation_id, 100, 100, "Mã kết quả không hợp lệ", status="error", unit="percent")
             raise HTTPException(status_code=404, detail="Mã kết quả không hợp lệ.")
         matching = list(INVENTORY_OUTPUT_DIR.glob(f"{job_id}_*.xlsx"))
         if not matching:
-            raise HTTPException(status_code=404, detail="Không tìm thấy file kết quả phân bổ tồn kho.")
+            job = get_inventory_analysis_job(job_id)
+            result = job.get("result") if isinstance(job, dict) and isinstance(job.get("result"), dict) else None
+            if not result or job.get("status") != "complete":
+                update_progress_job(operation_id, 100, 100, "Không tìm thấy kết quả Phân kho", status="error", unit="percent")
+                raise HTTPException(status_code=404, detail="Không tìm thấy kết quả Phân kho để tạo báo cáo.")
+            try:
+                update_progress_job(operation_id, 3, 100, "Đang chuẩn bị dữ liệu báo cáo Phân kho", status="running", unit="percent")
+                result = hydrate_inventory_allocation_report(result)
+                update_inventory_analysis_job(job_id, result=result)
+
+                def report_progress(done, total, label):
+                    total = max(1, int(total or 1))
+                    mapped = 5 + int((max(0, min(int(done or 0), total)) / total) * 80)
+                    update_progress_job(operation_id, mapped, 100, label, status="running", unit="percent")
+
+                output = create_inventory_output_workbook(
+                    result.get("_sales_content"),
+                    result.get("_sales_mapping") or {},
+                    result.get("_allocations") or result.get("allocations") or [],
+                    result.get("stock_rows") or [],
+                    result.get("summary") or {},
+                    result.get("policy") or {},
+                    result.get("sale_only_codes") or [],
+                    purchase_lines=result.get("_purchase_lines") or [],
+                    sales_lines=result.get("_sales_lines") or [],
+                    ledger=result.get("ledger") or {},
+                    missing_barem_report=result.get("missing_barem_report") or [],
+                    ambiguous_steel_rows=result.get("_ambiguous_steel_rows") or result.get("ambiguous_steel_rows") or [],
+                    progress_callback=report_progress,
+                )
+                filename = Path(str(result.get("filename") or inventory_output_filename("bao_cao.xlsx"))).name
+                path = INVENTORY_OUTPUT_DIR / f"{job_id}_{filename}"
+                path.write_bytes(output.getvalue())
+                matching = [path]
+            except Exception as exc:
+                update_progress_job(operation_id, 100, 100, f"Không tạo được báo cáo Phân kho: {exc}", status="error", unit="percent")
+                raise HTTPException(status_code=400, detail=f"Không tạo được báo cáo Phân kho: {exc}") from exc
         path = matching[0]
         filename = safe_download_name(path.name[len(job_id) + 1:])
         try:
+            update_progress_job(operation_id, 90, 100, "Đang chuyển báo cáo sang định dạng XLS", status="running", unit="percent")
             stream = openpyxl_workbook_to_xls_stream(path)
         except ValueError as exc:
+            update_progress_job(operation_id, 100, 100, str(exc), status="error", unit="percent")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        update_progress_job(operation_id, 100, 100, "Đã tạo xong báo cáo Phân kho", status="complete", unit="percent")
         return Response(
             stream.getvalue(),
             media_type=XLS_MEDIA_TYPE,
@@ -2074,7 +2358,8 @@ def inspect_vietmax_processed_file(path: Path, phase: str) -> dict:
 def validate_workflow_process_payload(path: Path, payload: dict, phase: str):
     pairs = normalize_inventory_pairs(payload.get("inventory_pairs") or [])
     active_companies = [raw_text(value) for value in (payload.get("process_mst") or []) if raw_text(value)]
-    if active_companies and not pairs:
+    requires_inventory_pairs = profile_key(payload.get("profile")) != "ho_guom"
+    if requires_inventory_pairs and active_companies and not pairs:
         raise WorkflowFailure(
             "INVENTORY_PAIR_REQUIRED",
             "Chưa có cặp Mã kho / TK vật tư cho nhóm vật tư. Hãy quay lại cấu hình nâng cao và thêm ít nhất một cặp trước khi tạo file.",
@@ -2087,7 +2372,7 @@ def validate_workflow_process_payload(path: Path, payload: dict, phase: str):
         pair for pair in pairs
         if not raw_text(pair.get("ma_kho")) or not raw_text(pair.get("tk_vat_tu"))
     ]
-    if incomplete_pairs:
+    if requires_inventory_pairs and incomplete_pairs:
         raise WorkflowFailure(
             "INVENTORY_PAIR_INCOMPLETE",
             "Có cặp phân kho chưa nhập đủ Mã kho và TK vật tư.",
@@ -2158,8 +2443,20 @@ def validate_form_mapping_columns(forms):
         )
 
 def run_workflow_process_job(path, original_name, process_payload, processor, kind, signature, progress):
+    process_payload = dict(process_payload)
     phase = normalize_vietmax_phase(process_payload.get("vietmax_phase"))
     profile = profile_key(process_payload.get("profile") or VIETMAX_PROFILE)
+    if profile == "ho_guom":
+        process_payload.update({
+            "inventory_pairs": [],
+            "inventory_pair_rules": [],
+            "use_default_inventory_pair": False,
+            "default_inventory_pair_id": "",
+            "word_rules": {},
+            "first_word_rules": {},
+            "repeated_phrase_removals": [],
+            "product_code_replacements": {},
+        })
     validate_workflow_process_payload(path, process_payload, phase)
     progress(1, 5, "Đã kiểm tra file nguồn và cấu hình")
     processed_purchase_saved_name = raw_text(process_payload.get("vietmax_processed_purchase_saved_name"))
@@ -2259,6 +2556,205 @@ def cache_workbook_stream(stream, prefix="processed") -> str:
     return saved_name
 
 
+def _inventory_mapping_section(raw_mapping, phase):
+    mapping = raw_mapping.get(phase) if isinstance(raw_mapping, dict) else {}
+    return mapping if isinstance(mapping, dict) else {}
+
+
+def _inventory_mapping_row(mapping, key, fallback):
+    try:
+        return max(1, int(mapping.get(key) or fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _inventory_mapping_column(mapping, key, fallback):
+    value = raw_text(mapping.get(key) or fallback).upper()
+    return excel_col_to_index(value)
+
+
+def _number_or_none(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text_value = raw_text(value).replace(" ", "")
+    if not text_value:
+        return None
+    if "," in text_value and "." in text_value:
+        if text_value.rfind(",") > text_value.rfind("."):
+            text_value = text_value.replace(".", "").replace(",", ".")
+        else:
+            text_value = text_value.replace(",", "")
+    elif "," in text_value:
+        text_value = text_value.replace(",", ".")
+    try:
+        return float(text_value)
+    except ValueError:
+        return None
+
+
+def _son_phuong_group_column_index(df, header_index):
+    for column_index in range(df.shape[1]):
+        if normalized_header_label(cell(df, header_index, column_index)) in {
+            "nhom xu ly",
+            "processing group",
+            "processing_group",
+        }:
+            return column_index
+    column_index = df.shape[1]
+    df[column_index] = ""
+    df.iat[header_index, column_index] = "Nh\u00f3m x\u1eed l\u00fd"
+    return column_index
+
+
+def _son_phuong_allocation_parts(allocation):
+    grouped = {}
+
+    def add_part(code, quantity, warehouse_code, warehouse_account):
+        quantity_value = _number_or_none(quantity) or 0
+        code_value = raw_text(code)
+        if quantity_value <= 0 or not code_value:
+            return
+        key = (code_value, raw_text(warehouse_code), raw_text(warehouse_account))
+        if key not in grouped:
+            grouped[key] = {
+                "code": code_value,
+                "quantity": 0.0,
+                "warehouse_code": key[1],
+                "warehouse_account": key[2],
+            }
+        grouped[key]["quantity"] += quantity_value
+
+    for used in allocation.get("used") or []:
+        add_part(
+            used.get("ledger_variant_code") or used.get("variant_code"),
+            used.get("quantity"),
+            allocation.get("warehouse_code") or "KHHVT",
+            allocation.get("warehouse_account") or "156",
+        )
+    add_part(
+        allocation.get("finished_variant_code") or allocation.get("variant_code"),
+        allocation.get("finished_quantity"),
+        allocation.get("remainder_warehouse_code"),
+        allocation.get("remainder_warehouse_account"),
+    )
+    return list(grouped.values())
+
+
+def son_phuong_processed_sales_dataframe(source_df, raw_mapping, result):
+    if source_df is None or source_df.empty:
+        raise ValueError("File b\u00e1n ra kh\u00f4ng c\u00f3 d\u1eef li\u1ec7u.")
+
+    mapping = _inventory_mapping_section(raw_mapping, "sales")
+    header_index = _inventory_mapping_row(mapping, "header_row", 2) - 1
+    data_start_index = _inventory_mapping_row(mapping, "data_start_row", header_index + 2) - 1
+    if header_index >= len(source_df):
+        raise ValueError("D\u00f2ng header b\u00e1n ra n\u1eb1m ngo\u00e0i file.")
+    data_start_index = max(header_index + 1, data_start_index)
+
+    code_index = _inventory_mapping_column(mapping, "code_col", "L")
+    quantity_index = _inventory_mapping_column(mapping, "qty_col", "O")
+    required_index = max(code_index, quantity_index)
+    if required_index >= source_df.shape[1]:
+        raise ValueError("C\u1ed9t M\u00e3 VT ho\u1eb7c S\u1ed1 l\u01b0\u1ee3ng b\u00e1n ra n\u1eb1m ngo\u00e0i file.")
+
+    working = source_df.copy()
+    tk_vat_tu_index, ma_kho_index = inventory_column_indexes(working, header_index)
+    customer_code_index = customer_code_column_index(working, header_index)
+    group_index = _son_phuong_group_column_index(working, header_index)
+    buyer_mst_index = excel_col_to_index("J")
+    amount_indexes = [
+        index
+        for index in (excel_col_to_index("S"), excel_col_to_index("V"), excel_col_to_index("W"))
+        if index < working.shape[1]
+    ]
+
+    allocations_by_row = {}
+    for allocation in result.get("allocations") or []:
+        try:
+            excel_row = int(allocation.get("row_number"))
+        except (TypeError, ValueError):
+            continue
+        allocations_by_row[excel_row] = allocation
+
+    unresolved = [
+        allocation for allocation in allocations_by_row.values()
+        if raw_text(allocation.get("allocation_role")) == "materials"
+        and (_number_or_none(allocation.get("unresolved_material_quantity")) or 0) > 0
+    ]
+    if unresolved:
+        rows = ", ".join(str(item.get("row_number") or "?") for item in unresolved[:12])
+        suffix = "..." if len(unresolved) > 12 else ""
+        raise ValueError(
+            f"Chưa thể tạo FDI bán ra: còn thiếu KHHVT thực ở dòng {rows}{suffix}. "
+            "Bổ sung hoặc điều chỉnh tồn kho trước khi xuất FAST."
+        )
+
+    output_rows = [working.iloc[row_index].tolist() for row_index in range(min(data_start_index, len(working)))]
+    split_count = 0
+    for row_index in range(data_start_index, len(working)):
+        source_row = working.iloc[row_index].tolist()
+        allocation = allocations_by_row.get(row_index + 1)
+        if not allocation:
+            output_rows.append(source_row)
+            continue
+
+        parts = _son_phuong_allocation_parts(allocation)
+        if not parts:
+            raise ValueError(
+                f"D\u00f2ng {row_index + 1} kh\u00f4ng c\u00f3 ph\u1ea7n ph\u00e2n kho h\u1ee3p l\u1ec7 "
+                f"cho M\u00e3 VT {raw_text(source_row[code_index]) or '-'}."
+            )
+
+        original_quantity = _number_or_none(source_row[quantity_index])
+        if original_quantity is None or original_quantity <= 0:
+            original_quantity = sum(part["quantity"] for part in parts)
+        customer_code = raw_text(source_row[customer_code_index])
+        if not customer_code and buyer_mst_index < len(source_row):
+            customer_code = raw_text(source_row[buyer_mst_index])
+
+        distributed_amounts = {column_index: 0.0 for column_index in amount_indexes}
+        for part_index, part in enumerate(parts):
+            next_row = list(source_row)
+            next_row[code_index] = part["code"]
+            next_row[quantity_index] = part["quantity"]
+            next_row[tk_vat_tu_index] = part["warehouse_account"]
+            next_row[ma_kho_index] = part["warehouse_code"]
+            next_row[customer_code_index] = customer_code
+            next_row[group_index] = "materials"
+
+            ratio = part["quantity"] / original_quantity if original_quantity else 0
+            for amount_index in amount_indexes:
+                original_amount = _number_or_none(source_row[amount_index])
+                if original_amount is None:
+                    continue
+                if part_index == len(parts) - 1:
+                    split_amount = original_amount - distributed_amounts[amount_index]
+                else:
+                    split_amount = original_amount * ratio
+                    distributed_amounts[amount_index] += split_amount
+                next_row[amount_index] = split_amount
+            output_rows.append(next_row)
+            split_count += 1
+
+    if not split_count:
+        raise ValueError("K\u1ebft qu\u1ea3 Ph\u00e2n kho kh\u00f4ng t\u1ea1o \u0111\u01b0\u1ee3c d\u00f2ng FDI b\u00e1n ra.")
+    return pd.DataFrame(output_rows)
+
+
+def cache_son_phuong_processed_sales_workbook(source_path, raw_mapping, result):
+    sheet_name, source_df = read_workbook(source_path)
+    processed_df = son_phuong_processed_sales_dataframe(source_df, raw_mapping, result)
+    validate_fast_import_processed_dataframe(
+        processed_df,
+        "FDI b\u00e1n ra S\u01a1n Ph\u01b0\u01a1ng sau Ph\u00e2n kho",
+    )
+    saved_name = f"processed_son_phuong_sales_{uuid.uuid4().hex}.xls"
+    write_dataframe_workbook(processed_df, sheet_name or "FDI_ban_ra", UPLOAD_DIR / saved_name)
+    return saved_name, processed_df
+
+
 def dataframe_raw_rows(df: pd.DataFrame) -> list[list]:
     return [
         [cell(df, row_index, col_index) for col_index in range(df.shape[1])]
@@ -2326,6 +2822,7 @@ def generic_form_mapping_export_workbook_stream(processed_df, form_mapping_prese
         require_inventory_columns=False,
         include_duplicate_report=False,
         use_default_forms_when_empty=False,
+        profile=profile,
     )
     tabular_sheets = dict(form_sheets)
     if not tabular_sheets:
@@ -2341,7 +2838,7 @@ def cleanup_progress_jobs(now=None):
         PROGRESS_JOBS.pop(key, None)
 
 
-def update_progress_job(operation_id: str, done: int, total: int, label: str, status: str = "running") -> None:
+def update_progress_job(operation_id: str, done: int, total: int, label: str, status: str = "running", unit: str = "rows") -> None:
     if not operation_id:
         return
     safe_total = max(1, int(total or 1))
@@ -2357,6 +2854,7 @@ def update_progress_job(operation_id: str, done: int, total: int, label: str, st
             "total": safe_total,
             "percent": percent,
             "label": raw_text(label),
+            "unit": unit if unit in {"rows", "steps", "percent"} else "rows",
             "updated_at": now,
         }
 

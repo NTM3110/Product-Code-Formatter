@@ -104,6 +104,33 @@ def up_sales_file(code, quantity, price):
 
 
 class AllocationTests(unittest.TestCase):
+    def test_deferred_analysis_keeps_financial_fields_for_report_hydration(self):
+        purchase = invoice_file("ITEM", 10, 40).getvalue()
+        sales = invoice_file("ITEM", 3, 100).getvalue()
+
+        result = inventory_app.analysis_payload(
+            purchase,
+            sales,
+            None,
+            {},
+            {"company_profile": "son_phuong", "allow_negative_export": True},
+            "sales.xlsx",
+            defer_workbook=True,
+            result_job_id="deferred-report-test",
+        )
+
+        self.assertNotIn("line_amount", result["allocations"][0])
+        self.assertEqual(result["_allocations"][0]["line_amount"], 300)
+        ledger = build_inventory_ledger(
+            result["_opening_lines"],
+            result["_purchase_lines"],
+            result["_allocations"],
+            sales_lines=result["_sales_lines"],
+            company_profile="son_phuong",
+        )
+        report_rows = build_sales_report_rows_from_ledger(ledger)
+        self.assertEqual(sum(row["sale_amount"] for row in report_rows), 300)
+
     def test_split_sales_ledger_preserves_source_sale_and_tax_amounts(self):
         purchase = [
             line("purchase", "PAPER", 5, 40, invoice_no="M1", invoice_date="01/01/2026", warehouse_code="KVT", warehouse_account="152")
@@ -160,7 +187,11 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(steel_kind("Ống thép F59.9x1.4"), "pipe")
         self.assertEqual(steel_kind("Ống thép D21.2x1.2"), "pipe")
         self.assertEqual(steel_coating("Thép hộp đen 20x20x1.1"), "black")
-        self.assertEqual(steel_coating("Thép hộp 20x20x1.1"), "galvanized")
+        self.assertEqual(steel_coating("Thép hộp 20x20x1.1"), "unknown")
+        self.assertEqual(steel_coating("Thép hộp mạ kẽm 20x20x1.1"), "galvanized")
+        self.assertEqual(steel_coating("Ong ton ma vuong 30x1.8x6.0"), "galvanized")
+        self.assertEqual(steel_profile_key("Thép hộp 20x20x1.1"), "box|unknown|20x20x1.1")
+        self.assertIsNone(inventory_app.explicit_steel_coating("Thép ống hộp các loại"))
         self.assertEqual(steel_kind("Thép cuộn cán nóng các loại", "ONGTRONGMA"), "unknown")
         self.assertEqual(generic_steel_sale_type("Thép ống hộp các loại"), "pipe_box")
         self.assertEqual(generic_steel_sale_type("Thép hộp các loại"), "box")
@@ -214,7 +245,7 @@ class AllocationTests(unittest.TestCase):
 
         used_codes = [item["variant_code"] for item in allocations[0]["used"]]
         used_codes = list(dict.fromkeys(used_codes))
-        self.assertEqual(used_codes[:4], ["PROFIT_LOW", "PROFIT_HIGH", "LOSS_LOW", "LOSS_HIGH"])
+        self.assertEqual(used_codes, ["PROFIT_LOW", "PROFIT_HIGH"])
 
     def test_son_phuong_shape_steel_matches_by_product_family_across_codes(self):
         purchase = [line("purchase", "TCC.THV50", 100, 90, product_name="Thép hình V50")]
@@ -231,7 +262,105 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(summary["material_quantity"], 25)
         self.assertEqual(summary["negative_export_quantity"], 0)
 
-    def test_son_phuong_generic_sale_can_split_across_more_than_six_codes(self):
+    def test_son_phuong_c100_uses_matching_purchase_then_ktp_for_shortage(self):
+        purchase = [line(
+            "purchase", "PURCHASE.C100", 5, 90,
+            product_name="Thep C 100",
+            invoice_date="01/01/2025",
+            invoice_date_iso="2025-01-01",
+        )]
+        sales = [line(
+            "sales", "SALE.C100", 8, 100,
+            product_name="Thep C100",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+
+        allocations, _, summary, _ = allocate_stock([], purchase, sales, {"company_profile": "son_phuong"})
+
+        self.assertEqual(allocations[0]["allocation_role"], "finished_goods")
+        self.assertEqual(allocations[0]["used"][0]["variant_code"], "PURCHASE.C100")
+        self.assertEqual(allocations[0]["material_quantity"], 5)
+        self.assertEqual(allocations[0]["finished_quantity"], 3)
+        self.assertEqual(allocations[0]["remainder_warehouse_code"], "KTP")
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_v40_uses_matching_purchase_across_name_styles(self):
+        purchase = [line(
+            "purchase", "PURCHASE.V40", 10, 90,
+            product_name="Thep hinh V40",
+            invoice_date="01/01/2025",
+            invoice_date_iso="2025-01-01",
+        )]
+        sales = [line(
+            "sales", "SALE.V40", 6, 100,
+            product_name="Thep V 40",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+
+        allocations, _, summary, _ = allocate_stock([], purchase, sales, {"company_profile": "son_phuong"})
+
+        self.assertEqual(allocations[0]["allocation_role"], "finished_goods")
+        self.assertEqual(allocations[0]["used"][0]["variant_code"], "PURCHASE.V40")
+        self.assertEqual(allocations[0]["material_quantity"], 6)
+        self.assertEqual(allocations[0]["finished_quantity"], 0)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_shape_steel_does_not_consume_another_size(self):
+        purchase = [line(
+            "purchase", "PURCHASE.V50", 10, 90,
+            product_name="Thep hinh V50",
+            invoice_date="01/01/2025",
+            invoice_date_iso="2025-01-01",
+        )]
+        sales = [line(
+            "sales", "SALE.V40", 6, 100,
+            product_name="Thep V40",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+
+        allocations, _, summary, _ = allocate_stock([], purchase, sales, {"company_profile": "son_phuong"})
+
+        self.assertEqual(allocations[0]["allocation_role"], "finished_goods")
+        self.assertEqual(allocations[0]["used"], [])
+        self.assertEqual(allocations[0]["material_quantity"], 0)
+        self.assertEqual(allocations[0]["finished_quantity"], 6)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_all_cold_sheet_products_are_always_khhvt(self):
+        sales = [
+            line(
+                "sales", "TON-LANH-MA-MAU", 12, 100,
+                product_name="Ton lanh ma mau",
+                invoice_date="02/01/2025",
+                invoice_date_iso="2025-01-02",
+            ),
+            line(
+                "sales", "TONLANHMCL", 15, 100,
+                product_name="Tôn lạnh màu các loại",
+                invoice_date="02/01/2025",
+                invoice_date_iso="2025-01-02",
+            ),
+            line(
+                "sales", "TON-LANH", 18, 100,
+                product_name="Tôn lạnh",
+                invoice_date="02/01/2025",
+                invoice_date_iso="2025-01-02",
+            ),
+        ]
+
+        allocations, _, summary, warnings = allocate_stock([], [], sales, {"company_profile": "son_phuong"})
+        ledger = build_inventory_ledger([], [], allocations, company_profile="son_phuong")
+
+        self.assertEqual([row["allocation_role"] for row in allocations], ["materials", "materials", "materials"])
+        self.assertTrue(all(not row["negative_warning"] for row in allocations))
+        self.assertEqual([row["material_quantity"] for row in allocations], [0, 0, 0])
+        self.assertEqual([row["unresolved_material_quantity"] for row in allocations], [12, 15, 18])
+        self.assertEqual(summary["unresolved_material_quantity"], 45)
+        self.assertTrue(all(row["finished_quantity"] == 0 for row in allocations))
+    def test_son_phuong_generic_sale_increases_type_count_only_until_quantity_is_covered(self):
         purchase = [
             line("purchase", f"BOX{i}", 30, 95 + i, product_name=f"Thep hop {20 + i}x{20 + i}x1.1")
             for i in range(1, 9)
@@ -248,8 +377,348 @@ class AllocationTests(unittest.TestCase):
         )
 
         used_codes = list(dict.fromkeys(item["variant_code"] for item in allocations[0]["used"]))
-        self.assertGreater(len(used_codes), 6)
+        self.assertEqual(len(used_codes), 5)
         self.assertEqual(sum(item["quantity"] for item in allocations[0]["used"]), 140)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_generic_plan_groups_same_code_across_purchase_invoices(self):
+        purchase = [
+            line("purchase", "BOXA", 30, 99, row_number=3, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+            line("purchase", "BOXA", 30, 99, row_number=4, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+            line("purchase", "BOXB", 60, 98, row_number=5, invoice_no="M3", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 30x60x1.4"),
+        ]
+        sales = [
+            line("sales", "GENBOX", 100, 110, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop cac loai"),
+        ]
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {"company_profile": "son_phuong", "generic_min_type_count": 2},
+            barem_map={"BOXA": 10, "BOXB": 10},
+        )
+
+        used = allocations[0]["used"]
+        used_codes = list(dict.fromkeys(item["variant_code"] for item in used))
+        box_a_invoices = {item["invoice_no"] for item in used if item["variant_code"] == "BOXA"}
+        self.assertEqual(used_codes, ["BOXA", "BOXB"])
+        self.assertEqual(box_a_invoices, {"M1", "M2"})
+        self.assertEqual(sum(item["quantity"] for item in used), 100)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_generic_plan_groups_supplier_prefixes_by_technical_profile(self):
+        purchase = [
+            line("purchase", "AA.HOP.MK.20X20X1.1", 30, 99, row_number=3, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+            line("purchase", "BB.HOP.MK.20X20X1.1", 30, 98, row_number=4, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+            line("purchase", "CC.HOP.MK.30X60X1.4", 60, 97, row_number=5, invoice_no="M3", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 30x60x1.4"),
+        ]
+        sales = [
+            line("sales", "GENBOX", 100, 110, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop cac loai"),
+        ]
+        barem_map = {
+            "by_code": {},
+            "by_profile": {
+                "box|unknown|20x20x1.1": 10,
+                "box|galvanized|30x60x1.4": 10,
+            },
+        }
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {"company_profile": "son_phuong", "generic_min_type_count": 2, "scenario_count": 10},
+            barem_map=barem_map,
+        )
+
+        used_codes = {item["variant_code"] for item in allocations[0]["used"]}
+        self.assertEqual(used_codes, {
+            "AA.HOP.MK.20X20X1.1",
+            "BB.HOP.MK.20X20X1.1",
+            "CC.HOP.MK.30X60X1.4",
+        })
+        self.assertIn("2 lo", allocations[0]["generic_plan_note"])
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_generic_plan_retries_with_more_types_without_mutating_stock(self):
+        purchase = [
+            line("purchase", code, 40, 90 + index, row_number=index + 3, invoice_no=f"M{index}", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name=f"Thep hop {20 + index}x{20 + index}x1.1")
+            for index, code in enumerate(("BOXA", "BOXB", "BOXC"), start=1)
+        ]
+        sales = [
+            line("sales", "GENBOX", 100, 110, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop cac loai"),
+        ]
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {"company_profile": "son_phuong", "generic_min_type_count": 2},
+            barem_map={"BOXA": 10, "BOXB": 10, "BOXC": 10},
+        )
+
+        used_codes = list(dict.fromkeys(item["variant_code"] for item in allocations[0]["used"]))
+        self.assertEqual(len(used_codes), 3)
+        self.assertEqual(sum(item["quantity"] for item in allocations[0]["used"]), 100)
+        self.assertIn("3 lo", allocations[0]["generic_plan_note"])
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_unknown_surface_stock_can_supply_explicit_black_or_galvanized_sales(self):
+        purchase = [
+            line("purchase", "P.GALV", 100, 90, row_number=3, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 20x20x1.1"),
+            line("purchase", "P.UNKNOWN", 100, 91, row_number=4, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+        ]
+        sales = [
+            line("sales", "S.BLACK", 100, 110, row_number=3, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop den 20x20x1.1"),
+            line("sales", "S.GALV", 100, 110, row_number=4, invoice_no="B2", invoice_date="03/01/2026", invoice_date_iso="2026-01-03", product_name="Thep hop ma kem 20x20x1.1"),
+        ]
+        for row in purchase + sales:
+            profile = inventory_app.steel_profile_summary(row["product_name"], row["variant_code"])
+            row.update({
+                "source_variant_code": row["variant_code"],
+                "steel_profile_key": profile["profile_key"],
+                "steel_profile_code": profile["profile_code"],
+                "steel_kind": profile["kind"],
+                "steel_coating": profile["coating"],
+                "steel_dimension": profile["dimension"],
+            })
+
+        allocations, _, summary, _ = allocate_stock(
+            [], purchase, sales, {"company_profile": "son_phuong"}
+        )
+
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[0]["used"]},
+            {"P.UNKNOWN"},
+        )
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[1]["used"]},
+            {"P.GALV"},
+        )
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_specific_unknown_surface_can_use_explicit_surface_stock(self):
+        purchase = [line(
+            "purchase", "P.GALV", 100, 90,
+            invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01",
+            product_name="Thep hop ma kem 20x20x1.1",
+        )]
+        sales = [line(
+            "sales", "S.UNKNOWN", 100, 110,
+            invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02",
+            product_name="Thep hop 20x20x1.1",
+        )]
+        for row in purchase + sales:
+            profile = inventory_app.steel_profile_summary(row["product_name"], row["variant_code"])
+            row.update({
+                "source_variant_code": row["variant_code"],
+                "steel_profile_key": profile["profile_key"],
+                "steel_profile_code": profile["profile_code"],
+                "steel_kind": profile["kind"],
+                "steel_coating": profile["coating"],
+                "steel_dimension": profile["dimension"],
+            })
+
+        allocations, _, summary, _ = allocate_stock(
+            [], purchase, sales, {"company_profile": "son_phuong"}
+        )
+
+        self.assertFalse(allocations[0]["used"][0].get("negative_export", False))
+        self.assertEqual(allocations[0]["used"][0]["variant_code"], "P.GALV")
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_unknown_surface_never_relaxes_kind_or_dimensions(self):
+        exact_unknown = {"variant_code": "EXACT", "steel_coating": "unknown"}
+        wrong_dimension = {"variant_code": "WRONG-DIM", "steel_coating": "unknown"}
+        wrong_kind = {"variant_code": "WRONG-KIND", "steel_coating": "unknown"}
+        by_profile = {
+            "box|unknown|20x20x1.1": [exact_unknown],
+            "box|unknown|30x30x1.1": [wrong_dimension],
+            "pipe|unknown|20x1.1": [wrong_kind],
+        }
+
+        compatible = inventory_app.son_phuong_compatible_profile_lots(
+            by_profile,
+            "box|black|20x20x1.1",
+        )
+
+        self.assertEqual([lot["variant_code"] for lot in compatible], ["EXACT"])
+
+
+    def test_son_phuong_generic_sale_preserves_stock_reserved_for_later_specific_sale(self):
+        purchase = [
+            line(
+                "purchase", "AA.HOP.MK.20X20X1.1", 100, 99,
+                row_number=3, invoice_no="M1", invoice_date="01/01/2026",
+                invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 20x20x1.1",
+            ),
+            line(
+                "purchase", "BB.HOP.MK.30X60X1.4", 100, 90,
+                row_number=4, invoice_no="M2", invoice_date="01/01/2026",
+                invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 30x60x1.4",
+            ),
+        ]
+        sales = [
+            line(
+                "sales", "GENBOX", 100, 110,
+                row_number=3, invoice_no="B1", invoice_date="02/01/2026",
+                invoice_date_iso="2026-01-02", product_name="Thep hop cac loai",
+            ),
+            line(
+                "sales", "HOP.MK.20X20X1.1", 100, 110,
+                row_number=4, invoice_no="B2", invoice_date="03/01/2026",
+                invoice_date_iso="2026-01-03", product_name="Thep hop ma kem 20x20x1.1",
+            ),
+        ]
+        for row in purchase + sales:
+            profile = inventory_app.steel_profile_summary(
+                row.get("product_name", ""),
+                row.get("variant_code", ""),
+            )
+            row.update({
+                "source_variant_code": row.get("variant_code", ""),
+                "steel_profile_key": profile.get("profile_key", ""),
+                "steel_profile_code": profile.get("profile_code", ""),
+                "steel_kind": profile.get("kind", ""),
+                "steel_coating": profile.get("coating", ""),
+                "steel_dimension": profile.get("dimension", ""),
+            })
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {
+                "company_profile": "son_phuong",
+                "generic_min_type_count": 1,
+                "scenario_count": 5,
+            },
+            barem_map={
+                "by_code": {},
+                "by_profile": {
+                    "box|unknown|20x20x1.1": 10,
+                    "box|galvanized|30x60x1.4": 10,
+                },
+            },
+        )
+
+        self.assertEqual([row["invoice_no"] for row in allocations], ["B1", "B2"])
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[0]["used"]},
+            {"BB.HOP.MK.30X60X1.4"},
+        )
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[1]["used"]},
+            {"AA.HOP.MK.20X20X1.1"},
+        )
+        self.assertTrue(allocations[1]["used"][0].get("specific_stock_reserved"))
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_sales_are_ordered_by_date_invoice_and_update_stock_per_row(self):
+        purchase = [
+            line("purchase", "BOXA", 60, 90, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 20x20x1.1"),
+            line("purchase", "BOXB", 60, 91, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop 30x60x1.4"),
+        ]
+        sales = [
+            line("sales", "GENBOX", 70, 110, row_number=3, invoice_no="HD10", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop cac loai"),
+            line("sales", "GENBOX", 70, 110, row_number=4, invoice_no="HD2", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep hop cac loai"),
+        ]
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {"company_profile": "son_phuong", "generic_min_type_count": 2},
+            barem_map={"BOXA": 10, "BOXB": 10},
+        )
+
+        self.assertEqual([item["invoice_no"] for item in allocations], ["HD2", "HD10"])
+        self.assertEqual(sum(item["quantity"] for item in allocations[0]["used"]), 70)
+        self.assertEqual(sum(item["quantity"] for item in allocations[1]["inventory_before"]), 50)
+        self.assertEqual(sum(item["quantity"] for item in allocations[1]["used"] if item.get("negative_export")), 0)
+        self.assertEqual(allocations[1]["unresolved_material_quantity"], 20)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_pipe_box_generic_preserves_pipe_for_pipe_only_generic(self):
+        purchase = [
+            line("purchase", "AA.ONG.MK.21.2X1.1", 100, 90, row_number=3, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep ong ma kem 21.2x1.1"),
+            line("purchase", "BB.HOP.MK.20X20X1.1", 100, 90, row_number=4, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 20x20x1.1"),
+        ]
+        sales = [
+            line("sales", "GEN-PIPE-BOX", 100, 110, row_number=3, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep ong hop cac loai"),
+            line("sales", "GEN-PIPE", 100, 110, row_number=4, invoice_no="B2", invoice_date="03/01/2026", invoice_date_iso="2026-01-03", product_name="Thep ong cac loai"),
+        ]
+        for row in purchase + sales:
+            profile = inventory_app.steel_profile_summary(row.get("product_name", ""), row.get("variant_code", ""))
+            row.update({
+                "source_variant_code": row.get("variant_code", ""),
+                "steel_profile_key": profile.get("profile_key", ""),
+                "steel_profile_code": profile.get("profile_code", ""),
+                "steel_kind": profile.get("kind", ""),
+                "steel_coating": profile.get("coating", ""),
+                "steel_dimension": profile.get("dimension", ""),
+            })
+
+        allocations, _, summary, _ = allocate_stock(
+            [], purchase, sales,
+            {"company_profile": "son_phuong", "generic_min_type_count": 1, "scenario_count": 5},
+            barem_map={"by_code": {}, "by_profile": {
+                "pipe|galvanized|21.2x1.1": 10,
+                "box|unknown|20x20x1.1": 10,
+            }},
+        )
+
+        self.assertEqual({item["variant_code"] for item in allocations[0]["used"]}, {"BB.HOP.MK.20X20X1.1"})
+        self.assertEqual({item["variant_code"] for item in allocations[1]["used"]}, {"AA.ONG.MK.21.2X1.1"})
+        self.assertEqual(summary["negative_export_quantity"], 0)
+
+    def test_son_phuong_future_pipe_stock_beats_smaller_barem_remainder(self):
+        purchase = [
+            line("purchase", "BOXA", 60, 90, row_number=3, invoice_no="M1", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 20x20x1.1"),
+            line("purchase", "BOXB", 60, 90, row_number=4, invoice_no="M2", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep hop ma kem 30x30x1.1"),
+            line("purchase", "PIPEA", 50, 90, row_number=5, invoice_no="M3", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep ong ma kem 21.2x1.1"),
+            line("purchase", "PIPEB", 50, 90, row_number=6, invoice_no="M4", invoice_date="01/01/2026", invoice_date_iso="2026-01-01", product_name="Thep ong ma kem 26.65x1.1"),
+        ]
+        sales = [
+            line("sales", "GEN-PIPE-BOX", 100, 110, row_number=3, invoice_no="B1", invoice_date="02/01/2026", invoice_date_iso="2026-01-02", product_name="Thep ong hop cac loai"),
+            line("sales", "GEN-PIPE", 100, 110, row_number=4, invoice_no="B2", invoice_date="03/01/2026", invoice_date_iso="2026-01-03", product_name="Thep ong cac loai"),
+        ]
+        for row in purchase + sales:
+            profile = inventory_app.steel_profile_summary(row.get("product_name", ""), row.get("variant_code", ""))
+            row.update({
+                "source_variant_code": row.get("variant_code", ""),
+                "steel_profile_key": profile.get("profile_key", ""),
+                "steel_profile_code": profile.get("profile_code", ""),
+                "steel_kind": profile.get("kind", ""),
+                "steel_coating": profile.get("coating", ""),
+                "steel_dimension": profile.get("dimension", ""),
+            })
+
+        allocations, _, summary, _ = allocate_stock(
+            [], purchase, sales,
+            {
+                "company_profile": "son_phuong",
+                "generic_min_type_count": 2,
+                "scenario_count": 100,
+                "barem_remainder_max_kg": 10,
+            },
+            barem_map={"by_code": {}, "by_profile": {
+                "box|unknown|20x20x1.1": 30,
+                "box|galvanized|30x30x1.1": 30,
+                "pipe|galvanized|21.2x1.1": 25,
+                "pipe|galvanized|26.65x1.1": 25,
+            }},
+        )
+
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[0]["used"]},
+            {"BOXA", "BOXB"},
+        )
+        self.assertEqual(
+            {item["variant_code"] for item in allocations[1]["used"]},
+            {"PIPEA", "PIPEB"},
+        )
         self.assertEqual(summary["negative_export_quantity"], 0)
 
     def test_son_phuong_pipe_generic_does_not_use_box_but_pipe_box_uses_both(self):
@@ -307,6 +776,32 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(summary["missing_barem_count"], 1)
         self.assertEqual(summary["missing_barem_report"][0]["variant_code"], "PIPEMISS")
 
+    def test_son_phuong_barem_tolerance_rounds_final_type_to_nearest_whole_bar(self):
+        purchase = [
+            line("purchase", "PIPEA", 200, 90, product_name="Thep ong D21.2x1.4"),
+        ]
+        sales = [line("sales", "GENPIPE", 74, 100, product_name="Thep ong cac loai")]
+
+        allocations, _, summary, _ = allocate_stock(
+            [],
+            purchase,
+            sales,
+            {
+                "company_profile": "son_phuong",
+                "generic_min_type_count": 1,
+                "barem_remainder_max_kg": 10,
+                "scenario_count": 5,
+            },
+            barem_map={"PIPEA": 12.166},
+        )
+
+        used = allocations[0]["used"]
+        self.assertEqual(len(used), 1)
+        self.assertAlmostEqual(used[0]["quantity"], 74)
+        self.assertEqual(used[0]["barem_multiple"], 6)
+        self.assertAlmostEqual(used[0]["barem_remainder_kg"], 1.004, places=3)
+        self.assertAlmostEqual(summary["material_quantity"], 74)
+        self.assertEqual(summary["finished_quantity"], 0)
     def test_son_phuong_barem_plan_respects_min_max_per_code_per_sale_row(self):
         purchase = [
             line("purchase", "BOXA", 100, 90, product_name="Thep hop 20x20x1.1"),
@@ -380,8 +875,8 @@ class AllocationTests(unittest.TestCase):
 
         barem_map = parse_barem_file(content.getvalue())
 
-        self.assertEqual(steel_profile_key("Ống thép F26.65x1.4", "OTHER-A"), "pipe|galvanized|26.65x1.4")
-        self.assertEqual(steel_profile_key("Thép hộp 20x20x1.1", "OTHER-B"), "box|galvanized|20x20x1.1")
+        self.assertEqual(steel_profile_key("Ống thép F26.65x1.4", "OTHER-A"), "pipe|unknown|26.65x1.4")
+        self.assertEqual(steel_profile_key("Thép hộp 20x20x1.1", "OTHER-B"), "box|unknown|20x20x1.1")
         purchase = [
             line("purchase", "OTHER-A", 100, 90, product_name="Ống thép F26.65x1.4"),
             line("purchase", "OTHER-B", 100, 91, product_name="Thép hộp 20x20x1.1"),
@@ -410,7 +905,7 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(summary["finished_quantity"], 0)
         self.assertEqual(summary["missing_barem_count"], 0)
 
-    def test_builtin_barem_separates_black_and_galvanized_and_defaults_to_galvanized(self):
+    def test_builtin_barem_separates_coatings_and_unspecified_sale_accepts_both(self):
         galvanized = line("purchase", "PIPE-G", 100, 90, product_name="Ống thép D59.9x2")
         black = line("purchase", "PIPE-B", 100, 90, product_name="Ống thép đen D59.9x2")
         box = line("purchase", "BOX-G", 100, 90, product_name="Thép hộp 20x20x1.1")
@@ -427,10 +922,10 @@ class AllocationTests(unittest.TestCase):
             {"company_profile": "son_phuong", "barem_tolerance_percent": 5},
             barem_map=DEFAULT_BAREM_MAP,
         )
-        self.assertEqual({item["variant_code"] for item in allocations[0]["used"]}, {"PIPE-G"})
+        self.assertEqual({item["variant_code"] for item in allocations[0]["used"]}, {"PIPE-G", "PIPE-B"})
         self.assertLessEqual(sum(1 for item in allocations[0]["used"] if item.get("barem_remainder")), 1)
 
-    def test_son_phuong_shortage_stays_negative_in_khh_without_ktp(self):
+    def test_son_phuong_material_shortage_stays_unresolved_without_negative_khhvt(self):
         purchase = [line(
             "purchase", "PIPE-G", 20, 90,
             product_name="Ống thép D59.9x2",
@@ -440,6 +935,7 @@ class AllocationTests(unittest.TestCase):
         sales = [line(
             "sales", "THEP-CAC-LOAI", 50, 100,
             product_name="Thép ống các loại",
+
             invoice_date="01/01/2025",
             invoice_date_iso="2025-01-01",
         )]
@@ -453,11 +949,86 @@ class AllocationTests(unittest.TestCase):
         )
         ledger = build_inventory_ledger([], purchase, allocations, company_profile="son_phuong")
 
-        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KVT"])
+        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KHHVT"])
         self.assertEqual(summary["finished_quantity"], 0)
-        self.assertGreater(summary["negative_export_quantity"], 0)
+        self.assertEqual(summary["material_quantity"], 20)
+        self.assertEqual(summary["unresolved_material_quantity"], 30)
+        self.assertEqual(summary["negative_export_quantity"], 0)
         self.assertEqual(allocations[0]["used"][0]["ledger_variant_code"], "PIPE-G")
-        self.assertTrue(allocations[0]["used"][-1]["negative_export"])
+        self.assertFalse(any(item.get("negative_export") for item in allocations[0]["used"]))
+        self.assertEqual(allocations[0]["unresolved_material_quantity"], 30)
+
+    def test_son_phuong_structural_shortage_moves_only_remainder_to_ktp(self):
+        purchase = [line(
+            "purchase", "THEP-V100", 5, 90,
+            product_name="Thep V 50x50x5",
+            invoice_date="01/01/2025",
+            invoice_date_iso="2025-01-01",
+        )]
+        sales = [line(
+            "sales", "THEP-V100", 8, 100,
+            product_name="Thep V 50x50x5",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+
+        allocations, _, summary, _ = allocate_stock([], purchase, sales, {"company_profile": "son_phuong"})
+        ledger = build_inventory_ledger([], purchase, allocations, company_profile="son_phuong")
+
+        self.assertEqual(allocations[0]["allocation_role"], "finished_goods")
+        self.assertEqual(allocations[0]["material_quantity"], 5)
+        self.assertEqual(allocations[0]["finished_quantity"], 3)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KHHVT", "KTP"])
+
+    def test_son_phuong_solid_square_is_finished_goods_not_pipe_box(self):
+        purchase = [line(
+            "purchase", "THEP-VUONG-16", 5, 90,
+            product_name="Thep vuong 16",
+            invoice_date="01/01/2025",
+            invoice_date_iso="2025-01-01",
+        )]
+        sales = [line(
+            "sales", "THEP-VUONG-16", 8, 100,
+            product_name="Thep vuong 16",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+
+        allocations, _, summary, _ = allocate_stock([], purchase, sales, {"company_profile": "son_phuong"})
+
+        self.assertEqual(steel_kind("Thep vuong 16", "THEP-VUONG-16"), "unknown")
+        self.assertEqual(allocations[0]["allocation_role"], "finished_goods")
+        self.assertEqual(allocations[0]["material_quantity"], 5)
+        self.assertEqual(allocations[0]["finished_quantity"], 3)
+        self.assertEqual(summary["negative_export_quantity"], 0)
+    def test_son_phuong_unclassified_product_uses_khock_159(self):
+        sales = [line(
+            "sales", "MAY-HAN", 2, 100,
+            product_name="May han cong nghiep",
+            invoice_date="02/01/2025",
+            invoice_date_iso="2025-01-02",
+        )]
+        policy = {
+            "company_profile": "son_phuong",
+            "sales_inventory_pairs": [
+                {"role": "materials", "ma_kho": "KHHVT", "tk_vat_tu": "156"},
+                {"role": "finished_goods", "ma_kho": "KTP", "tk_vat_tu": "155"},
+                {"role": "fallback", "ma_kho": "KHOCK", "tk_vat_tu": "159"},
+            ],
+        }
+
+        allocations, _, summary, warnings = allocate_stock([], [], sales, policy)
+        ledger = build_inventory_ledger([], [], allocations, company_profile="son_phuong")
+
+        self.assertEqual(allocations[0]["allocation_role"], "fallback")
+        self.assertEqual(allocations[0]["material_quantity"], 0)
+        self.assertEqual(allocations[0]["finished_quantity"], 2)
+        self.assertEqual(allocations[0]["remainder_warehouse_code"], "KHOCK")
+        self.assertEqual(summary["negative_export_quantity"], 0)
+        self.assertFalse(any("chua ghep du" in warning for warning in warnings))
+        self.assertEqual([warehouse["warehouse_code"] for warehouse in ledger["warehouses"]], ["KHOCK"])
+        self.assertEqual(ledger["warehouses"][0]["account"], "159")
 
     def test_son_phuong_export_removes_old_ktp_sheets_and_writes_only_khh_ledger(self):
         purchase = [line(
@@ -503,14 +1074,18 @@ class AllocationTests(unittest.TestCase):
         )
         result = load_workbook(result_content)
 
-        self.assertIn("SoChiTietKVT", result.sheetnames)
+        self.assertNotIn("SoChiTietKVT", result.sheetnames)
+        self.assertIn("SoChiTietKHHVT", result.sheetnames)
         self.assertNotIn("SoChiTietKTP", result.sheetnames)
         self.assertNotIn("SoChiTietHH_TP", result.sheetnames)
-        self.assertIn("TongHopNXT_KVT", result.sheetnames)
+        self.assertNotIn("TongHopNXT_KVT", result.sheetnames)
+        self.assertIn("TongHopNXT_KHHVT", result.sheetnames)
         self.assertNotIn("TongHopNXT_KTP", result.sheetnames)
-        self.assertIn("BaoCaoBH_KVT", result.sheetnames)
+        self.assertNotIn("BaoCaoBH_KVT", result.sheetnames)
+        self.assertIn("BaoCaoBH_KHHVT", result.sheetnames)
         self.assertNotIn("BaoCaoBH_KTP", result.sheetnames)
-        self.assertIn("BangKeHDBH_KVT", result.sheetnames)
+        self.assertNotIn("BangKeHDBH_KVT", result.sheetnames)
+        self.assertIn("BangKeHDBH_KHHVT", result.sheetnames)
         self.assertNotIn("BangKeHDBH_KTP", result.sheetnames)
 
     def test_ambiguous_steel_report_does_not_treat_nong_as_ong(self):

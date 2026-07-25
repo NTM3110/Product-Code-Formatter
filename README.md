@@ -1,138 +1,166 @@
-﻿# Product Code Formatter - MST All Names V6
+# Product Code Formatter
 
-## Overview
+Product Code Formatter is a Windows-first Excel processing application for Vietnamese invoice and inventory workflows. The desktop application runs a React 19 interface inside pywebview, talks to a local FastAPI server, and delegates workbook rules to Python modules built on pandas and openpyxl.
 
-Windows desktop app for formatting `Mã VT` from Excel invoice data. The active UI is React + Vite, served by a FastAPI backend and wrapped in pywebview for the desktop `.exe`.
+This README describes the current repository. For implementation rules and a request-to-code lookup table, read [AGENTS.md](AGENTS.md).
 
-Main capabilities:
-- require LAN Keygen license activation before normal use
-- group sellers by `MST`
-- suggest and validate company prefixes
-- let users include or skip companies and products
-- generate product codes by profile (`Sơn Phương`, `Cao Thành`, `Quang Thịnh`, `Vietmax`)
-- persist config, rules, overrides, price-group settings, and skipped items
-- export a processed Excel workbook
+## What the application does
 
-## Current Notes
+The profile selected in the UI determines the available workflow:
 
-- Active UI: `react_frontend/`
-- Active backend: `web_api.py`
-- Shared Excel/business logic: `app.py`
-- Desktop wrapper: `web_desktop_app.py`
-- Future edit map: `docs/PROJECT_MAP.md`
-- Fast fix checklist: `docs/FAST_CHANGE_GUIDE.md`
-- The company check page shows all company names found under the same `MST`.
-- The app still groups by seller `MST`.
-- Prefix suggestion uses the most common company name for that `MST`.
-- Users can tick or untick which company groups and products to process.
-- Rows where quantity is empty, invalid, or `0` are skipped.
+| Profile | Current workflow |
+|---|---|
+| vietmax | Purchase and sales formatting, product review, purchase/sales matching and conversion, inventory allocation, reports, and FAST export |
+| son_phuong | Two-phase purchase/sales formatting plus steel-aware inventory allocation and reporting |
+| cao_thanh | Generic formatter with price grouping/filtering |
+| quang_thinh | Generic product-code formatter |
+| viet_hung | Generic product-code formatter |
+| ho_guom | Estimate extraction or generic formatter mode |
 
-## Build
+The Inventory Allocator is also available as a standalone Flask module under inventory_allocation_app/, but its active desktop UI is integrated into the React workflow.
 
-1. Extract the project ZIP.
-2. Build the React bundle: `cd react_frontend; npm run build`.
-3. Build the desktop wrapper: `.\.venv\Scripts\python.exe -m PyInstaller ProductCodeFormatterWeb.spec --noconfirm`.
-4. Copy `dist\ProductCodeFormatterWeb.exe` to `deploy\ProductCodeFormatterWeb.exe`.
+## Runtime architecture
 
-## License Activation
+~~~text
+react_frontend/src/main.tsx
+  -> react_frontend/src/vietmax/VietmaxApp.tsx
+  -> react_frontend/src/api.ts
+  -> web_api.py (FastAPI)
+  -> app.py / product_code/* / workflows/* / inventory_allocation_app/app.py
+  -> processed Excel files, reports, and FAST workbooks
 
-The desktop app shows a license activation dialog before the main window opens. Use a self-hosted `keygen-sh/keygen-api` server on the same LAN and enter:
+web_desktop_app.py
+  -> starts FastAPI on localhost
+  -> opens the React bundle in pywebview
+  -> exposes the native Save As dialog to React
+~~~
 
-- License server URL, such as `http://license-server.local:3000` for private LAN use or `https://license-server.local` when using an HTTPS reverse proxy
-- Keygen account id or slug
-- License key
+The active frontend is react_frontend/. There is no active Angular or PySide frontend in this repository.
 
-For local setup notes, see `license_server/README.md`. License metadata can restrict allowed app company profiles with `allowed_profiles`, `profiles`, `company_profiles`, `allowed_companies`, or `companies`.
+## Start from source
 
-## Run From Source
+The preferred acceptance workflow is the isolated runtime preview:
 
-- React/FastAPI web app: `run_react_app.bat`
-- Desktop wrapper from source: `run_react_native_app.bat`
-- License admin: `run_license_server_admin.bat`
+~~~powershell
+.\run_runtime_preview.bat
+~~~
 
-## Key Paths
+It runs Vite, FastAPI, and pywebview from source. Preview data is isolated under %LOCALAPPDATA%\ProductCodeFormatterPreview so it does not overwrite the installed application's state.
 
-- Project map: `docs/PROJECT_MAP.md`
-- Fast change guide: `docs/FAST_CHANGE_GUIDE.md`
-- Active React UI: `react_frontend/src/vietmax/VietmaxApp.tsx`
-- Inventory allocation UI: `react_frontend/src/vietmax/InventoryAllocationStage.tsx`
-- FastAPI backend: `web_api.py`
-- Shared backend logic: `app.py`
-- Desktop wrapper: `web_desktop_app.py`
-- PyInstaller spec: `ProductCodeFormatterWeb.spec`
-- Packaged app output: `deploy/ProductCodeFormatterWeb.exe`
+To recreate preview data from the installed application:
 
-## Context Compaction Guide
+~~~powershell
+.\run_runtime_preview.bat -ResetData
+~~~
 
-When context is overloaded, summarize only the minimum needed to continue work.
+Other launchers:
 
-Use this format:
+~~~powershell
+.\run_react_app.bat          # FastAPI plus the built React bundle
+.\run_react_native_app.bat   # desktop wrapper from source
+.\run_license_server_admin.bat
+~~~
 
-```text
-Goal:
-- one sentence
+Frontend development only:
 
-Changed Files:
-- path + one short reason each
+~~~powershell
+Set-Location .\react_frontend
+npm run dev
+~~~
 
-Current Behavior:
-- 3-6 bullets only
+## Verify changes
 
-Open Work:
-- exact next tasks only
+React or TypeScript changes:
 
-Verification:
-- latest build/test status only
+~~~powershell
+Set-Location .\react_frontend
+npm run build
+~~~
 
-Known Constraints:
-- only active constraints still relevant
-```
+From the repository root, run the main Python syntax and workbook regressions:
 
-Rules for compact handoff:
-- do not paste long config examples unless the bug is about config shape
-- do not repeat full user history
-- do not list unchanged files
-- prefer symbol names over code excerpts
-- mention only the latest accepted behavior, not every prior attempt
-- if a UI area is affected, name the modal/section instead of describing the whole screen
-- if build/test already passed, record only the latest result
+~~~powershell
+.\.venv\Scripts\python.exe -m py_compile app.py web_api.py web_desktop_app.py test_process_workbook.py
+.\.venv\Scripts\python.exe -m unittest test_process_workbook.py
+~~~
 
-Good compact summary example:
+Run focused suites when their owner changes:
 
-```text
-Goal:
-- Fix Cao Thành price-group modal behavior and rebuild EXE.
+~~~powershell
+.\.venv\Scripts\python.exe -m unittest test_estimate_extractor.py
+.\.venv\Scripts\python.exe -m unittest test_workflow_runtime.py
+.\.venv\Scripts\python.exe -m unittest test_release_store.py
+.\.venv\Scripts\python.exe -m unittest discover inventory_allocation_app
+~~~
 
-Changed Files:
-- frontend/src/app/app.component.ts - price grouping, skipped-item persistence
-- frontend/src/app/app.component.html - price modal controls
-- frontend/src/app/app.component.spec.ts - regression tests
-- app.py - config persistence semantics
+See the test matrix in [AGENTS.md](AGENTS.md) before choosing a smaller verification set.
 
-Current Behavior:
-- price modal groups by final customized Mã VT
-- skipped products are stored as skipped, not selected
-- product modal shows code length and >50 warning
+## Build and release
 
-Open Work:
-- rebuild deploy EXE after frontend change
+Build the React bundle, Python application, and PyInstaller onedir package:
 
-Verification:
-- npm run build passed
-- npm test passed: 22 SUCCESS
+~~~powershell
+.\build_app.ps1 -Version "0.4.0" -Notes "Local build" -Channel dev
+~~~
 
-Known Constraints:
-- CSS budget warning exists but does not block build
-```
+The executable is created at:
 
-## Compaction Priority
+~~~text
+dist/ProductCodeFormatter/ProductCodeFormatter.exe
+~~~
 
-If you must cut more context, keep information in this order:
+The onedir executable above must remain beside its `_internal` directory. To create the
+single-file standalone executable that can be copied by itself to another computer, run:
 
-1. current goal
-2. changed files
-3. exact unfinished work
-4. verification state
-5. only critical constraints
+~~~powershell
+.\build_standalone.ps1 -Version "0.4.5" -Notes "Standalone build" -Channel dev
+~~~
 
-Drop everything else first.
+The standalone build is written to `dist/standalone/ProductCodeFormatter.exe` and copied
+to `deploy/ProductCodeFormatter.exe`.
+
+Create a Velopack test or stable release only after the source preview is accepted:
+
+~~~powershell
+.\build_release.ps1 -Version "0.4.0" -Notes "Release notes" -Channel test
+.\build_release.ps1 -Version "0.4.0" -Notes "Release notes" -Channel stable
+~~~
+
+Release feeds are written under Releases/<channel>/; distributable setup files and bundles are copied to deploy/.
+
+## Important paths
+
+| Path | Responsibility |
+|---|---|
+| react_frontend/src/vietmax/VietmaxApp.tsx | Main application state, stage orchestration, profile workflows, config payloads |
+| react_frontend/src/vietmax/workflowStages.ts | Profile capabilities and stage definitions |
+| react_frontend/src/vietmax/InventoryAllocationStage.tsx | Allocation configuration, review, reports, and export UI |
+| react_frontend/src/estimate/EstimateExtractorWorkflow.tsx | Ho Guom estimate-extraction UI |
+| react_frontend/src/api.ts | Typed browser-to-FastAPI calls |
+| web_api.py | Active FastAPI endpoints, workflow jobs, uploads, caches, and integration adapters |
+| app.py | Shared configuration, product-code, workbook, Vietmax, inventory-pair, and FAST logic |
+| product_code/ | Extracted config, license, Excel I/O, updater, release, and workflow-runtime helpers |
+| inventory_allocation_app/app.py | Allocation engine, ledger/report generation, and workbook export |
+| workflows/estimate_extractor/logic.py | Estimate analysis and export engine |
+| web_desktop_app.py | Desktop bootstrap and native file-save bridge |
+| ProductCodeFormatterWeb.spec | PyInstaller package definition |
+| build_app.ps1 / build_release.ps1 | Application and Velopack release builds |
+
+## Runtime data
+
+Installed application state is stored under %LOCALAPPDATA%\ProductCodeFormatter:
+
+- product_code_config.json - normalized profile settings and saved rules
+- license.json - local machine activation state
+- default_form_mappings.json and templates/ - persisted form mappings/templates
+- sessions/ - resumable workflow session metadata
+- uploads/ and outputs/ - runtime workbook artifacts
+
+Do not edit runtime config by hand for feature work. Use the config helpers in app.py and the API save endpoints so normalization and backups continue to work.
+
+## Security and generated files
+
+- License activation is machine-bound and validated through the Keygen client in product_code/license_client.py.
+- Never place admin tokens, private certificates, license keys, or .env secrets in application code or commits.
+- Do not hand-edit build/, dist/, deploy/, uploads/, outputs/, or __pycache__/ during normal implementation.
+- Output workbook rules and user configuration are business data; preserve backward compatibility when changing their shapes.

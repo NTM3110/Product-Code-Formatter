@@ -1,6 +1,6 @@
 {
   "son_phuong": {
-    "updated_at": "2026-06-21T22:02:36",
+    "updated_at": "2026-07-25T10:54:39",
     "rules": [
       {
         "company": "(Không có tên công ty)",
@@ -13,7 +13,7 @@
           {
             "row_number": 3,
             "source_variant_code": "BOX3",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -21,7 +21,7 @@
           {
             "row_number": 4,
             "source_variant_code": "BOX4",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -29,7 +29,7 @@
           {
             "row_number": 5,
             "source_variant_code": "BOX5",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -37,7 +37,7 @@
           {
             "row_number": 6,
             "source_variant_code": "BOX6",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -45,7 +45,7 @@
           {
             "row_number": 7,
             "source_variant_code": "BOX7",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -53,7 +53,7 @@
           {
             "row_number": 8,
             "source_variant_code": "BOX8",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -61,7 +61,7 @@
           {
             "row_number": 9,
             "source_variant_code": "BOX9",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -69,7 +69,7 @@
           {
             "row_number": 10,
             "source_variant_code": "BOX10",
-            "profile_code": "HOP.MK.20X20X1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
             "product_name": "Thep hop 20x20x1.1",
             "kind": "box",
             "reason": "Tên hàng có dấu hiệu hộp: ống hộp/hộp/vuông/CN."
@@ -78,10 +78,10 @@
         "profile_count": 1,
         "top_profiles": [
           {
-            "profile_code": "HOP.MK.20X20X1.1",
-            "profile_key": "box|galvanized|20x20x1.1",
+            "profile_code": "HOP.UNKNOWN.20X20X1.1",
+            "profile_key": "box|unknown|20x20x1.1",
             "kind": "box",
-            "coating": "galvanized",
+            "coating": "unknown",
             "dimension": "20x20x1.1",
             "count": 253,
             "quantity": 253.0,

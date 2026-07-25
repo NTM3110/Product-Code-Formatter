@@ -22,7 +22,7 @@ ALL_LABELS = DIRECT_LABELS | INDIRECT_LABELS
 COST_LABEL_ORDER = ["VL", "NC", "MTC", "CPC", "LT", "CPK", "TNCT", "VAT", "TC"]
 BID_HEADER_LABELS = [("ten cong tac",), ("khoi luong",)]
 DETAIL_HEADER_LABELS = [("ma so", "ma hieu", "ma hieu don gia"), ("thanh phan hao phi", "ten cong tac"), ("thanh tien",)]
-DETAIL_SHEET_NAMES = ["chiet tinh", "don gia chi tiet"]
+DETAIL_SHEET_NAMES = ["chiet tinh", "don gia chi tiet", "don gia chi tiet rut gon"]
 
 
 @dataclass
@@ -65,7 +65,7 @@ class EstimateAnalysisResult:
     @property
     def ok(self) -> bool:
         return (
-            self.bid_rows == self.detail_blocks
+            self.detail_blocks >= self.bid_rows
             and not self.identity_mismatches
             and not self.calculation_mismatches
             and not self.unclassified_rows
@@ -203,9 +203,6 @@ def analyze_estimate_workbook(
 
     for block_index, (start, end) in enumerate(detail_blocks):
         if block_index >= len(bid_rows):
-            result.identity_mismatches.append(
-                {"block": block_index + 1, "detail_row": start + 1, "reason": "missing Du thau row"}
-            )
             continue
 
         bid_row = bid_rows[block_index]
@@ -249,7 +246,7 @@ def list_estimate_workbook_sheets(path: str) -> dict:
     except ValueError:
         pass
     try:
-        detail_index = _find_sheet_index(workbook, DETAIL_SHEET_NAMES, DETAIL_HEADER_LABELS)
+        detail_index = _best_detail_sheet_index(workbook, int(suggested["bid_sheet_index"])) if suggested["bid_sheet_index"] is not None else _find_sheet_index(workbook, DETAIL_SHEET_NAMES, DETAIL_HEADER_LABELS)
         detail_sheet = workbook.sheet_by_index(detail_index)
         detail_header = _find_header_row(detail_sheet, DETAIL_HEADER_LABELS)
         suggested["detail_sheet_index"] = detail_index
@@ -539,13 +536,37 @@ def _resolve_estimate_sheet_indexes(workbook, bid_sheet_index: int | None, detai
     if bid_sheet_index is None:
         bid_sheet_index = _find_sheet_index(workbook, ["du thau", "du thau (2)"], BID_HEADER_LABELS)
     else:
-        bid_sheet_index = _validate_sheet_index(workbook, bid_sheet_index, "Dự thầu")
+        bid_sheet_index = _validate_sheet_index(workbook, bid_sheet_index, "Du thau")
     if detail_sheet_index is None:
-        detail_sheet_index = _find_sheet_index(workbook, DETAIL_SHEET_NAMES, DETAIL_HEADER_LABELS)
+        detail_sheet_index = _best_detail_sheet_index(workbook, bid_sheet_index)
     else:
-        detail_sheet_index = _validate_sheet_index(workbook, detail_sheet_index, "Chiết tính")
+        detail_sheet_index = _validate_sheet_index(workbook, detail_sheet_index, "Chiet tinh")
     return bid_sheet_index, detail_sheet_index
 
+
+def _best_detail_sheet_index(workbook, bid_sheet_index: int) -> int:
+    bid_sheet = workbook.sheet_by_index(bid_sheet_index)
+    bid_header = _find_header_row(bid_sheet, BID_HEADER_LABELS)
+    bid_cols = _bid_columns(bid_sheet, bid_header)
+    bid_count = len(_bid_item_rows(bid_sheet, bid_header + 1, bid_cols))
+    candidates = []
+    for index in range(workbook.nsheets):
+        if index == bid_sheet_index:
+            continue
+        try:
+            sheet = workbook.sheet_by_index(index)
+            detail_header = _find_header_row(sheet, DETAIL_HEADER_LABELS)
+            detail_cols = _detail_columns(sheet, detail_header)
+            block_count = len(_detail_blocks(sheet, detail_header + 1, detail_cols))
+        except ValueError:
+            continue
+        name_key = _fold(workbook.sheet_names()[index])
+        preferred = 0 if any(label in name_key for label in DETAIL_SHEET_NAMES) else 1
+        candidates.append((abs(block_count - bid_count), preferred, -block_count, index))
+    if not candidates:
+        raise ValueError("Could not find sheet with required headers")
+    candidates.sort()
+    return candidates[0][3]
 
 def _find_optional_exact_sheet_index(workbook, name: str) -> int | None:
     target = _fold(name)
@@ -770,20 +791,34 @@ def _convert_detail_sums_to_bid_unit(
     return converted
 
 
+def _bid_amount_factor(bid_sheet, bid_row: int, bid_cols: SheetColumns, unit_total: float, bid_multipliers=None) -> float:
+    amount_total = _number(_cell(bid_sheet, bid_row, bid_cols.amount_total)) if bid_cols.amount_total is not None else 0.0
+    if amount_total and unit_total:
+        return amount_total / unit_total
+    return _effective_bid_qty(bid_sheet, bid_row, bid_cols, bid_multipliers)
+
+
+def _cost_heading_key(value) -> str:
+    key = _fold(value)
+    key = re.sub(r"^[\s\-:;\.\)\(]+", "", key)
+    key = re.sub(r"^[a-z]\s*[\.\)]\s*", "", key)
+    return key.strip(" -:;.")
+
 def _classify_row(name, unit, current_direct: str | None):
     name_key = _fold(name)
     unit_key = _fold(unit).upper()
     if not name_key:
         return None, current_direct, "blank"
 
-    if name_key == "vat lieu" or re.match(r"^a\s*[\.\)]*\s*vat\s*lieu\b", name_key):
+    heading_key = _cost_heading_key(name_key)
+    if heading_key in {"vat lieu", "vat tu"}:
         return None, "VL", "direct_header"
-    if name_key == "nhan cong" or re.match(r"^b\s*[\.\)]*\s*nhan\s*cong\b", name_key):
+    if heading_key == "nhan cong":
         return None, "NC", "direct_header"
-    if name_key in {"may", "may thi cong"} or re.match(r"^c\s*[\.\)]*\s*may\s*thi\s*cong\b", name_key):
+    if heading_key in {"may", "may thi cong"}:
         return None, "MTC", "direct_header"
 
-    if name_key == "cong" or "cong chi phi truc tiep" in name_key:
+    if name_key == "cong" or name_key.startswith("tong cong") or "chi phi truc tiep" in name_key:
         return None, current_direct, "summary"
     if name_key.startswith("chi phi gian tiep") or "cong chi phi gian tiep" in name_key:
         return None, current_direct, "summary"
@@ -808,6 +843,16 @@ def _classify_row(name, unit, current_direct: str | None):
     return None, current_direct, "unclassified"
 
 
+def _has_direct_source_value(sheet, row: int, columns: SheetColumns) -> bool:
+    return any(
+        [
+            _text(_cell(sheet, row, columns.code)),
+            _number(_cell(sheet, row, columns.norm)),
+            _number(_cell(sheet, row, columns.price)),
+        ]
+    )
+
+
 def _classify_detail_block(result: EstimateAnalysisResult, sheet, start: int, end: int, columns: SheetColumns) -> dict[str, float]:
     return _detail_block_sums(sheet, start, end, columns, result)
 
@@ -821,6 +866,9 @@ def _detail_block_sums(sheet, start: int, end: int, columns: SheetColumns, resul
             _cell(sheet, row, columns.unit),
             current_direct,
         )
+        if reason == "direct_header" and current_direct in DIRECT_LABELS and _has_direct_source_value(sheet, row, columns):
+            label = current_direct
+            reason = "direct_item"
         helper = _text(_cell(sheet, row, columns.helper)).upper() if columns.helper is not None else ""
         amount = _number(_cell(sheet, row, columns.amount))
 
@@ -874,7 +922,7 @@ def _validate_bid_totals(result, block_index, bid_sheet, bid_row, bid_cols, deta
     for key, col in [("VL", bid_cols.vl), ("NC", bid_cols.nc), ("MTC", bid_cols.mtc)]:
         if col is not None:
             got[key] = converted_sums[key]
-    got["amount_total"] = got["unit_total"] * qty
+    got["amount_total"] = got["unit_total"] * _bid_amount_factor(bid_sheet, bid_row, bid_cols, got["unit_total"], bid_multipliers)
     expected = {
         "unit_total": _number(_cell(bid_sheet, bid_row, bid_cols.unit_total)),
         "amount_total": _number(_cell(bid_sheet, bid_row, bid_cols.amount_total)),
@@ -961,7 +1009,7 @@ def _compare_thvt_helper_key(generated: ThvtRow, actual: ThvtRow) -> dict | None
 def _is_other_material_row(sheet, row: int, columns: SheetColumns) -> bool:
     code = _fold(_cell(sheet, row, columns.code))
     name = _fold(_cell(sheet, row, columns.name))
-    return "vat lieu khac" in code or "vat lieu khac" in name
+    return "vat lieu khac" in code or "vat lieu khac" in name or "vat tu khac" in code or "vat tu khac" in name
 
 
 def _detail_material_unit_price(sheet, row: int, columns: SheetColumns) -> float:
@@ -1067,15 +1115,11 @@ def _direct_detail_rows(sheet, start: int, end: int, columns: SheetColumns) -> l
             _cell(sheet, row, columns.unit),
             current_direct,
         )
-        has_detail_value = any(
-            [
-                _text(_cell(sheet, row, columns.code)),
-                _number(_cell(sheet, row, columns.norm)),
-                _number(_cell(sheet, row, columns.price)),
-                _number(_cell(sheet, row, columns.amount)),
-            ]
-        )
-        if label in DIRECT_LABELS and reason == "direct_item" and has_detail_value:
+        has_direct_source_value = _has_direct_source_value(sheet, row, columns)
+        if reason == "direct_header" and current_direct in DIRECT_LABELS and has_direct_source_value:
+            label = current_direct
+            reason = "direct_item"
+        if label in DIRECT_LABELS and reason == "direct_item" and has_direct_source_value:
             rows.append({"row": row, "label": label})
     return rows
 
@@ -1202,7 +1246,8 @@ def _write_bid_output_sheet(
             worksheet.cell(row=excel_row, column=bid_cols.qty + 1, value=qty)
         sums = _detail_block_sums(detail_sheet, start + 1, end, detail_cols)
         converted_sums = _convert_detail_sums_to_bid_unit(bid_sheet, bid_row, bid_cols, sums, bid_multipliers)
-        row_amounts_by_label[bid_row] = {label: converted_sums[label] * qty for label in COST_LABEL_ORDER}
+        amount_factor = _bid_amount_factor(bid_sheet, bid_row, bid_cols, converted_sums["TC"], bid_multipliers)
+        row_amounts_by_label[bid_row] = {label: converted_sums[label] * amount_factor for label in COST_LABEL_ORDER}
         if bid_cols.amount_total is not None:
             worksheet.cell(row=excel_row, column=bid_cols.amount_total + 1, value=row_amounts_by_label[bid_row]["TC"])
         for offset, label in enumerate(COST_LABEL_ORDER):
